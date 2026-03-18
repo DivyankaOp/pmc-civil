@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PMC Civil AI Agent</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700&family=Inter:wght@300;400;500&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--navy:#0B1F3A;--navy2:#112847;--blue:#1D4ED8;--blu:#EFF6FF;--sur:#F7F8FC;--bor:rgba(11,31,58,0.1);--bor2:rgba(11,31,58,0.16);--tx:#0B1F3A;--tx2:#4B5E7A;--tx3:#8A9BB0;--r:10px;--r2:16px;--gem:#1A73E8}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;font-family:'Inter',sans-serif;background:var(--sur);color:var(--tx)}
+.app{display:flex;height:100vh;overflow:hidden}
+
+/* SIDEBAR */
+.sb{width:260px;flex-shrink:0;background:var(--navy);display:flex;flex-direction:column}
+.sb-logo{padding:18px 16px 14px;border-bottom:1px solid rgba(255,255,255,.06)}
+.logo-row{display:flex;align-items:center;gap:10px;margin-bottom:7px}
+.pmc{font-family:'Syne',sans-serif;font-size:15px;font-weight:700;color:#fff;letter-spacing:2px;border:1.5px solid rgba(255,255,255,.3);padding:4px 11px;border-radius:6px}
+.online{display:flex;align-items:center;gap:5px;font-size:10px;color:rgba(255,255,255,.4)}
+.odot{width:6px;height:6px;border-radius:50%;background:#22C55E;animation:pu 2s infinite}
+@keyframes pu{0%,100%{opacity:1}50%{opacity:.3}}
+.logo-sub{font-size:10.5px;color:rgba(255,255,255,.3);line-height:1.5}
+
+.sb-nav{padding:12px 10px;flex:1;overflow-y:auto}
+.nlabel{font-size:9px;font-weight:500;color:rgba(255,255,255,.22);text-transform:uppercase;letter-spacing:1.2px;padding:0 8px;margin:10px 0 4px}
+.nlabel:first-child{margin-top:0}
+.nb{display:flex;align-items:center;gap:9px;width:100%;padding:8px 10px;border-radius:8px;border:none;background:transparent;cursor:pointer;color:rgba(255,255,255,.5);font-size:12px;font-family:'Inter',sans-serif;transition:all .12s;text-align:left;margin-bottom:1px}
+.nb:hover{background:rgba(255,255,255,.07);color:rgba(255,255,255,.9)}
+.nb.active{background:rgba(26,115,232,.28);color:#fff;border-left:2px solid #4285F4}
+.ni{font-size:14px;flex-shrink:0;width:18px;text-align:center}
+
+.sb-bot{padding:14px 14px 16px;border-top:1px solid rgba(255,255,255,.06)}
+.ak-label{font-size:9px;font-weight:500;color:rgba(255,255,255,.28);text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.gbadge{background:rgba(66,133,244,.2);color:#90CAF9;font-size:8.5px;padding:2px 6px;border-radius:3px}
+.ak-wrap{position:relative}
+.ak-in{width:100%;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px 34px 8px 10px;font-size:11px;color:#fff;font-family:'DM Mono',monospace;outline:none;transition:border-color .15s}
+.ak-in::placeholder{color:rgba(255,255,255,.18)}
+.ak-in:focus{border-color:rgba(66,133,244,.5)}
+.eye{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:rgba(255,255,255,.25);font-size:12px}
+.eye:hover{color:rgba(255,255,255,.6)}
+.ak-st{display:flex;align-items:center;gap:5px;margin-top:5px}
+.sdt{width:5px;height:5px;border-radius:50%;background:#475569}
+.sdt.ok{background:#22C55E}
+.sdt.er{background:#EF4444}
+.stx{font-size:10px;color:rgba(255,255,255,.25)}
+.ak-hint{font-size:10px;color:rgba(255,255,255,.18);margin-top:4px;line-height:1.5}
+.ak-hint a{color:rgba(66,133,244,.7);text-decoration:none}
+
+/* MAIN */
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.topbar{height:54px;flex-shrink:0;background:#fff;border-bottom:1px solid var(--bor);display:flex;align-items:center;justify-content:space-between;padding:0 22px}
+.tb-t{font-family:'Syne',sans-serif;font-size:14px;font-weight:600;color:var(--navy)}
+.tb-s{font-size:11px;color:var(--tx3);margin-top:1px}
+.tb-r{display:flex;align-items:center;gap:8px}
+.mbadge{font-size:10px;font-weight:500;padding:3px 9px;border-radius:20px;background:#E8F0FE;color:#1A73E8}
+.ncbtn{background:var(--navy);color:#fff;border:none;border-radius:8px;padding:6px 13px;font-size:12px;font-weight:500;cursor:pointer;font-family:'Inter',sans-serif;transition:background .15s}
+.ncbtn:hover{background:var(--gem)}
+
+/* WARN */
+.warn{background:#FFFBEB;border-bottom:1px solid #FDE68A;padding:7px 22px;font-size:11.5px;color:#92400E;display:flex;align-items:center;gap:7px;flex-shrink:0}
+.warn.h{display:none}
+.warn a{color:var(--gem);font-weight:500}
+
+/* CHAT */
+.chat{flex:1;overflow-y:auto;padding:20px 22px;display:flex;flex-direction:column;gap:16px}
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-thumb{background:var(--bor2);border-radius:10px}
+
+/* WELCOME */
+.welcome{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:400px;gap:18px;text-align:center;padding:2rem}
+.wico{width:58px;height:58px;background:linear-gradient(135deg,var(--navy),var(--gem));border-radius:15px;display:flex;align-items:center;justify-content:center;font-size:25px}
+.wtit{font-family:'Syne',sans-serif;font-size:21px;font-weight:700;color:var(--navy)}
+.wsub{font-size:13px;color:var(--tx2);line-height:1.7;max-width:450px}
+.qgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;width:100%;max-width:640px}
+.qcard{background:#fff;border:1px solid var(--bor);border-radius:var(--r);padding:11px 12px;cursor:pointer;text-align:left;transition:all .15s;font-family:'Inter',sans-serif}
+.qcard:hover{border-color:var(--gem);box-shadow:0 0 0 3px rgba(26,115,232,.07);transform:translateY(-1px)}
+.qi{font-size:17px;margin-bottom:5px;display:block}
+.ql{font-size:12px;font-weight:500;color:var(--navy);display:block}
+.qd{font-size:10.5px;color:var(--tx3);margin-top:2px;line-height:1.4;display:block}
+
+/* MESSAGES */
+.msg{display:flex;gap:10px;align-items:flex-start;animation:fu .18s ease}
+@keyframes fu{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+.msg.user{flex-direction:row-reverse}
+.av{width:29px;height:29px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;flex-shrink:0;letter-spacing:.5px}
+.av.ai{background:linear-gradient(135deg,var(--navy),var(--gem));color:#fff;font-family:'Syne',sans-serif}
+.av.user{background:var(--sur);border:1px solid var(--bor);color:var(--tx2);font-size:13px}
+.bub{max-width:85%;padding:11px 14px;border-radius:var(--r2);font-size:13.5px;line-height:1.75;word-break:break-word;border:1px solid var(--bor);background:#fff;color:var(--tx)}
+.bub.user{background:var(--navy);color:#fff;border-color:transparent;border-radius:var(--r2) var(--r2) 4px var(--r2)}
+.bub.ai{border-radius:4px var(--r2) var(--r2) var(--r2)}
+.bub table{width:100%;border-collapse:collapse;margin:10px 0;font-size:12px}
+.bub th{background:var(--sur);padding:7px 9px;text-align:left;font-weight:500;border:1px solid var(--bor);font-size:11px;color:var(--tx2)}
+.bub td{padding:7px 9px;border:1px solid var(--bor);vertical-align:top;line-height:1.5}
+.bub tr:nth-child(even) td{background:rgba(247,248,252,.7)}
+.bub h2{font-family:'Syne',sans-serif;font-size:14px;font-weight:600;margin:14px 0 6px;color:var(--navy);border-bottom:1px solid var(--bor);padding-bottom:5px}
+.bub h3{font-size:13px;font-weight:500;margin:10px 0 5px;color:var(--navy)}
+.bub strong{font-weight:500;color:var(--navy)}
+.bub ul,.bub ol{padding-left:16px;margin:5px 0}
+.bub li{margin-bottom:3px}
+.bub code{font-family:'DM Mono',monospace;font-size:11px;background:var(--sur);padding:1px 4px;border-radius:3px;border:1px solid var(--bor)}
+.bub hr{border:none;border-top:1px solid var(--bor);margin:10px 0}
+.dbadge{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:500;padding:3px 9px;border-radius:20px;margin-bottom:8px;text-transform:uppercase;letter-spacing:.4px}
+.dd{background:#DBEAFE;color:#1E40AF}
+.dc{background:#D1FAE5;color:#065F46}
+.db{background:#FEF3C7;color:#92400E}
+.dcp{background:#EDE9FE;color:#5B21B6}
+.ds{background:#FFE4E6;color:#9F1239}
+.dg{background:var(--sur);color:var(--tx2)}
+.fpills{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:7px}
+.fp{display:flex;align-items:center;gap:5px;font-size:11px;padding:3px 9px;border-radius:20px}
+.fp.u{background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.2)}
+.fp.a{background:#E8F0FE;color:#1A73E8;border:1px solid #C5D8FC}
+.dots{display:flex;gap:4px;align-items:center;padding:2px 0}
+.dots span{width:6px;height:6px;border-radius:50%;background:var(--tx3);animation:bo 1.1s infinite}
+.dots span:nth-child(2){animation-delay:.18s}
+.dots span:nth-child(3){animation-delay:.36s}
+@keyframes bo{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-5px)}}
+
+/* INPUT */
+.iarea{background:#fff;border-top:1px solid var(--bor);padding:13px 22px 17px;flex-shrink:0}
+.chips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}
+.chip{display:inline-flex;align-items:center;gap:5px;background:#E8F0FE;border:1px solid #C5D8FC;border-radius:20px;padding:3px 10px;font-size:11px;color:#1A73E8;max-width:210px}
+.chip .cn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:140px}
+.chip .rm{cursor:pointer;color:#90CAF9;font-size:13px;line-height:1}
+.chip .rm:hover{color:#1A73E8}
+.ibox{display:flex;align-items:flex-end;gap:8px;background:var(--sur);border:1.5px solid var(--bor2);border-radius:13px;padding:8px 9px 8px 13px;transition:border-color .15s}
+.ibox:focus-within{border-color:var(--gem)}
+.attbtn{width:31px;height:31px;border-radius:7px;background:transparent;border:1px solid var(--bor);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px;color:var(--tx2);transition:all .12s;flex-shrink:0}
+.attbtn:hover{background:var(--bor);color:var(--navy)}
+textarea.tin{flex:1;border:none;background:transparent;outline:none;font-size:13.5px;font-family:'Inter',sans-serif;color:var(--tx);resize:none;min-height:24px;max-height:120px;line-height:1.55;padding:3px 0}
+textarea.tin::placeholder{color:var(--tx3)}
+.sbtn{width:36px;height:36px;border-radius:9px;background:var(--gem);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .15s;color:#fff;font-size:15px}
+.sbtn:hover{background:var(--navy)}
+.sbtn:disabled{opacity:.3;cursor:not-allowed}
+.hint{font-size:10.5px;color:var(--tx3);margin-top:6px;text-align:center}
+.hint kbd{background:var(--sur);border:1px solid var(--bor);border-radius:3px;padding:1px 4px;font-size:9.5px}
+
+@media(max-width:768px){.sb{display:none}.qgrid{grid-template-columns:repeat(2,1fr)}.chat{padding:14px 14px}.iarea{padding:11px 14px 15px}.topbar{padding:0 14px}}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="sb">
+    <div class="sb-logo">
+      <div class="logo-row">
+        <span class="pmc">PMC</span>
+        <div class="online"><span class="odot"></span>Gemini AI Online</div>
+      </div>
+      <div class="logo-sub">Civil Construction AI Agent<br>Project Management Consultant · Surat</div>
+    </div>
+    <div class="sb-nav">
+      <div class="nlabel">Mode</div>
+      <button class="nb active" onclick="setMode('auto',this)"><span class="ni">🤖</span>Auto-detect</button>
+      <div class="nlabel">Tasks</div>
+      <button class="nb" onclick="setMode('drawing',this)"><span class="ni">📐</span>Drawing Analysis</button>
+      <button class="nb" onclick="setMode('estimate',this)"><span class="ni">🧮</span>Cost Estimation</button>
+      <button class="nb" onclick="setMode('boq',this)"><span class="ni">📋</span>BOQ / Takeoff</button>
+      <button class="nb" onclick="setMode('compare',this)"><span class="ni">⚖️</span>Comparison Report</button>
+      <button class="nb" onclick="setMode('report',this)"><span class="ni">📊</span>Site Report</button>
+      <button class="nb" onclick="setMode('study',this)"><span class="ni">🏗️</span>Drawing Study</button>
+    </div>
+    <div class="sb-bot">
+      <div class="ak-label"><span>Gemini API Key</span><span class="gbadge">GEMINI</span></div>
+      <div class="ak-wrap">
+        <input type="password" class="ak-in" id="apiKey" placeholder="AIzaSy..." oninput="checkKey()">
+        <button class="eye" onclick="toggleKey()">👁</button>
+      </div>
+      <div class="ak-hint">Free key: <a href="https://aistudio.google.com/app/apikey" target="_blank">aistudio.google.com</a></div>
+      <div class="ak-st"><div class="sdt" id="sdt"></div><span class="stx" id="stx">No key entered</span></div>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="topbar">
+      <div><div class="tb-t" id="tbt">PMC Civil AI Agent</div><div class="tb-s" id="tbs">Powered by Gemini 2.0 · Auto-detect any drawing, estimate, BOQ, comparison</div></div>
+      <div class="tb-r"><span class="mbadge" id="mbadge">Auto</span><button class="ncbtn" onclick="newChat()">+ New Chat</button></div>
+    </div>
+
+    <div class="warn" id="warn">
+      ⚠️ Enter your Gemini API key in the sidebar — free at <a href="https://aistudio.google.com/app/apikey" target="_blank">aistudio.google.com</a>
+    </div>
+
+    <div class="chat" id="chat">
+      <div class="welcome" id="welcome">
+        <div class="wico">🏗️</div>
+        <div class="wtit">PMC Civil AI Agent</div>
+        <div class="wsub">Upload any drawing, paste any estimate or BOQ — Gemini AI auto-detects everything and gives full professional PMC analysis.</div>
+        <div class="qgrid">
+          <button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Analyze drawing</span><span class="qd">Upload civil drawing — full analysis with IS codes</span></button>
+          <button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Item-wise cost table in INR with rates</span></button>
+          <button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Prepare BOQ</span><span class="qd">Full bill of quantities with units & rates</span></button>
+          <button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare docs</span><span class="qd">2 drawings / BOQs / quotes — full report</span></button>
+          <button class="qcard" onclick="qs('report')"><span class="qi">📊</span><span class="ql">Site report</span><span class="qd">Formal PMC progress report</span></button>
+          <button class="qcard" onclick="qs('study')"><span class="qi">🏗️</span><span class="ql">Study drawing</span><span class="qd">Educational walkthrough with IS codes</span></button>
+        </div>
+      </div>
+    </div>
+
+    <div class="iarea">
+      <div class="chips" id="chips"></div>
+      <div class="ibox">
+        <button class="attbtn" onclick="document.getElementById('fi').click()">📎</button>
+        <textarea class="tin" id="tin" placeholder="Upload a drawing, paste estimate/BOQ data, or ask anything civil construction…" rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
+        <button class="sbtn" id="sbtn" onclick="send()">➤</button>
+      </div>
+      <div class="hint">JPG · PNG · PDF · Multiple files · <kbd>Enter</kbd> send · <kbd>Shift+Enter</kbd> new line</div>
+    </div>
+  </div>
+</div>
+<input type="file" id="fi" accept="image/*,.pdf" multiple style="display:none" onchange="onFiles(event)">
+
+<script>
+const MODES={
+  auto:{t:'PMC Civil AI Agent',s:'Powered by Gemini 2.0 · Auto-detect any drawing, estimate, BOQ, comparison',b:'Auto'},
+  drawing:{t:'Drawing Analysis',s:'Upload civil drawings — full analysis with dimensions and IS codes',b:'Drawing'},
+  estimate:{t:'Cost Estimation',s:'Item-wise cost breakdown in INR with current Gujarat market rates',b:'Estimate'},
+  boq:{t:'BOQ / Material Takeoff',s:'Full bill of quantities with units, rates and IS codes',b:'BOQ'},
+  compare:{t:'Comparison Report',s:'2 drawings / estimates / BOQs / quotes — full comparison with PMC recommendation',b:'Compare'},
+  report:{t:'Site Progress Report',s:'Formal PMC site report with all standard sections',b:'Report'},
+  study:{t:'Drawing Study',s:'Educational walkthrough of any drawing with IS codes',b:'Study'}
+};
+
+const SYS={
+  auto:`You are PMC Civil AI Agent — senior Project Management Consultant for civil construction in India (Surat, Gujarat). AUTO-DETECT input type and give FULL DETAILED professional response immediately. Never ask — detect and deliver.
+
+DETECTION:
+1. DRAWING → type, title block, scale, dimensions, grid, structural elements, reinforcement, materials, IS codes, symbols, PMC observations
+2. COST ESTIMATE → item-wise table (Item|Unit|Qty|Rate INR|Amount INR), total, rate analysis, missing items, PMC notes
+3. BOQ → full BOQ table, trade summary, material quantities, IS codes
+4. COMPARISON (2 files) → exec summary, Option A, Option B, comparison table, differences, variance%, cost impact, PMC recommendation
+5. CONTRACTOR QUOTE → scope, rates, inclusions/exclusions, risk flags, PMC verdict
+6. SITE PHOTO → condition, work stage, quality, issues, compliance, recommendations
+7. ANY QUERY → full civil construction expert response
+
+ALWAYS: Start with DETECTED:[type] | Use markdown tables | IS codes | INR rates (Surat/Gujarat) | End with PMC OBSERVATIONS & RECOMMENDATIONS`,
+  drawing:`Senior PMC civil drawing analyst. FULL ANALYSIS: drawing type, title block, scale, dimensions, grid lines, structural elements (columns/beams/slabs/walls/footings), reinforcement details (dia/spacing/cover/lap), materials, IS codes (IS 456/IS 1786/IS 875/IS 13920), symbols & legends, discrepancies, PMC observations & recommendations.`,
+  estimate:`PMC senior cost estimation engineer India. FULL ESTIMATION: project summary, item-wise table (Item No.|Description|Unit|Qty|Rate INR|Amount INR), trade-wise summary, total cost, rate analysis vs Gujarat DSR, missing scope, contingency suggestion, PMC observations. Use current Surat market rates March 2026.`,
+  boq:`PMC quantity surveyor India. FULL BOQ: scope summary, BOQ table (Item No.|Description|Unit|Qty|Rate INR|Amount INR), trade-wise breakup, material quantities (cement bags/steel MT/sand/aggregate/bricks), IS codes (IS 1200 for measurement), assumptions, PMC notes. Use DSR rates.`,
+  compare:`Senior PMC consultant. FULL COMPARISON REPORT: executive summary, Option A full analysis, Option B full analysis, item-wise comparison table (Item|Unit|A|B|Difference|Variance%), key technical differences, scope gaps, cost impact INR, risk flags, PMC RECOMMENDATION (be decisive — clearly state which option to select and why).`,
+  report:`PMC site engineer. FORMAL PMC SITE PROGRESS REPORT: project info, reporting period, work executed (trade-wise), cumulative progress % table, resources deployed (manpower/machinery/materials), quality tests (IS code/result/pass-fail), safety observations, issues/RFIs/NCRs, next period plan, signature block. Formal PMC language.`,
+  study:`PMC civil drawing tutor. EDUCATIONAL WALKTHROUGH: drawing type identification, how to read step-by-step, title block fields explained, symbols & meanings table, dimension lines, section marks, each structural element explained with IS code, relevant IS standards, common mistakes to avoid, 3 self-test questions with answers.`
+};
+
+const QT={
+  drawing:`I want to analyze a civil drawing. I will upload the image or PDF — please do a complete professional PMC analysis.`,
+  estimate:`I need cost estimation help. Please tell me what details you need and I will provide my project scope or paste the estimate data.`,
+  boq:`I need to prepare a BOQ. I will describe the scope or upload a drawing — please prepare a full bill of quantities with INR rates.`,
+  compare:`I want to compare two documents. I will provide Option A and Option B — please generate a full comparison report with PMC recommendation.`,
+  report:`I need to prepare a PMC site progress report. Please guide me on what information you need.`,
+  study:`I want to study a civil drawing. I will upload it — please give a complete educational walkthrough of every element.`
+};
+
+let mode='auto',hist=[],files=[],busy=false;
+
+function setMode(m,el){
+  mode=m;
+  document.querySelectorAll('.nb').forEach(b=>b.classList.remove('active'));
+  el.classList.add('active');
+  const i=MODES[m];
+  document.getElementById('tbt').textContent=i.t;
+  document.getElementById('tbs').textContent=i.s;
+  document.getElementById('mbadge').textContent=i.b;
+}
+
+function checkKey(){
+  const k=document.getElementById('apiKey').value.trim();
+  const d=document.getElementById('sdt'),t=document.getElementById('stx'),w=document.getElementById('warn');
+  if(!k){d.className='sdt';t.textContent='No key entered';w.classList.remove('h');}
+  else if(k.startsWith('AIza')){d.className='sdt ok';t.textContent='Key valid';w.classList.add('h');}
+  else{d.className='sdt er';t.textContent='Check format';}
+}
+function toggleKey(){const i=document.getElementById('apiKey');i.type=i.type==='password'?'text':'password';}
+
+function onFiles(e){
+  Array.from(e.target.files).forEach(f=>{
+    const rd=new FileReader();
+    rd.onload=ev=>{files.push({name:f.name,type:f.type,b64:ev.target.result.split(',')[1]});renderChips();};
+    rd.readAsDataURL(f);
+  });
+  document.getElementById('fi').value='';
+}
+function renderChips(){
+  const c=document.getElementById('chips');c.innerHTML='';
+  files.forEach((f,i)=>{
+    const ch=document.createElement('div');ch.className='chip';
+    ch.innerHTML=`<span>${f.name.match(/\.pdf$/i)?'📄':'🖼️'}</span><span class="cn">${f.name}</span><span class="rm" onclick="rmF(${i})">✕</span>`;
+    c.appendChild(ch);
+  });
+}
+function rmF(i){files.splice(i,1);renderChips();}
+function hw(){const w=document.getElementById('welcome');if(w)w.style.display='none';}
+
+function di(text){
+  const t=text.toLowerCase();
+  if(t.includes('comparison')||t.includes('option a')||t.includes('compare'))return{c:'dcp',l:'Comparison Report'};
+  if(t.includes('drawing')||t.includes('floor plan')||t.includes('elevation')||t.includes('rcc')||t.includes('structural'))return{c:'dd',l:'Drawing Analysis'};
+  if(t.includes('boq')||t.includes('bill of quantities')||t.includes('takeoff'))return{c:'db',l:'BOQ / Takeoff'};
+  if(t.includes('estimate')||t.includes('cost')||t.includes('rate'))return{c:'dc',l:'Cost Estimate'};
+  if(t.includes('site')||t.includes('progress')||t.includes('report'))return{c:'ds',l:'Site Report'};
+  return{c:'dg',l:'PMC Analysis'};
+}
+
+function addMsg(role,text,fnames,badge){
+  hw();
+  const chat=document.getElementById('chat');
+  const row=document.createElement('div');row.className=`msg ${role}`;
+  const av=document.createElement('div');av.className=`av ${role}`;av.textContent=role==='ai'?'PMC':'👤';
+  const bub=document.createElement('div');bub.className=`bub ${role}`;
+  if(badge&&role==='ai'){
+    const info=di(text);
+    const b=document.createElement('div');b.className=`dbadge ${info.c}`;
+    b.textContent='🔍 '+info.l;bub.appendChild(b);bub.appendChild(document.createElement('br'));
+  }
+  if(fnames&&fnames.length){
+    const fr=document.createElement('div');fr.className='fpills';
+    fnames.forEach(n=>{const p=document.createElement('div');p.className=`fp ${role==='user'?'u':'a'}`;p.textContent=(n.match(/\.pdf$/i)?'📄':'🖼️')+' '+n;fr.appendChild(p);});
+    bub.appendChild(fr);
+  }
+  const tx=document.createElement('div');
+  if(role==='ai'){tx.innerHTML=md(text);}else{tx.style.whiteSpace='pre-wrap';tx.textContent=text;}
+  bub.appendChild(tx);row.appendChild(av);row.appendChild(bub);
+  chat.appendChild(row);chat.scrollTop=chat.scrollHeight;
+}
+
+function addLoad(){
+  hw();const chat=document.getElementById('chat');
+  const row=document.createElement('div');row.className='msg ai';row.id='lr';
+  const av=document.createElement('div');av.className='av ai';av.textContent='PMC';
+  const bub=document.createElement('div');bub.className='bub';
+  bub.innerHTML='<div class="dots"><span></span><span></span><span></span></div>';
+  row.appendChild(av);row.appendChild(bub);chat.appendChild(row);chat.scrollTop=chat.scrollHeight;
+}
+function rmLoad(){const r=document.getElementById('lr');if(r)r.remove();}
+
+function md(t){
+  return t
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>')
+    .replace(/^### (.+)$/gm,'<h3>$1</h3>')
+    .replace(/^## (.+)$/gm,'<h2>$1</h2>')
+    .replace(/^# (.+)$/gm,'<h2>$1</h2>')
+    .replace(/^---+$/gm,'<hr>')
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/^\|(.+)\|$/gm,(_,row)=>{
+      const cells=row.split('|').map(c=>c.trim());
+      if(cells.every(c=>/^[-:]+$/.test(c)))return'';
+      return'<tr>'+cells.map(c=>`<td>${c}</td>`).join('')+'</tr>';
+    })
+    .replace(/(<tr>[\s\S]*?<\/tr>\n?)+/g,m=>{
+      const rows=m.match(/<tr>[\s\S]*?<\/tr>/g)||[];
+      if(!rows.length)return m;
+      const[first,...rest]=rows;
+      const h=first.replace(/<td>/g,'<th>').replace(/<\/td>/g,'</th>');
+      return`<table><thead>${h}</thead><tbody>${rest.join('')}</tbody></table>`;
+    })
+    .replace(/^[-*] (.+)$/gm,'<li>$1</li>')
+    .replace(/(<li>[\s\S]*?<\/li>\n?)+/g,m=>`<ul>${m}</ul>`)
+    .replace(/\n{2,}/g,'<br><br>').replace(/\n/g,'<br>');
+}
+
+async function send(){
+  if(busy)return;
+  const apiKey=document.getElementById('apiKey').value.trim();
+  if(!apiKey){alert('Please enter your Gemini API key in the sidebar.\n\nGet free key: aistudio.google.com/app/apikey');return;}
+  const tin=document.getElementById('tin');
+  const txt=tin.value.trim();
+  if(!txt&&!files.length)return;
+  busy=true;document.getElementById('sbtn').disabled=true;
+
+  const fnames=files.map(f=>f.name);
+  const disp=txt||(fnames.length?'Analyze uploaded file(s) and pull all proper details.':'');
+  addMsg('user',disp,fnames);
+  tin.value='';tin.style.height='auto';
+
+  const parts=[];
+  files.forEach(f=>{
+    parts.push({inline_data:{mime_type:f.type||(f.name.match(/\.pdf$/i)?'application/pdf':'image/jpeg'),data:f.b64}});
+  });
+  let prompt=txt||'Auto-detect these file(s) and provide full detailed professional PMC civil construction analysis.';
+  if(files.length>1)prompt+=`\n\n${files.length} files uploaded — if they are two similar documents, auto-treat as COMPARISON and generate full comparison report.`;
+  parts.push({text:prompt});
+
+  hist.push({role:'user',parts});
+  files=[];renderChips();
+  addLoad();
+
+  try{
+    const body={
+      system_instruction:{parts:[{text:SYS[mode]}]},
+      contents:hist,
+      generationConfig:{maxOutputTokens:8192,temperature:0.3}
+    };
+
+    // Call via local proxy server
+    const res=await fetch('/gemini',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({apiKey,body})
+    });
+
+    if(!res.ok){
+      const e=await res.json().catch(()=>({}));
+      throw new Error(e?.error?.message||'HTTP '+res.status);
+    }
+    const data=await res.json();
+    const aiText=data?.candidates?.[0]?.content?.parts?.[0]?.text||'No response received.';
+    hist.push({role:'model',parts:[{text:aiText}]});
+    rmLoad();
+    addMsg('ai',aiText,null,true);
+  }catch(err){
+    rmLoad();hist.pop();
+    let msg=err.message;
+    if(msg.includes('API_KEY_INVALID')||msg.includes('400'))msg='Invalid Gemini API key. Please check.';
+    else if(msg.includes('429'))msg='Rate limit. Wait a moment and try again.';
+    addMsg('ai',`**Error:** ${msg}`);
+  }
+  busy=false;document.getElementById('sbtn').disabled=false;
+}
+
+function qs(type){
+  document.getElementById('tin').value=QT[type];
+  aRz(document.getElementById('tin'));
+  document.getElementById('tin').focus();
+}
+
+function newChat(){
+  hist=[];files=[];renderChips();
+  const chat=document.getElementById('chat');
+  chat.innerHTML=`<div class="welcome" id="welcome"><div class="wico">🏗️</div><div class="wtit">PMC Civil AI Agent</div><div class="wsub">Upload any drawing, paste any estimate or BOQ — Gemini AI auto-detects everything and gives full professional PMC analysis.</div><div class="qgrid"><button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Analyze drawing</span><span class="qd">Upload civil drawing — full analysis with IS codes</span></button><button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Item-wise cost table in INR with rates</span></button><button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Prepare BOQ</span><span class="qd">Full bill of quantities with units & rates</span></button><button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare docs</span><span class="qd">2 drawings / BOQs / quotes — full report</span></button><button class="qcard" onclick="qs('report')"><span class="qi">📊</span><span class="ql">Site report</span><span class="qd">Formal PMC progress report</span></button><button class="qcard" onclick="qs('study')"><span class="qi">🏗️</span><span class="ql">Study drawing</span><span class="qd">Educational walkthrough with IS codes</span></button></div></div>`;
+}
+
+function hkey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}}
+function aRz(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,120)+'px';}
+</script>
+</body>
+</html>
