@@ -10,7 +10,7 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const GEMINI_URL = (key) =>
-  `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`;
+  `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${key}`;
 
 // ── GEMINI CHAT ENDPOINT
 app.post('/gemini', async (req, res) => {
@@ -38,7 +38,6 @@ app.post('/export-excel', async (req, res) => {
     if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
     const { files, userText, mode } = req.body;
 
-    // Step 1: Ask Gemini to extract structured JSON from uploaded files
     const parts = [];
     if (files && files.length) {
       for (const f of files) {
@@ -61,7 +60,6 @@ Return this exact JSON structure:
   "company": "VCT BHARUCH or extract from document",
   "date": "DD-MM-YYYY",
   "summary": "2-3 line summary",
-  
   "vendors": [
     {
       "name": "Agency/Vendor name",
@@ -71,28 +69,23 @@ Return this exact JSON structure:
       "product_description": "full product description"
     }
   ],
-  
   "pricing": {
     "old_rate": [
-      { "label": "row label", "values": [v1, v2, v3, ...] }
+      { "label": "row label", "values": [v1, v2, v3] }
     ],
     "new_rate": [
-      { "label": "row label", "values": [v1, v2, v3, ...] }
+      { "label": "row label", "values": [v1, v2, v3] }
     ]
   },
-  
   "commercial_terms": [
-    { "label": "term name", "values": [v1, v2, v3, ...] }
+    { "label": "term name", "values": [v1, v2, v3] }
   ],
-  
   "technical_specs": [
-    { "label": "spec name", "values": [v1, v2, v3, ...] }
+    { "label": "spec name", "values": [v1, v2, v3] }
   ],
-  
   "boq_items": [
     { "sr": 1, "description": "item", "unit": "m3", "qty": 10, "rate": 5000, "amount": 50000 }
   ],
-  
   "recommendation": "PMC recommendation with reasons",
   "prepared_by": "PMC Civil AI Agent"
 }
@@ -121,7 +114,6 @@ If a field is not applicable, use empty array []. Extract every number and detai
       return res.status(500).json({ error: 'Could not parse AI response as JSON: ' + rawText.slice(0, 200) });
     }
 
-    // Step 2: Build Excel from extracted JSON
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('PMC Report');
 
@@ -133,7 +125,6 @@ If a field is not applicable, use empty array []. Extract every number and detai
     const DKGREEN = '375623';
     const GREY    = 'F2F2F2';
     const WHITE   = 'FFFFFF';
-    const RED     = 'C00000';
 
     const thin = { style: 'thin', color: { argb: 'FF000000' } };
     const allBorders = { top: thin, left: thin, bottom: thin, right: thin };
@@ -149,13 +140,17 @@ If a field is not applicable, use empty array []. Extract every number and detai
           name: 'Calibri'
         };
       }
-      cell.alignment = {
-        horizontal: opts.align || 'left',
-        vertical: 'middle',
-        wrapText: opts.wrap !== false
-      };
+      cell.alignment = { horizontal: opts.align || 'left', vertical: 'middle', wrapText: opts.wrap !== false };
       if (opts.border !== false) cell.border = allBorders;
     }
+
+    const vendors = data.vendors || [];
+    const vendorCount = Math.max(vendors.length, 1);
+    let row = 1;
+
+    ws.getColumn(1).width = 6;
+    ws.getColumn(2).width = 30;
+    for (let i = 3; i <= vendorCount + 2; i++) ws.getColumn(i).width = 26;
 
     function addFullRow(rowNum, text, bg, color = 'FFFFFF', size = 12, bold = true) {
       ws.mergeCells(rowNum, 1, rowNum, vendorCount + 2);
@@ -169,11 +164,9 @@ If a field is not applicable, use empty array []. Extract every number and detai
       const srCell = ws.getCell(rowNum, 1);
       srCell.value = srVal;
       styleCell(srCell, { bg: bg || GREY, align: 'center', border: true });
-
       const lblCell = ws.getCell(rowNum, 2);
       lblCell.value = label;
       styleCell(lblCell, { bg: bg || WHITE, bold: labelBold, border: true });
-
       values.forEach((v, i) => {
         const c = ws.getCell(rowNum, i + 3);
         c.value = v;
@@ -182,20 +175,11 @@ If a field is not applicable, use empty array []. Extract every number and detai
       ws.getRow(rowNum).height = 16;
     }
 
-    const vendors = data.vendors || [];
-    const vendorCount = Math.max(vendors.length, 1);
-    let row = 1;
-
-    // Set column widths
-    ws.getColumn(1).width = 6;
-    ws.getColumn(2).width = 30;
-    for (let i = 3; i <= vendorCount + 2; i++) ws.getColumn(i).width = 26;
-
-    // ── TITLE
-    addFullRow(row++, data.company || 'VCT BHARUCH', NAVY, 'FFFFFF', 14, true);
+    // TITLE
+    addFullRow(row++, data.company || 'PMC BHARUCH', NAVY, 'FFFFFF', 14, true);
     addFullRow(row++, (data.project_title || 'COMPARISON REPORT').toUpperCase(), MIDBLUE, 'FFFFFF', 12, true);
 
-    // ── VENDOR HEADERS
+    // VENDOR HEADERS
     const hdrRow = ws.getRow(row);
     hdrRow.getCell(1).value = 'SR NO';
     styleCell(hdrRow.getCell(1), { bg: NAVY, color: 'FFFFFF', bold: true, align: 'center', border: true });
@@ -209,18 +193,17 @@ If a field is not applicable, use empty array []. Extract every number and detai
     hdrRow.height = 50;
     row++;
 
-    // ── VENDOR INFO
-    const infoRows = [
-      ['', 'AGENCY NAME', vendors.map(v => v.name || '')],
-      ['', 'CONTACT NO',  vendors.map(v => v.contact || '')],
+    // VENDOR INFO
+    [
+      ['', 'AGENCY NAME',       vendors.map(v => v.name || '')],
+      ['', 'CONTACT NO',        vendors.map(v => v.contact || '')],
       ['', 'DATE OF QUOTATION', vendors.map(v => v.quote_date || '')],
-      ['', 'BRAND',       vendors.map(v => v.brand || '')],
-    ];
-    infoRows.forEach(([sr, lbl, vals], idx) => {
+      ['', 'BRAND',             vendors.map(v => v.brand || '')],
+    ].forEach(([sr, lbl, vals], idx) => {
       addRow(row++, sr, lbl, vals, idx % 2 === 0 ? LTBLUE : GREY, true);
     });
 
-    // ── PRODUCT DESCRIPTION
+    // PRODUCT DESCRIPTION
     if (vendors.some(v => v.product_description)) {
       addFullRow(row++, 'PRODUCT DESCRIPTION', MIDBLUE, 'FFFFFF', 10, true);
       const pdRow = ws.getRow(row);
@@ -237,29 +220,26 @@ If a field is not applicable, use empty array []. Extract every number and detai
       row++;
     }
 
-    // ── PRICING OLD
+    // PRICING OLD
     if (data.pricing?.old_rate?.length) {
       addFullRow(row++, 'PRICING — OLD RATE', NAVY, 'FFFFFF', 10, true);
       data.pricing.old_rate.forEach((r, idx) => {
         const isTotal = r.label?.toUpperCase().includes('TOTAL');
-        const bg = isTotal ? YELLOW : (idx % 2 === 0 ? WHITE : GREY);
-        addRow(row++, '', r.label, r.values || [], bg, isTotal);
+        addRow(row++, '', r.label, r.values || [], isTotal ? YELLOW : (idx % 2 === 0 ? WHITE : GREY), isTotal);
       });
     }
 
-    // ── PRICING NEW
+    // PRICING NEW
     if (data.pricing?.new_rate?.length) {
       addFullRow(row++, 'PRICING — NEW RATE (LATEST)', NAVY, 'FFFFFF', 10, true);
       const totals = [];
       data.pricing.new_rate.forEach((r, idx) => {
-        const isTotal   = r.label?.toUpperCase().includes('TOTAL');
-        const isDisc    = r.label?.toUpperCase().includes('DISCOUNT');
-        const bg = isTotal ? YELLOW : isDisc ? GREEN : (idx % 2 === 0 ? WHITE : GREY);
+        const isTotal = r.label?.toUpperCase().includes('TOTAL');
+        const isDisc  = r.label?.toUpperCase().includes('DISCOUNT');
         if (isTotal) totals.push(...(r.values || []));
-        addRow(row++, '', r.label, r.values || [], bg, isTotal);
+        addRow(row++, '', r.label, r.values || [], isTotal ? YELLOW : isDisc ? GREEN : (idx % 2 === 0 ? WHITE : GREY), isTotal);
       });
 
-      // Highlight lowest
       if (totals.length > 0) {
         const nums = totals.map(v => parseFloat(String(v).replace(/[^0-9.]/g, '')) || 0);
         const minVal = Math.min(...nums.filter(n => n > 0));
@@ -273,20 +253,14 @@ If a field is not applicable, use empty array []. Extract every number and detai
           const c = lowRow.getCell(i + 3);
           const isLowest = n === minVal && n > 0;
           c.value = n > 0 ? `₹${n.toLocaleString('en-IN')}${isLowest ? ' ✓ LOWEST' : ''}` : '—';
-          styleCell(c, {
-            bg: isLowest ? '00B050' : WHITE,
-            color: isLowest ? 'FFFFFF' : '000000',
-            bold: isLowest,
-            align: 'center',
-            border: true
-          });
+          styleCell(c, { bg: isLowest ? '00B050' : WHITE, color: isLowest ? 'FFFFFF' : '000000', bold: isLowest, align: 'center', border: true });
         });
         lowRow.height = 20;
         row++;
       }
     }
 
-    // ── BOQ ITEMS
+    // BOQ ITEMS
     if (data.boq_items?.length) {
       addFullRow(row++, 'BILL OF QUANTITIES', NAVY, 'FFFFFF', 11, true);
       const boqHdr = ws.getRow(row++);
@@ -316,26 +290,24 @@ If a field is not applicable, use empty array []. Extract every number and detai
       styleCell(totRow.getCell(6), { bg: YELLOW, bold: true, align: 'center', border: true });
     }
 
-    // ── COMMERCIAL TERMS
+    // COMMERCIAL TERMS
     if (data.commercial_terms?.length) {
       addFullRow(row++, 'COMMERCIAL TERMS', NAVY, 'FFFFFF', 10, true);
       data.commercial_terms.forEach((t, idx) => {
-        const bg = idx % 2 === 0 ? WHITE : GREY;
-        addRow(row++, '', t.label, t.values || [], bg, true);
+        addRow(row++, '', t.label, t.values || [], idx % 2 === 0 ? WHITE : GREY, true);
         ws.getRow(row - 1).height = 40;
       });
     }
 
-    // ── TECHNICAL SPECS
+    // TECHNICAL SPECS
     if (data.technical_specs?.length) {
       addFullRow(row++, 'TECHNICAL SPECIFICATIONS', NAVY, 'FFFFFF', 10, true);
       data.technical_specs.forEach((s, idx) => {
-        const bg = idx % 2 === 0 ? WHITE : GREY;
-        addRow(row++, String(idx + 1), s.label, s.values || [], bg, true);
+        addRow(row++, String(idx + 1), s.label, s.values || [], idx % 2 === 0 ? WHITE : GREY, true);
       });
     }
 
-    // ── PMC RECOMMENDATION
+    // PMC RECOMMENDATION
     if (data.recommendation) {
       addFullRow(row++, 'PMC RECOMMENDATION', DKGREEN, 'FFFFFF', 11, true);
       ws.mergeCells(row, 1, row, vendorCount + 2);
@@ -346,7 +318,7 @@ If a field is not applicable, use empty array []. Extract every number and detai
       row++;
     }
 
-    // ── SUMMARY
+    // SUMMARY
     if (data.summary) {
       ws.mergeCells(row, 1, row, vendorCount + 2);
       const sumCell = ws.getCell(row, 1);
@@ -356,7 +328,7 @@ If a field is not applicable, use empty array []. Extract every number and detai
       row++;
     }
 
-    // ── FOOTER
+    // FOOTER
     ws.mergeCells(row, 1, row, vendorCount + 2);
     const footCell = ws.getCell(row, 1);
     const today = new Date().toLocaleDateString('en-IN', { day:'2-digit', month:'2-digit', year:'numeric' });
@@ -364,10 +336,8 @@ If a field is not applicable, use empty array []. Extract every number and detai
     styleCell(footCell, { bg: GREY, color: '595959', align: 'center', size: 9, italic: true, bold: false, border: false });
     ws.getRow(row).height = 14;
 
-    // Freeze header rows
     ws.views = [{ state: 'frozen', xSplit: 2, ySplit: 3 }];
 
-    // Send as Excel file
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename="PMC_Report.xlsx"');
     await wb.xlsx.write(res);
@@ -378,6 +348,14 @@ If a field is not applicable, use empty array []. Extract every number and detai
     res.status(500).json({ error: err.message });
   }
 });
+
+// Keep-alive ping every 14 min to prevent Render free tier sleep
+const APP_URL = process.env.RENDER_EXTERNAL_URL;
+if (APP_URL) {
+  setInterval(() => {
+    fetch(APP_URL + '/health').catch(() => {});
+  }, 14 * 60 * 1000);
+}
 
 // Health check
 app.get('/health', (req, res) => {
