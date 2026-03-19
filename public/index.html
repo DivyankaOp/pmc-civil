@@ -6,7 +6,7 @@
 <title>PMC Civil AI Agent</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700&family=Inter:wght@300;400;500&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-:root{--navy:#0B1F3A;--sur:#F7F8FC;--bor:rgba(11,31,58,0.1);--bor2:rgba(11,31,58,0.16);--tx:#0B1F3A;--tx2:#4B5E7A;--tx3:#8A9BB0;--r:10px;--r2:16px;--gem:#1A73E8}
+:root{--navy:#0B1F3A;--sur:#F7F8FC;--bor:rgba(11,31,58,0.1);--bor2:rgba(11,31,58,0.16);--tx:#0B1F3A;--tx2:#4B5E7A;--tx3:#8A9BB0;--r:10px;--r2:16px;--gem:#1A73E8;--grn:#059669}
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;font-family:'Inter',sans-serif;background:var(--sur);color:var(--tx)}
 .app{display:flex;height:100vh;overflow:hidden}
@@ -28,7 +28,7 @@ html,body{height:100%;font-family:'Inter',sans-serif;background:var(--sur);color
 .sb-bot{padding:14px;border-top:1px solid rgba(255,255,255,.06)}
 .sb-info{background:rgba(255,255,255,.05);border-radius:8px;padding:10px 12px}
 .sb-info-title{font-size:10px;font-weight:500;color:rgba(255,255,255,.5);margin-bottom:4px}
-.sb-info-text{font-size:10px;color:rgba(255,255,255,.25);line-height:1.5}
+.sb-info-text{font-size:10px;color:rgba(255,255,255,.25);line-height:1.6}
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
 .topbar{height:54px;flex-shrink:0;background:#fff;border-bottom:1px solid var(--bor);display:flex;align-items:center;justify-content:space-between;padding:0 22px}
 .tb-t{font-family:'Syne',sans-serif;font-size:14px;font-weight:600;color:var(--navy)}
@@ -43,7 +43,7 @@ html,body{height:100%;font-family:'Inter',sans-serif;background:var(--sur);color
 .welcome{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:400px;gap:18px;text-align:center;padding:2rem}
 .wico{width:58px;height:58px;background:linear-gradient(135deg,var(--navy),var(--gem));border-radius:15px;display:flex;align-items:center;justify-content:center;font-size:25px}
 .wtit{font-family:'Syne',sans-serif;font-size:21px;font-weight:700;color:var(--navy)}
-.wsub{font-size:13px;color:var(--tx2);line-height:1.7;max-width:450px}
+.wsub{font-size:13px;color:var(--tx2);line-height:1.7;max-width:460px}
 .qgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;width:100%;max-width:640px}
 .qcard{background:#fff;border:1px solid var(--bor);border-radius:var(--r);padding:11px 12px;cursor:pointer;text-align:left;transition:all .15s;font-family:'Inter',sans-serif}
 .qcard:hover{border-color:var(--gem);box-shadow:0 0 0 3px rgba(26,115,232,.07);transform:translateY(-1px)}
@@ -80,6 +80,16 @@ html,body{height:100%;font-family:'Inter',sans-serif;background:var(--sur);color
 .dots span{width:6px;height:6px;border-radius:50%;background:var(--tx3);animation:bo 1.1s infinite}
 .dots span:nth-child(2){animation-delay:.18s}.dots span:nth-child(3){animation-delay:.36s}
 @keyframes bo{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-5px)}}
+
+/* EXCEL DOWNLOAD BUTTON */
+.xl-btn{display:inline-flex;align-items:center;gap:7px;margin-top:10px;background:#1D6F42;color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:12.5px;font-weight:500;cursor:pointer;font-family:'Inter',sans-serif;transition:background .15s}
+.xl-btn:hover{background:#155233}
+.xl-btn:disabled{opacity:.5;cursor:not-allowed}
+.xl-btn .spinner{width:13px;height:13px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:none}
+.xl-btn.loading .spinner{display:inline-block}
+.xl-btn.loading .xl-icon{display:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+
 .iarea{background:#fff;border-top:1px solid var(--bor);padding:13px 22px 17px;flex-shrink:0}
 .chips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}
 .chip{display:inline-flex;align-items:center;gap:5px;background:#E8F0FE;border:1px solid #C5D8FC;border-radius:20px;padding:3px 10px;font-size:11px;color:#1A73E8;max-width:210px}
@@ -122,15 +132,15 @@ textarea.tin::placeholder{color:var(--tx3)}
     </div>
     <div class="sb-bot">
       <div class="sb-info">
-        <div class="sb-info-title">PMC Civil AI Agent v1.0</div>
-        <div class="sb-info-text">Powered by Google Gemini 1.5 Flash<br>Upload drawings · Estimates · BOQ · Comparison</div>
+        <div class="sb-info-title">📊 Excel Export — Auto</div>
+        <div class="sb-info-text">Har response ke saath green "Download Excel" button aayega — click karo aur PMC format mein Excel file milegi!</div>
       </div>
     </div>
   </div>
 
   <div class="main">
     <div class="topbar">
-      <div><div class="tb-t" id="tbt">PMC Civil AI Agent</div><div class="tb-s" id="tbs">Powered by Gemini · Auto-detect any drawing, estimate, BOQ, comparison</div></div>
+      <div><div class="tb-t" id="tbt">PMC Civil AI Agent</div><div class="tb-s" id="tbs">Upload any file → AI analysis + Excel download automatically</div></div>
       <div class="tb-r"><span class="mbadge" id="mbadge">Auto</span><button class="ncbtn" onclick="newChat()">+ New Chat</button></div>
     </div>
 
@@ -138,14 +148,14 @@ textarea.tin::placeholder{color:var(--tx3)}
       <div class="welcome" id="welcome">
         <div class="wico">🏗️</div>
         <div class="wtit">PMC Civil AI Agent</div>
-        <div class="wsub">Upload any drawing, paste any estimate or BOQ — Gemini AI auto-detects everything and gives full professional PMC analysis. Kisi bhi device se access karo!</div>
+        <div class="wsub">Upload koi bhi file — PDF, image, Excel. AI automatically analysis karega aur <strong>PMC format Excel file</strong> download ke liye dega!</div>
         <div class="qgrid">
-          <button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Analyze drawing</span><span class="qd">Upload civil drawing — full analysis with IS codes</span></button>
-          <button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Item-wise cost table in INR with rates</span></button>
-          <button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Prepare BOQ</span><span class="qd">Full bill of quantities with units & rates</span></button>
-          <button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare docs</span><span class="qd">2 drawings / BOQs / quotes — full report</span></button>
-          <button class="qcard" onclick="qs('report')"><span class="qi">📊</span><span class="ql">Site report</span><span class="qd">Formal PMC progress report</span></button>
-          <button class="qcard" onclick="qs('study')"><span class="qi">🏗️</span><span class="ql">Study drawing</span><span class="qd">Educational walkthrough with IS codes</span></button>
+          <button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Drawing analysis</span><span class="qd">Upload civil drawing → Excel report</span></button>
+          <button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Scope batao → Excel cost sheet</span></button>
+          <button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">BOQ / Takeoff</span><span class="qd">Drawing upload → Excel BOQ</span></button>
+          <button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare quotes</span><span class="qd">2-3 PDFs → Excel comparison</span></button>
+          <button class="qcard" onclick="qs('report')"><span class="qi">📊</span><span class="ql">Site report</span><span class="qd">Details do → Excel site report</span></button>
+          <button class="qcard" onclick="qs('study')"><span class="qi">🏗️</span><span class="ql">Drawing study</span><span class="qd">Upload → educational analysis</span></button>
         </div>
       </div>
     </div>
@@ -154,80 +164,160 @@ textarea.tin::placeholder{color:var(--tx3)}
       <div class="chips" id="chips"></div>
       <div class="ibox">
         <button class="attbtn" onclick="document.getElementById('fi').click()">📎</button>
-        <textarea class="tin" id="tin" placeholder="Upload a drawing, paste estimate/BOQ data, or ask anything civil construction…" rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
+        <textarea class="tin" id="tin" placeholder="Koi bhi file upload karo ya question type karo — AI analysis + Excel download automatic milega..." rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
         <button class="sbtn" id="sbtn" onclick="send()">➤</button>
       </div>
-      <div class="hint">JPG · PNG · PDF · Multiple files · <kbd>Enter</kbd> send · <kbd>Shift+Enter</kbd> new line</div>
+      <div class="hint">PDF · JPG · PNG · Excel · Multiple files · <kbd>Enter</kbd> send · <kbd>Shift+Enter</kbd> new line</div>
     </div>
   </div>
 </div>
-<input type="file" id="fi" accept="image/*,.pdf" multiple style="display:none" onchange="onFiles(event)">
+<input type="file" id="fi" accept="image/*,.pdf,.xlsx,.xls,.csv" multiple style="display:none" onchange="onFiles(event)">
 
 <script>
 const MODES={
-  auto:{t:'PMC Civil AI Agent',s:'Powered by Gemini · Auto-detect any drawing, estimate, BOQ, comparison',b:'Auto'},
-  drawing:{t:'Drawing Analysis',s:'Upload civil drawings — full analysis with dimensions and IS codes',b:'Drawing'},
-  estimate:{t:'Cost Estimation',s:'Item-wise cost breakdown in INR with current Gujarat market rates',b:'Estimate'},
-  boq:{t:'BOQ / Material Takeoff',s:'Full bill of quantities with units, rates and IS codes',b:'BOQ'},
-  compare:{t:'Comparison Report',s:'2 drawings / estimates / BOQs / quotes — full comparison with PMC recommendation',b:'Compare'},
-  report:{t:'Site Progress Report',s:'Formal PMC site report with all standard sections',b:'Report'},
-  study:{t:'Drawing Study',s:'Educational walkthrough of any drawing with IS codes',b:'Study'}
+  auto:{t:'PMC Civil AI Agent',s:'Upload any file → AI analysis + Excel download automatically',b:'Auto'},
+  drawing:{t:'Drawing Analysis',s:'Upload civil drawings — full analysis + Excel report',b:'Drawing'},
+  estimate:{t:'Cost Estimation',s:'Item-wise cost breakdown in INR + Excel download',b:'Estimate'},
+  boq:{t:'BOQ / Material Takeoff',s:'Full bill of quantities + Excel download',b:'BOQ'},
+  compare:{t:'Comparison Report',s:'2-3 quotes/drawings → Excel comparison with PMC recommendation',b:'Compare'},
+  report:{t:'Site Progress Report',s:'Formal PMC site report + Excel download',b:'Report'},
+  study:{t:'Drawing Study',s:'Educational walkthrough of any drawing',b:'Study'}
 };
+
 const SYS={
-  auto:`You are PMC Civil AI Agent — senior Project Management Consultant for civil construction in India (Surat, Gujarat). AUTO-DETECT input type and give FULL DETAILED professional response immediately. Never ask — detect and deliver.
+  auto:`You are PMC Civil AI Agent — senior Project Management Consultant for civil construction in India (Surat, Gujarat). 
+AUTO-DETECT input type and give FULL DETAILED professional response. Never ask — detect and deliver.
+
 DETECTION:
-1. DRAWING (floor plan/elevation/section/RCC/structural/road/drainage) → type, title block, scale, dimensions, grid, structural elements, reinforcement, materials, IS codes, symbols, PMC observations & recommendations
-2. COST ESTIMATE (items/rates/amounts) → item-wise table (Item|Unit|Qty|Rate INR|Amount INR), total, rate analysis, missing items, PMC notes
+1. DRAWING → type, title block, scale, dimensions, structural elements, reinforcement, materials, IS codes, PMC observations
+2. COST ESTIMATE → item-wise table (Item|Unit|Qty|Rate INR|Amount INR), total, rate analysis, PMC notes
 3. BOQ/QUANTITIES → full BOQ table, trade summary, material quantities, IS codes
-4. COMPARISON (2 files/datasets) → exec summary, Option A, Option B, comparison table, differences, variance%, cost impact INR, PMC recommendation
-5. CONTRACTOR QUOTE/TENDER → scope, rates, inclusions/exclusions, risk flags, PMC verdict
+4. COMPARISON (2+ files) → exec summary, each option analysis, comparison table, differences, variance%, PMC recommendation with clear winner
+5. CONTRACTOR QUOTE → scope, rates, inclusions/exclusions, risk flags, PMC verdict
 6. SITE PHOTO → condition, work stage, quality, issues, compliance, recommendations
 7. ANY QUERY → full civil construction expert response
-ALWAYS: Start with DETECTED:[type] | Use markdown tables | IS codes | INR rates (Surat/Gujarat) | End with PMC OBSERVATIONS & RECOMMENDATIONS`,
-  drawing:`Senior PMC civil drawing analyst. FULL ANALYSIS: drawing type, title block, scale, dimensions, grid lines, structural elements (columns/beams/slabs/walls/footings), reinforcement (dia/spacing/cover/lap), materials, IS codes (IS 456/IS 1786/IS 875/IS 13920), symbols & legends, discrepancies, PMC observations & recommendations.`,
-  estimate:`PMC senior cost estimation engineer India. FULL ESTIMATION: project summary, item-wise table (Item No.|Description|Unit|Qty|Rate INR|Amount INR), trade-wise summary, total cost, rate analysis vs Gujarat DSR, missing scope, contingency suggestion, PMC observations. Use current Surat market rates.`,
-  boq:`PMC quantity surveyor India. FULL BOQ: scope summary, BOQ table (Item No.|Description|Unit|Qty|Rate INR|Amount INR), trade-wise breakup, material quantities (cement bags/steel MT/sand/aggregate/bricks), IS codes, assumptions, PMC notes. Use DSR rates.`,
-  compare:`Senior PMC consultant. FULL COMPARISON REPORT: executive summary, Option A full analysis, Option B full analysis, item-wise comparison table (Item|Unit|A|B|Difference|Variance%), key technical differences, scope gaps, cost impact INR, risk flags, PMC RECOMMENDATION — be decisive, clearly state which option to select and why.`,
-  report:`PMC site engineer. FORMAL PMC SITE PROGRESS REPORT: project info, reporting period, work executed (trade-wise), cumulative progress % table, resources deployed (manpower/machinery/materials), quality tests (IS code/result/pass-fail), safety observations, issues/RFIs/NCRs, next period plan, signature block. Formal PMC language.`,
-  study:`PMC civil drawing tutor. EDUCATIONAL WALKTHROUGH: drawing type identification, how to read step-by-step, title block explained, symbols & meanings table, dimension lines, section marks, each structural element with IS code, IS standards, common mistakes, 3 self-test questions with answers.`
+
+ALWAYS: Use markdown tables | IS codes | INR rates (Surat/Gujarat) | End with PMC OBSERVATIONS & RECOMMENDATIONS
+Note: User will also get an Excel download — so give thorough analysis in your text response too.`,
+  drawing:`Senior PMC civil drawing analyst. FULL ANALYSIS: drawing type, title block, scale, dimensions, grid lines, structural elements, reinforcement details, materials, IS codes, symbols, discrepancies, PMC observations & recommendations. Use tables.`,
+  estimate:`PMC senior cost estimation engineer India. Full item-wise table (Item No.|Description|Unit|Qty|Rate INR|Amount INR), trade-wise summary, total, rate analysis vs Gujarat DSR, missing scope, PMC observations.`,
+  boq:`PMC quantity surveyor. Full BOQ (Item No.|Description|Unit|Qty|Rate INR|Amount INR), trade-wise breakup, material quantities, IS codes, PMC notes.`,
+  compare:`Senior PMC consultant. FULL COMPARISON: exec summary, each option analysis, item-wise comparison table, differences, cost impact, PMC RECOMMENDATION — be decisive, name the winner clearly with reasons.`,
+  report:`PMC site engineer. Formal site progress report: project info, work executed, progress%, resources, quality tests, issues, next plan, signature block.`,
+  study:`PMC drawing tutor. Educational walkthrough: drawing type, how to read, symbols, dimension lines, structural elements with IS codes, common mistakes, quiz questions.`
 };
+
 const QT={
-  drawing:`I want to analyze a civil drawing. I will upload the image or PDF — please do a complete professional PMC analysis.`,
-  estimate:`I need cost estimation. Please guide me — what details do you need? I will provide project scope or paste estimate data.`,
-  boq:`I need to prepare a BOQ. I will describe scope or upload a drawing — please prepare full bill of quantities with INR rates.`,
-  compare:`I want to compare two documents. I will provide Option A and Option B — please generate full comparison report with PMC recommendation.`,
-  report:`I need a PMC site progress report. Please guide me on what information you need.`,
-  study:`I want to study a civil drawing. I will upload it — please give complete educational walkthrough of every element.`
+  drawing:`I want to analyze a civil drawing. Uploading now — please do complete PMC analysis.`,
+  estimate:`I need cost estimation. Please guide me or I will paste project scope/estimate data.`,
+  boq:`I need to prepare a BOQ. Will upload drawing or describe scope — give full BOQ with INR rates.`,
+  compare:`I want to compare quotes/drawings. Uploading files now — give full comparison + Excel report.`,
+  report:`I need a PMC site progress report. Please ask me for the details needed.`,
+  study:`I want to study this civil drawing. Uploading now — give educational walkthrough.`
 };
-let mode='auto',hist=[],files=[],busy=false;
+
+let mode='auto', hist=[], files=[], busy=false;
+let lastFiles=[], lastText='';
+
 function setMode(m,el){mode=m;document.querySelectorAll('.nb').forEach(b=>b.classList.remove('active'));el.classList.add('active');const i=MODES[m];document.getElementById('tbt').textContent=i.t;document.getElementById('tbs').textContent=i.s;document.getElementById('mbadge').textContent=i.b;}
-function onFiles(e){Array.from(e.target.files).forEach(f=>{const rd=new FileReader();rd.onload=ev=>{files.push({name:f.name,type:f.type,b64:ev.target.result.split(',')[1]});renderChips();};rd.readAsDataURL(f);});document.getElementById('fi').value='';}
-function renderChips(){const c=document.getElementById('chips');c.innerHTML='';files.forEach((f,i)=>{const ch=document.createElement('div');ch.className='chip';ch.innerHTML=`<span>${f.name.match(/\.pdf$/i)?'📄':'🖼️'}</span><span class="cn">${f.name}</span><span class="rm" onclick="rmF(${i})">✕</span>`;c.appendChild(ch);});}
+function onFiles(e){Array.from(e.target.files).forEach(f=>{const rd=new FileReader();rd.onload=ev=>{files.push({name:f.name,type:f.type||'application/octet-stream',b64:ev.target.result.split(',')[1]});renderChips();};rd.readAsDataURL(f);});document.getElementById('fi').value='';}
+function renderChips(){const c=document.getElementById('chips');c.innerHTML='';files.forEach((f,i)=>{const ch=document.createElement('div');ch.className='chip';const icon=f.name.match(/\.pdf$/i)?'📄':f.name.match(/\.(xlsx?|csv)$/i)?'📊':'🖼️';ch.innerHTML=`<span>${icon}</span><span class="cn">${f.name}</span><span class="rm" onclick="rmF(${i})">✕</span>`;c.appendChild(ch);});}
 function rmF(i){files.splice(i,1);renderChips();}
 function hw(){const w=document.getElementById('welcome');if(w)w.style.display='none';}
-function di(text){const t=text.toLowerCase();if(t.includes('comparison')||t.includes('option a'))return{c:'dcp',l:'Comparison Report'};if(t.includes('drawing')||t.includes('floor plan')||t.includes('rcc')||t.includes('structural'))return{c:'dd',l:'Drawing Analysis'};if(t.includes('boq')||t.includes('bill of quantities'))return{c:'db',l:'BOQ / Takeoff'};if(t.includes('estimate')||t.includes('cost'))return{c:'dc',l:'Cost Estimate'};if(t.includes('site')||t.includes('progress'))return{c:'ds',l:'Site Report'};return{c:'dg',l:'PMC Analysis'};}
-function addMsg(role,text,fnames,badge){hw();const chat=document.getElementById('chat');const row=document.createElement('div');row.className=`msg ${role}`;const av=document.createElement('div');av.className=`av ${role}`;av.textContent=role==='ai'?'PMC':'👤';const bub=document.createElement('div');bub.className=`bub ${role}`;if(badge&&role==='ai'){const info=di(text);const b=document.createElement('div');b.className=`dbadge ${info.c}`;b.textContent='🔍 '+info.l;bub.appendChild(b);bub.appendChild(document.createElement('br'));}if(fnames&&fnames.length){const fr=document.createElement('div');fr.className='fpills';fnames.forEach(n=>{const p=document.createElement('div');p.className=`fp ${role==='user'?'u':'a'}`;p.textContent=(n.match(/\.pdf$/i)?'📄':'🖼️')+' '+n;fr.appendChild(p);});bub.appendChild(fr);}const tx=document.createElement('div');if(role==='ai'){tx.innerHTML=mdt(text);}else{tx.style.whiteSpace='pre-wrap';tx.textContent=text;}bub.appendChild(tx);row.appendChild(av);row.appendChild(bub);chat.appendChild(row);chat.scrollTop=chat.scrollHeight;}
+
+function di(text){const t=text.toLowerCase();if(t.includes('comparison')||t.includes('option a'))return{c:'dcp',l:'Comparison Report'};if(t.includes('drawing')||t.includes('floor plan')||t.includes('rcc'))return{c:'dd',l:'Drawing Analysis'};if(t.includes('boq')||t.includes('bill of quantities'))return{c:'db',l:'BOQ / Takeoff'};if(t.includes('estimate')||t.includes('cost'))return{c:'dc',l:'Cost Estimate'};if(t.includes('site')||t.includes('progress'))return{c:'ds',l:'Site Report'};return{c:'dg',l:'PMC Analysis'};}
+
+function addMsg(role,text,fnames,badge,msgFiles,msgText){
+  hw();
+  const chat=document.getElementById('chat');
+  const row=document.createElement('div');row.className=`msg ${role}`;
+  const av=document.createElement('div');av.className=`av ${role}`;av.textContent=role==='ai'?'PMC':'👤';
+  const bub=document.createElement('div');bub.className=`bub ${role}`;
+  if(badge&&role==='ai'){const info=di(text);const b=document.createElement('div');b.className=`dbadge ${info.c}`;b.textContent='🔍 '+info.l;bub.appendChild(b);bub.appendChild(document.createElement('br'));}
+  if(fnames&&fnames.length){const fr=document.createElement('div');fr.className='fpills';fnames.forEach(n=>{const p=document.createElement('div');p.className=`fp ${role==='user'?'u':'a'}`;const ic=n.match(/\.pdf$/i)?'📄':n.match(/\.(xlsx?|csv)$/i)?'📊':'🖼️';p.textContent=ic+' '+n;fr.appendChild(p);});bub.appendChild(fr);}
+  const tx=document.createElement('div');
+  if(role==='ai'){tx.innerHTML=mdt(text);}else{tx.style.whiteSpace='pre-wrap';tx.textContent=text;}
+  bub.appendChild(tx);
+
+  // Add Excel download button for AI responses when files were uploaded
+  if(role==='ai' && msgFiles && msgFiles.length>0){
+    const xlBtn=document.createElement('button');
+    xlBtn.className='xl-btn';
+    xlBtn.innerHTML='<span class="xl-icon">📊</span><span class="spinner"></span> Download Excel Report';
+    xlBtn.onclick=()=>downloadExcel(xlBtn, msgFiles, msgText||'');
+    bub.appendChild(xlBtn);
+  }
+
+  row.appendChild(av);row.appendChild(bub);
+  chat.appendChild(row);chat.scrollTop=chat.scrollHeight;
+}
+
+async function downloadExcel(btn, uploadedFiles, userText){
+  btn.disabled=true;
+  btn.classList.add('loading');
+  btn.querySelector('span:last-child').textContent=' Generating Excel...';
+  try{
+    const res=await fetch('/export-excel',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({files:uploadedFiles, userText, mode})
+    });
+    if(!res.ok){
+      const e=await res.json().catch(()=>({}));
+      throw new Error(e.error||'Export failed');
+    }
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;
+    a.download=`PMC_Report_${new Date().toISOString().slice(0,10)}.xlsx`;
+    a.click();
+    URL.revokeObjectURL(url);
+    btn.innerHTML='<span class="xl-icon">✅</span> Downloaded!';
+    btn.style.background='#059669';
+  }catch(err){
+    btn.innerHTML='<span class="xl-icon">❌</span> '+err.message;
+    btn.style.background='#DC2626';
+    btn.disabled=false;
+  }
+  btn.classList.remove('loading');
+}
+
 function addLoad(){hw();const chat=document.getElementById('chat');const row=document.createElement('div');row.className='msg ai';row.id='lr';const av=document.createElement('div');av.className='av ai';av.textContent='PMC';const bub=document.createElement('div');bub.className='bub';bub.innerHTML='<div class="dots"><span></span><span></span><span></span></div>';row.appendChild(av);row.appendChild(bub);chat.appendChild(row);chat.scrollTop=chat.scrollHeight;}
 function rmLoad(){const r=document.getElementById('lr');if(r)r.remove();}
+
 function mdt(t){return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>').replace(/^### (.+)$/gm,'<h3>$1</h3>').replace(/^## (.+)$/gm,'<h2>$1</h2>').replace(/^# (.+)$/gm,'<h2>$1</h2>').replace(/^---+$/gm,'<hr>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/^\|(.+)\|$/gm,(_,row)=>{const cells=row.split('|').map(c=>c.trim());if(cells.every(c=>/^[-:]+$/.test(c)))return'';return'<tr>'+cells.map(c=>`<td>${c}</td>`).join('')+'</tr>';}).replace(/(<tr>[\s\S]*?<\/tr>\n?)+/g,m=>{const rows=m.match(/<tr>[\s\S]*?<\/tr>/g)||[];if(!rows.length)return m;const[first,...rest]=rows;const h=first.replace(/<td>/g,'<th>').replace(/<\/td>/g,'</th>');return`<table><thead>${h}</thead><tbody>${rest.join('')}</tbody></table>`;}).replace(/^[-*] (.+)$/gm,'<li>$1</li>').replace(/(<li>[\s\S]*?<\/li>\n?)+/g,m=>`<ul>${m}</ul>`).replace(/\n{2,}/g,'<br><br>').replace(/\n/g,'<br>');}
+
 async function send(){
   if(busy)return;
   const tin=document.getElementById('tin');
   const txt=tin.value.trim();
   if(!txt&&!files.length)return;
   busy=true;document.getElementById('sbtn').disabled=true;
+
+  const sentFiles=[...files];
+  const sentText=txt;
   const fnames=files.map(f=>f.name);
   const disp=txt||(fnames.length?'Analyze uploaded file(s) and pull all proper details.':'');
   addMsg('user',disp,fnames);
   tin.value='';tin.style.height='auto';
+
   const parts=[];
-  files.forEach(f=>{parts.push({inline_data:{mime_type:f.type||(f.name.match(/\.pdf$/i)?'application/pdf':'image/jpeg'),data:f.b64}});});
+  files.forEach(f=>{
+    if(f.type==='application/pdf'||f.name.match(/\.pdf$/i)){
+      parts.push({inline_data:{mime_type:'application/pdf',data:f.b64}});
+    }else if(f.type.startsWith('image/')){
+      parts.push({inline_data:{mime_type:f.type,data:f.b64}});
+    }
+  });
   let prompt=txt||'Auto-detect these file(s) and provide full detailed professional PMC civil construction analysis.';
-  if(files.length>1)prompt+=`\n\n${files.length} files uploaded — if two similar documents, auto-treat as COMPARISON and generate full comparison report.`;
+  if(files.length>1)prompt+=`\n\n${files.length} files uploaded — if two or more similar documents, auto-treat as COMPARISON and generate full comparison report.`;
   parts.push({text:prompt});
+
   hist.push({role:'user',parts});
   files=[];renderChips();
   addLoad();
+
   try{
     const body={system_instruction:{parts:[{text:SYS[mode]}]},contents:hist,generationConfig:{maxOutputTokens:8192,temperature:0.3}};
     const res=await fetch('/gemini',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body})});
@@ -235,18 +325,20 @@ async function send(){
     const data=await res.json();
     const aiText=data?.candidates?.[0]?.content?.parts?.[0]?.text||'No response received.';
     hist.push({role:'model',parts:[{text:aiText}]});
-    rmLoad();addMsg('ai',aiText,null,true);
+    rmLoad();
+    // Pass sentFiles so Excel button appears when files were uploaded
+    addMsg('ai',aiText,null,true, sentFiles.length>0?sentFiles:null, sentText);
   }catch(err){
     rmLoad();hist.pop();
     let msg=err.message;
-    if(msg.includes('429'))msg='Rate limit hit. Wait a moment and try again.';
-    else if(msg.includes('API key'))msg='API key error on server. Check Render environment variable.';
+    if(msg.includes('429'))msg='Rate limit. Wait a moment and try again.';
     addMsg('ai',`**Error:** ${msg}`);
   }
   busy=false;document.getElementById('sbtn').disabled=false;
 }
+
 function qs(type){document.getElementById('tin').value=QT[type];aRz(document.getElementById('tin'));document.getElementById('tin').focus();}
-function newChat(){hist=[];files=[];renderChips();const chat=document.getElementById('chat');chat.innerHTML=`<div class="welcome" id="welcome"><div class="wico">🏗️</div><div class="wtit">PMC Civil AI Agent</div><div class="wsub">Upload any drawing, paste any estimate or BOQ — Gemini AI auto-detects everything and gives full professional PMC analysis.</div><div class="qgrid"><button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Analyze drawing</span><span class="qd">Upload civil drawing — full analysis with IS codes</span></button><button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Item-wise cost table in INR with rates</span></button><button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Prepare BOQ</span><span class="qd">Full bill of quantities with units & rates</span></button><button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare docs</span><span class="qd">2 drawings / BOQs / quotes — full report</span></button><button class="qcard" onclick="qs('report')"><span class="qi">📊</span><span class="ql">Site report</span><span class="qd">Formal PMC progress report</span></button><button class="qcard" onclick="qs('study')"><span class="qi">🏗️</span><span class="ql">Study drawing</span><span class="qd">Educational walkthrough with IS codes</span></button></div></div>`;}
+function newChat(){hist=[];files=[];renderChips();const chat=document.getElementById('chat');chat.innerHTML=`<div class="welcome" id="welcome"><div class="wico">🏗️</div><div class="wtit">PMC Civil AI Agent</div><div class="wsub">Upload koi bhi file — PDF, image, Excel. AI automatically analysis karega aur <strong>PMC format Excel file</strong> download ke liye dega!</div><div class="qgrid"><button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Drawing analysis</span><span class="qd">Upload civil drawing → Excel report</span></button><button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Scope batao → Excel cost sheet</span></button><button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">BOQ / Takeoff</span><span class="qd">Drawing upload → Excel BOQ</span></button><button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare quotes</span><span class="qd">2-3 PDFs → Excel comparison</span></button><button class="qcard" onclick="qs('report')"><span class="qi">📊</span><span class="ql">Site report</span><span class="qd">Details do → Excel site report</span></button><button class="qcard" onclick="qs('study')"><span class="qi">🏗️</span><span class="ql">Drawing study</span><span class="qd">Upload → educational analysis</span></button></div></div>`;}
 function hkey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}}
 function aRz(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,120)+'px';}
 </script>
