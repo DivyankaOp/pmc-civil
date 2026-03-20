@@ -12,360 +12,381 @@ app.use(express.static(path.join(__dirname, 'public')));
 const GEMINI_URL = (key) =>
   `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`;
 
-// ── GEMINI CHAT ENDPOINT
+// ─── 1. CHAT ───────────────────────────────────────────────────────
 app.post('/gemini', async (req, res) => {
   try {
     const key = process.env.GEMINI_API_KEY;
-    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set in environment.' });
+    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
     const { body } = req.body;
-    if (!body) return res.status(400).json({ error: 'No body provided.' });
-    const response = await fetch(GEMINI_URL(key), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+    const r = await fetch(GEMINI_URL(key), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
     });
-    const data = await response.json();
-    return res.status(response.status).json(data);
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
+    return res.status(r.status).json(await r.json());
+  } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// ── EXCEL EXPORT ENDPOINT
+// ─── 2. EXTRACT DATA FROM FILES ────────────────────────────────────
+async function extractData(key, files, userText) {
+  const parts = [];
+  for (const f of (files || [])) {
+    if (f.type === 'application/pdf' || f.name?.match(/\.pdf$/i))
+      parts.push({ inline_data: { mime_type: 'application/pdf', data: f.b64 } });
+    else if (f.type?.startsWith('image/'))
+      parts.push({ inline_data: { mime_type: f.type, data: f.b64 } });
+  }
+  parts.push({ text: `Return ONLY raw JSON. No markdown. No backticks. Start { end }.
+
+{"report_type":"comparison","project_title":"from doc","company":"from doc","date":"DD-MM-YYYY","summary":"summary",
+"vendors":[{"name":"agency","vendor_name":"person","contact":"phone","quote_date":"DD-MM-YYYY","brand":"brand","product_description":"full desc"}],
+"pricing":{"old_rate":[{"label":"BASIC AMOUNT (OLD RATE)","values":[1000,2000,0,0,0]},{"label":"18% GST","values":[180,360,0,0,0]},{"label":"TOTAL AMOUNT WITH GST","values":[1180,2360,0,0,0]}],
+"new_rate":[{"label":"BASIC AMOUNT (NEW RATE)","values":[900,1800,1200,800,1100]},{"label":"18% GST","values":[162,324,216,144,198]},{"label":"SPECIAL DISCOUNT","values":[0,0,0,50,100]},{"label":"TOTAL AMOUNT WITH GST","values":[1062,2124,1416,894,1198]}]},
+"commercial_terms":[{"label":"PAYMENT TERMS","values":["v1","v2","v3","v4","v5"]},{"label":"FREIGHT & TRANSIT INSURANCE","values":["v1","v2","v3","v4","v5"]},{"label":"DELIVERY TIME","values":["v1","v2","v3","v4","v5"]},{"label":"INSTALLATION & COMMISSIONING","values":["v1","v2","v3","v4","v5"]},{"label":"WARRANTY","values":["v1","v2","v3","v4","v5"]}],
+"technical_specs":[{"label":"SPEC","values":["v1","v2","v3","v4","v5"]}],
+"boq_items":[{"sr":1,"description":"item","unit":"unit","qty":1,"rate":1000,"amount":1000}],
+"recommendation":"PMC recommendation"}
+
+Rules: exact numbers not strings | 0 for N/A in pricing | ONLY JSON` + (userText ? '\nNote: ' + userText : '') });
+
+  const r = await fetch(GEMINI_URL(key), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { maxOutputTokens: 8192, temperature: 0.0, responseMimeType: 'application/json' } })
+  });
+  let raw = (await r.json())?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
+  if (fb !== -1 && lb !== -1) raw = raw.slice(fb, lb + 1);
+  try { return JSON.parse(raw.replace(/```json|```/g, '').trim()); }
+  catch (e) {
+    return { report_type: 'general', project_title: userText || 'PMC Report', company: 'PMC', date: new Date().toLocaleDateString('en-IN'), summary: '', vendors: [], pricing: { old_rate: [], new_rate: [] }, commercial_terms: [], technical_specs: [], boq_items: [], recommendation: 'Refer to chat analysis.' };
+  }
+}
+
+// ─── 3. BUILD EXCEL — EXACT PMC FORMAT ────────────────────────────
+async function buildExcel(d) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'PMC Civil AI Agent';
+  const ws = wb.addWorksheet('Comparison');
+
+  // Exact colors from template
+  const NAVY    = 'FF1F3864';
+  const MIDBLUE = 'FF2E75B6';
+  const LTBLUE  = 'FFBDD7EE';
+  const YELLOW  = 'FFFFD966';
+  const GREEN   = 'FFE2EFDA';
+  const DKGREEN = 'FF375623';
+  const GREY    = 'FFF2F2F2';
+  const WHITE   = 'FFFFFFFF';
+  const LOWEST  = 'FF00B050';
+
+  const thin = { style: 'thin', color: { argb: 'FF000000' } };
+  const bdr  = { top: thin, left: thin, bottom: thin, right: thin };
+
+  const vendors = d.vendors || [];
+  const vc = Math.max(vendors.length, 1);
+  const LC = 2 + vc; // last column index
+
+  // Set exact col widths from template
+  ws.getColumn(1).width = 6;
+  ws.getColumn(2).width = 32;
+  for (let i = 3; i <= LC; i++) ws.getColumn(i).width = 28;
+
+  const sc = (cell, bgArgb, bold = false, fcArgb = 'FF000000', size = 10, align = 'left', wrap = true) => {
+    cell.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgArgb } };
+    cell.font   = { bold, color: { argb: fcArgb }, size, name: 'Calibri' };
+    cell.alignment = { horizontal: align, vertical: 'middle', wrapText: wrap };
+    cell.border = bdr;
+  };
+
+  const mergeRow = (r, text, bgArgb, fcArgb = 'FF000000', size = 10, bold = true, height = 18) => {
+    ws.mergeCells(r, 1, r, LC);
+    const c = ws.getCell(r, 1); c.value = text;
+    sc(c, bgArgb, bold, fcArgb, size, 'center');
+    ws.getRow(r).height = height;
+  };
+
+  let row = 1;
+
+  // ROW 1 — Company title  (bg:1F3864 fc:FFFFFF size:14 bold)
+  mergeRow(row++, d.company || 'VCT BHARUCH', NAVY, 'FFFFFFFF', 14, true, 22);
+
+  // ROW 2 — Report title  (bg:2E75B6 fc:FFFFFF size:12 bold)
+  mergeRow(row++, (d.project_title || 'COMPARISON REPORT').toUpperCase(), MIDBLUE, 'FFFFFFFF', 12, true, 20);
+
+  // ROW 3 — Column headers  (bg:1F3864 fc:FFFFFF size:9 bold)
+  const hRow = ws.getRow(row);
+  const h1 = hRow.getCell(1); h1.value = 'SR NO';      sc(h1, NAVY, true, 'FFFFFFFF', 9, 'center');
+  const h2 = hRow.getCell(2); h2.value = 'PARTICULARS'; sc(h2, NAVY, true, 'FFFFFFFF', 9, 'center');
+  vendors.forEach((v, i) => {
+    const c = hRow.getCell(i + 3);
+    c.value = `${v.name || ''}\n(${v.brand || ''})\n${v.quote_date || ''}`;
+    sc(c, NAVY, true, 'FFFFFFFF', 9, 'center');
+  });
+  hRow.height = 60; row++;
+
+  // ROWS 4-8 — Vendor info
+  const infoRows = [
+    { lbl: 'AGENCY NAME',       bg: LTBLUE, bold: true,  vals: vendors.map(v => v.name || '') },
+    { lbl: 'VENDOR NAME',       bg: GREY,   bold: false, vals: vendors.map(v => v.vendor_name || '') },
+    { lbl: 'CONTACT NO',        bg: LTBLUE, bold: true,  vals: vendors.map(v => String(v.contact || '')) },
+    { lbl: 'DATE OF QUOTATION', bg: GREY,   bold: false, vals: vendors.map(v => v.quote_date || '') },
+    { lbl: 'BRAND',             bg: LTBLUE, bold: true,  vals: vendors.map(v => v.brand || '') },
+  ];
+  infoRows.forEach(({ lbl, bg, bold, vals }) => {
+    const r = ws.getRow(row);
+    const sr = r.getCell(1); sr.value = ''; sc(sr, bg, false, 'FF000000', 10, 'center');
+    const lb = r.getCell(2); lb.value = lbl; sc(lb, bg, true, 'FF000000', 10, 'left');
+    vals.forEach((v, i) => { const c = r.getCell(i + 3); c.value = v; sc(c, bg, bold, 'FF000000', 10, 'center'); });
+    ws.getRow(row).height = 16; row++;
+  });
+
+  // ROW 9 — Product desc header  A9:B9 merged = "SR NO", C9:G9 merged = "PRODUCT DESCRIPTION"
+  ws.mergeCells(row, 1, row, 2);
+  const pd1 = ws.getCell(row, 1); pd1.value = 'SR NO'; sc(pd1, MIDBLUE, true, 'FFFFFFFF', 10, 'center');
+  ws.mergeCells(row, 3, row, LC);
+  const pd2 = ws.getCell(row, 3); pd2.value = 'PRODUCT DESCRIPTION'; sc(pd2, MIDBLUE, true, 'FFFFFFFF', 10, 'center');
+  ws.getRow(row).height = 16; row++;
+
+  // ROW 10 — Product descriptions
+  const pdRow = ws.getRow(row);
+  const pdsr = pdRow.getCell(1); pdsr.value = '1'; sc(pdsr, GREY, false, 'FF000000', 10, 'center');
+  const pdlb = pdRow.getCell(2); pdlb.value = 'PRODUCT DESCRIPTION'; sc(pdlb, GREY, true, 'FF000000', 10, 'left');
+  vendors.forEach((v, i) => {
+    const c = pdRow.getCell(i + 3); c.value = v.product_description || '';
+    sc(c, WHITE, false, 'FF000000', 9, 'left');
+  });
+  ws.getRow(row).height = 90; row++;
+
+  // PRICING OLD RATE
+  if (d.pricing?.old_rate?.length) {
+    mergeRow(row++, 'PRICING — OLD RATE', NAVY, 'FFFFFFFF', 10, true, 18);
+    d.pricing.old_rate.forEach(({ label, values }, idx) => {
+      const isTotal = label?.toUpperCase().includes('TOTAL');
+      const bg = isTotal ? YELLOW : WHITE;
+      const r = ws.getRow(row);
+      const src = r.getCell(1); src.value = ''; sc(src, bg, false, 'FF000000', 10, 'center');
+      const lc = r.getCell(2); lc.value = label; sc(lc, bg, isTotal, 'FF000000', 10, 'left');
+      (values || []).forEach((v, i) => {
+        const c = r.getCell(i + 3);
+        const disp = (v === 0 || v === null || v === '') ? 'N/A' : v;
+        c.value = disp;
+        if (typeof v === 'number' && v > 0) c.numFmt = '#,##0';
+        sc(c, bg, isTotal, 'FF000000', 10, 'center');
+      });
+      ws.getRow(row).height = 16; row++;
+    });
+  }
+
+  // PRICING NEW RATE
+  if (d.pricing?.new_rate?.length) {
+    mergeRow(row++, 'PRICING — NEW RATE', NAVY, 'FFFFFFFF', 10, true, 18);
+    let totalVals = [];
+    d.pricing.new_rate.forEach(({ label, values }) => {
+      const isTotal = label?.toUpperCase().includes('TOTAL');
+      const isDisc  = label?.toUpperCase().includes('DISCOUNT');
+      const bg = isTotal ? YELLOW : isDisc ? GREEN : WHITE;
+      if (isTotal) totalVals = values || [];
+      const r = ws.getRow(row);
+      const src = r.getCell(1); src.value = ''; sc(src, bg, false, 'FF000000', 10, 'center');
+      const lc = r.getCell(2); lc.value = label; sc(lc, bg, isTotal, 'FF000000', 10, 'left');
+      (values || []).forEach((v, i) => {
+        const c = r.getCell(i + 3);
+        c.value = (v === 0 || v === null || v === '') ? (isDisc ? '-' : 'N/A') : v;
+        if (typeof v === 'number' && v > 0) c.numFmt = '#,##0';
+        sc(c, bg, isTotal, 'FF000000', 10, 'center');
+      });
+      ws.getRow(row).height = 16; row++;
+    });
+
+    // LOWEST PRICE ROW
+    if (totalVals.length) {
+      const nums = totalVals.map(v => typeof v === 'number' ? v : parseFloat(String(v).replace(/[^0-9.]/g, '')) || 0);
+      const minVal = Math.min(...nums.filter(n => n > 0));
+      mergeRow(row++, 'LOWEST QUOTED PRICE (NEW RATE WITH GST)', NAVY, 'FFFFFFFF', 10, true, 18);
+      const lr = ws.getRow(row);
+      const lsr = lr.getCell(1); lsr.value = ''; sc(lsr, GREEN, false, 'FF000000', 10, 'center');
+      const llb = lr.getCell(2); llb.value = 'TOTAL WITH GST (HIGHLIGHT = LOWEST)'; sc(llb, GREEN, true, 'FF000000', 10, 'left');
+      nums.forEach((n, i) => {
+        const c = lr.getCell(i + 3);
+        const isLow = n === minVal && n > 0;
+        if (n > 0) { c.value = n; c.numFmt = '₹#,##0'; }
+        else c.value = 'N/A';
+        sc(c, isLow ? LOWEST : WHITE, isLow, isLow ? 'FFFFFFFF' : 'FF000000', 10, 'center');
+      });
+      ws.getRow(row).height = 18; row++;
+    }
+  }
+
+  // COMMERCIAL TERMS
+  if (d.commercial_terms?.length) {
+    mergeRow(row++, 'COMMERCIAL TERMS', NAVY, 'FFFFFFFF', 10, true, 18);
+    d.commercial_terms.forEach(({ label, values }, idx) => {
+      const bg = idx % 2 === 0 ? WHITE : GREY;
+      const r = ws.getRow(row);
+      const src = r.getCell(1); src.value = ''; sc(src, bg, false, 'FF000000', 10, 'center');
+      const lc = r.getCell(2); lc.value = label; sc(lc, bg, true, 'FF000000', 10, 'left');
+      (values || []).forEach((v, i) => { const c = r.getCell(i + 3); c.value = v; sc(c, bg, false, 'FF000000', 9, 'center'); });
+      ws.getRow(row).height = 40; row++;
+    });
+  }
+
+  // TECHNICAL SPECS
+  if (d.technical_specs?.length) {
+    mergeRow(row++, 'TECHNICAL SPECIFICATIONS', NAVY, 'FFFFFFFF', 10, true, 18);
+    d.technical_specs.forEach(({ label, values }, idx) => {
+      const bg = idx % 2 === 0 ? WHITE : GREY;
+      const r = ws.getRow(row);
+      const src = r.getCell(1); src.value = String(idx + 1); sc(src, bg, false, 'FF000000', 10, 'center');
+      const lc = r.getCell(2); lc.value = label; sc(lc, bg, true, 'FF000000', 10, 'left');
+      (values || []).forEach((v, i) => { const c = r.getCell(i + 3); c.value = v; sc(c, bg, false, 'FF000000', 10, 'center'); });
+      ws.getRow(row).height = 16; row++;
+    });
+  }
+
+  // BOQ
+  if (d.boq_items?.length) {
+    mergeRow(row++, 'BILL OF QUANTITIES', NAVY, 'FFFFFFFF', 11, true, 18);
+    const bHdr = ws.getRow(row++);
+    ['SR NO','DESCRIPTION OF WORK','UNIT','QUANTITY','RATE (INR)','AMOUNT (INR)'].forEach((h, i) => {
+      const c = bHdr.getCell(i + 1); c.value = h; sc(c, MIDBLUE, true, 'FFFFFFFF', 10, 'center');
+    });
+    let total = 0;
+    d.boq_items.forEach((item, idx) => {
+      const bg = idx % 2 === 0 ? WHITE : GREY;
+      const r = ws.getRow(row++);
+      [item.sr, item.description, item.unit, item.qty, item.rate, item.amount].forEach((v, i) => {
+        const c = r.getCell(i + 1); c.value = v;
+        sc(c, bg, false, 'FF000000', 10, i === 0 || i > 1 ? 'center' : 'left');
+        if (i >= 4 && typeof v === 'number') c.numFmt = '#,##0';
+      });
+      total += parseFloat(item.amount) || 0;
+    });
+    ws.mergeCells(row, 1, row, 4);
+    const tc = ws.getCell(row, 1); tc.value = 'GRAND TOTAL'; sc(tc, YELLOW, true, 'FF000000', 10, 'right');
+    const ta = ws.getCell(row, 6); ta.value = total; ta.numFmt = '₹#,##0'; sc(ta, YELLOW, true, 'FF000000', 10, 'center');
+    ws.getRow(row).height = 18; row++;
+  }
+
+  // PMC RECOMMENDATION — dark green header + light green box
+  mergeRow(row++, 'PMC RECOMMENDATION', DKGREEN, 'FFFFFFFF', 11, true, 18);
+  ws.mergeCells(row, 1, row, LC);
+  const recCell = ws.getCell(row, 1);
+  recCell.value = d.recommendation || 'Refer to chat analysis above.';
+  sc(recCell, GREEN, true, 'FF000000', 10, 'left');
+  ws.getRow(row).height = 70; row++;
+
+  // Summary
+  if (d.summary) {
+    ws.mergeCells(row, 1, row, LC);
+    const sCell = ws.getCell(row, 1);
+    sCell.value = 'SUMMARY: ' + d.summary;
+    sc(sCell, LTBLUE, false, 'FF000000', 9, 'left', true);
+    sCell.font = { ...sCell.font, italic: true };
+    ws.getRow(row).height = 30; row++;
+  }
+
+  // Footer
+  ws.mergeCells(row, 1, row, LC);
+  const fCell = ws.getCell(row, 1);
+  const today = new Date().toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric' });
+  fCell.value = `Prepared by: PMC Civil AI Agent  |  Date: ${today}  |  VCT Bharuch — Powered by Gemini AI`;
+  fCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GREY } };
+  fCell.font = { italic: true, size: 9, color: { argb: 'FF595959' }, name: 'Calibri' };
+  fCell.alignment = { horizontal: 'center', vertical: 'middle' };
+  ws.getRow(row).height = 14;
+
+  ws.views = [{ state: 'frozen', xSplit: 2, ySplit: 3 }];
+  return wb;
+}
+
+// ─── 4. EXCEL ENDPOINT ─────────────────────────────────────────────
 app.post('/export-excel', async (req, res) => {
   try {
     const key = process.env.GEMINI_API_KEY;
     if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
-    const { files, userText, mode } = req.body;
-
-    const parts = [];
-    if (files && files.length) {
-      for (const f of files) {
-        if (f.type === 'application/pdf' || f.name.match(/\.pdf$/i)) {
-          parts.push({ inline_data: { mime_type: 'application/pdf', data: f.b64 } });
-        } else if (f.type.startsWith('image/')) {
-          parts.push({ inline_data: { mime_type: f.type, data: f.b64 } });
-        }
-      }
-    }
-
-    const extractPrompt = `You are a PMC (Project Management Consultant) civil construction data extraction expert.
-
-Analyze the uploaded file(s) and extract ALL data. Return ONLY valid JSON (no markdown, no explanation).
-
-Return this exact JSON structure:
-{
-  "report_type": "comparison|estimation|boq|drawing|site_report|general",
-  "project_title": "string",
-  "company": "VCT BHARUCH or extract from document",
-  "date": "DD-MM-YYYY",
-  "summary": "2-3 line summary",
-  "vendors": [
-    {
-      "name": "Agency/Vendor name",
-      "contact": "contact number",
-      "quote_date": "date",
-      "brand": "brand name",
-      "product_description": "full product description"
-    }
-  ],
-  "pricing": {
-    "old_rate": [
-      { "label": "row label", "values": [v1, v2, v3] }
-    ],
-    "new_rate": [
-      { "label": "row label", "values": [v1, v2, v3] }
-    ]
-  },
-  "commercial_terms": [
-    { "label": "term name", "values": [v1, v2, v3] }
-  ],
-  "technical_specs": [
-    { "label": "spec name", "values": [v1, v2, v3] }
-  ],
-  "boq_items": [
-    { "sr": 1, "description": "item", "unit": "m3", "qty": 10, "rate": 5000, "amount": 50000 }
-  ],
-  "recommendation": "PMC recommendation with reasons",
-  "prepared_by": "PMC Civil AI Agent"
-}
-
-If a field is not applicable, use empty array []. Extract every number and detail accurately. For comparisons extract ALL vendors/options.`;
-
-    parts.push({ text: extractPrompt + (userText ? '\n\nUser note: ' + userText : '') });
-
-    const geminiRes = await fetch(GEMINI_URL(key), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts }],
-        generationConfig: { maxOutputTokens: 8192, temperature: 0.1 }
-      })
-    });
-
-    const geminiData = await geminiRes.json();
-    let rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    rawText = rawText.replace(/```json|```/g, '').trim();
-
-    let data;
-    try {
-      data = JSON.parse(rawText);
-    } catch (e) {
-      return res.status(500).json({ error: 'Could not parse AI response as JSON: ' + rawText.slice(0, 200) });
-    }
-
-    const wb = new ExcelJS.Workbook();
-    const ws = wb.addWorksheet('PMC Report');
-
-    const NAVY    = '1F3864';
-    const MIDBLUE = '2E75B6';
-    const LTBLUE  = 'BDD7EE';
-    const YELLOW  = 'FFD966';
-    const GREEN   = 'E2EFDA';
-    const DKGREEN = '375623';
-    const GREY    = 'F2F2F2';
-    const WHITE   = 'FFFFFF';
-
-    const thin = { style: 'thin', color: { argb: 'FF000000' } };
-    const allBorders = { top: thin, left: thin, bottom: thin, right: thin };
-
-    function styleCell(cell, opts = {}) {
-      if (opts.bg)   cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + opts.bg } };
-      if (opts.bold !== undefined || opts.color || opts.size || opts.italic) {
-        cell.font = {
-          bold: opts.bold || false,
-          italic: opts.italic || false,
-          color: { argb: 'FF' + (opts.color || '000000') },
-          size: opts.size || 10,
-          name: 'Calibri'
-        };
-      }
-      cell.alignment = { horizontal: opts.align || 'left', vertical: 'middle', wrapText: opts.wrap !== false };
-      if (opts.border !== false) cell.border = allBorders;
-    }
-
-    const vendors = data.vendors || [];
-    const vendorCount = Math.max(vendors.length, 1);
-    let row = 1;
-
-    ws.getColumn(1).width = 6;
-    ws.getColumn(2).width = 30;
-    for (let i = 3; i <= vendorCount + 2; i++) ws.getColumn(i).width = 26;
-
-    function addFullRow(rowNum, text, bg, color = 'FFFFFF', size = 12, bold = true) {
-      ws.mergeCells(rowNum, 1, rowNum, vendorCount + 2);
-      const cell = ws.getCell(rowNum, 1);
-      cell.value = text;
-      styleCell(cell, { bg, color, bold, size, align: 'center', border: true });
-      ws.getRow(rowNum).height = 20;
-    }
-
-    function addRow(rowNum, srVal, label, values, bg, labelBold = false) {
-      const srCell = ws.getCell(rowNum, 1);
-      srCell.value = srVal;
-      styleCell(srCell, { bg: bg || GREY, align: 'center', border: true });
-      const lblCell = ws.getCell(rowNum, 2);
-      lblCell.value = label;
-      styleCell(lblCell, { bg: bg || WHITE, bold: labelBold, border: true });
-      values.forEach((v, i) => {
-        const c = ws.getCell(rowNum, i + 3);
-        c.value = v;
-        styleCell(c, { bg: bg || WHITE, align: 'center', border: true });
-      });
-      ws.getRow(rowNum).height = 16;
-    }
-
-    // TITLE
-    addFullRow(row++, data.company || 'PMC BHARUCH', NAVY, 'FFFFFF', 14, true);
-    addFullRow(row++, (data.project_title || 'COMPARISON REPORT').toUpperCase(), MIDBLUE, 'FFFFFF', 12, true);
-
-    // VENDOR HEADERS
-    const hdrRow = ws.getRow(row);
-    hdrRow.getCell(1).value = 'SR NO';
-    styleCell(hdrRow.getCell(1), { bg: NAVY, color: 'FFFFFF', bold: true, align: 'center', border: true });
-    hdrRow.getCell(2).value = 'PARTICULARS';
-    styleCell(hdrRow.getCell(2), { bg: NAVY, color: 'FFFFFF', bold: true, align: 'center', border: true });
-    vendors.forEach((v, i) => {
-      const c = hdrRow.getCell(i + 3);
-      c.value = `${v.name || ''}\n(${v.brand || ''})\n${v.quote_date || ''}`;
-      styleCell(c, { bg: NAVY, color: 'FFFFFF', bold: true, align: 'center', border: true });
-    });
-    hdrRow.height = 50;
-    row++;
-
-    // VENDOR INFO
-    [
-      ['', 'AGENCY NAME',       vendors.map(v => v.name || '')],
-      ['', 'CONTACT NO',        vendors.map(v => v.contact || '')],
-      ['', 'DATE OF QUOTATION', vendors.map(v => v.quote_date || '')],
-      ['', 'BRAND',             vendors.map(v => v.brand || '')],
-    ].forEach(([sr, lbl, vals], idx) => {
-      addRow(row++, sr, lbl, vals, idx % 2 === 0 ? LTBLUE : GREY, true);
-    });
-
-    // PRODUCT DESCRIPTION
-    if (vendors.some(v => v.product_description)) {
-      addFullRow(row++, 'PRODUCT DESCRIPTION', MIDBLUE, 'FFFFFF', 10, true);
-      const pdRow = ws.getRow(row);
-      pdRow.getCell(1).value = '1';
-      styleCell(pdRow.getCell(1), { bg: WHITE, align: 'center', border: true });
-      pdRow.getCell(2).value = 'PRODUCT DESCRIPTION';
-      styleCell(pdRow.getCell(2), { bg: WHITE, bold: true, border: true });
-      vendors.forEach((v, i) => {
-        const c = pdRow.getCell(i + 3);
-        c.value = v.product_description || '';
-        styleCell(c, { bg: WHITE, align: 'left', border: true, size: 9 });
-      });
-      pdRow.height = 80;
-      row++;
-    }
-
-    // PRICING OLD
-    if (data.pricing?.old_rate?.length) {
-      addFullRow(row++, 'PRICING — OLD RATE', NAVY, 'FFFFFF', 10, true);
-      data.pricing.old_rate.forEach((r, idx) => {
-        const isTotal = r.label?.toUpperCase().includes('TOTAL');
-        addRow(row++, '', r.label, r.values || [], isTotal ? YELLOW : (idx % 2 === 0 ? WHITE : GREY), isTotal);
-      });
-    }
-
-    // PRICING NEW
-    if (data.pricing?.new_rate?.length) {
-      addFullRow(row++, 'PRICING — NEW RATE (LATEST)', NAVY, 'FFFFFF', 10, true);
-      const totals = [];
-      data.pricing.new_rate.forEach((r, idx) => {
-        const isTotal = r.label?.toUpperCase().includes('TOTAL');
-        const isDisc  = r.label?.toUpperCase().includes('DISCOUNT');
-        if (isTotal) totals.push(...(r.values || []));
-        addRow(row++, '', r.label, r.values || [], isTotal ? YELLOW : isDisc ? GREEN : (idx % 2 === 0 ? WHITE : GREY), isTotal);
-      });
-
-      if (totals.length > 0) {
-        const nums = totals.map(v => parseFloat(String(v).replace(/[^0-9.]/g, '')) || 0);
-        const minVal = Math.min(...nums.filter(n => n > 0));
-        addFullRow(row++, 'LOWEST QUOTED PRICE', MIDBLUE, 'FFFFFF', 10, true);
-        const lowRow = ws.getRow(row);
-        lowRow.getCell(1).value = '';
-        styleCell(lowRow.getCell(1), { bg: GREEN, border: true });
-        lowRow.getCell(2).value = 'TOTAL WITH GST (✓ = LOWEST)';
-        styleCell(lowRow.getCell(2), { bg: GREEN, bold: true, border: true });
-        nums.forEach((n, i) => {
-          const c = lowRow.getCell(i + 3);
-          const isLowest = n === minVal && n > 0;
-          c.value = n > 0 ? `₹${n.toLocaleString('en-IN')}${isLowest ? ' ✓ LOWEST' : ''}` : '—';
-          styleCell(c, { bg: isLowest ? '00B050' : WHITE, color: isLowest ? 'FFFFFF' : '000000', bold: isLowest, align: 'center', border: true });
-        });
-        lowRow.height = 20;
-        row++;
-      }
-    }
-
-    // BOQ ITEMS
-    if (data.boq_items?.length) {
-      addFullRow(row++, 'BILL OF QUANTITIES', NAVY, 'FFFFFF', 11, true);
-      const boqHdr = ws.getRow(row++);
-      ['SR NO','DESCRIPTION OF WORK','UNIT','QUANTITY','RATE (INR)','AMOUNT (INR)'].forEach((h, i) => {
-        const c = boqHdr.getCell(i + 1);
-        c.value = h;
-        styleCell(c, { bg: MIDBLUE, color: 'FFFFFF', bold: true, align: 'center', border: true });
-      });
-      let total = 0;
-      data.boq_items.forEach((item, idx) => {
-        const bg = idx % 2 === 0 ? WHITE : GREY;
-        const r = ws.getRow(row++);
-        [item.sr, item.description, item.unit, item.qty, item.rate, item.amount].forEach((v, i) => {
-          const c = r.getCell(i + 1);
-          c.value = v;
-          styleCell(c, { bg, align: i === 0 ? 'center' : i > 1 ? 'center' : 'left', border: true });
-        });
-        total += parseFloat(item.amount) || 0;
-      });
-      const totRow = ws.getRow(row++);
-      ws.mergeCells(row - 1, 1, row - 1, 4);
-      totRow.getCell(1).value = 'TOTAL';
-      styleCell(totRow.getCell(1), { bg: YELLOW, bold: true, align: 'right', border: true });
-      totRow.getCell(5).value = '';
-      styleCell(totRow.getCell(5), { bg: YELLOW, border: true });
-      totRow.getCell(6).value = total;
-      styleCell(totRow.getCell(6), { bg: YELLOW, bold: true, align: 'center', border: true });
-    }
-
-    // COMMERCIAL TERMS
-    if (data.commercial_terms?.length) {
-      addFullRow(row++, 'COMMERCIAL TERMS', NAVY, 'FFFFFF', 10, true);
-      data.commercial_terms.forEach((t, idx) => {
-        addRow(row++, '', t.label, t.values || [], idx % 2 === 0 ? WHITE : GREY, true);
-        ws.getRow(row - 1).height = 40;
-      });
-    }
-
-    // TECHNICAL SPECS
-    if (data.technical_specs?.length) {
-      addFullRow(row++, 'TECHNICAL SPECIFICATIONS', NAVY, 'FFFFFF', 10, true);
-      data.technical_specs.forEach((s, idx) => {
-        addRow(row++, String(idx + 1), s.label, s.values || [], idx % 2 === 0 ? WHITE : GREY, true);
-      });
-    }
-
-    // PMC RECOMMENDATION
-    if (data.recommendation) {
-      addFullRow(row++, 'PMC RECOMMENDATION', DKGREEN, 'FFFFFF', 11, true);
-      ws.mergeCells(row, 1, row, vendorCount + 2);
-      const recCell = ws.getCell(row, 1);
-      recCell.value = data.recommendation;
-      styleCell(recCell, { bg: 'E2EFDA', bold: false, align: 'left', size: 10, border: true });
-      ws.getRow(row).height = 80;
-      row++;
-    }
-
-    // SUMMARY
-    if (data.summary) {
-      ws.mergeCells(row, 1, row, vendorCount + 2);
-      const sumCell = ws.getCell(row, 1);
-      sumCell.value = 'SUMMARY: ' + data.summary;
-      styleCell(sumCell, { bg: LTBLUE, bold: false, align: 'left', size: 9, italic: true, border: true });
-      ws.getRow(row).height = 30;
-      row++;
-    }
-
-    // FOOTER
-    ws.mergeCells(row, 1, row, vendorCount + 2);
-    const footCell = ws.getCell(row, 1);
-    const today = new Date().toLocaleDateString('en-IN', { day:'2-digit', month:'2-digit', year:'numeric' });
-    footCell.value = `Prepared by: PMC Civil AI Agent  |  Date: ${today}  |  Powered by Gemini AI`;
-    styleCell(footCell, { bg: GREY, color: '595959', align: 'center', size: 9, italic: true, bold: false, border: false });
-    ws.getRow(row).height = 14;
-
-    ws.views = [{ state: 'frozen', xSplit: 2, ySplit: 3 }];
-
+    const { files, userText } = req.body;
+    const d = await extractData(key, files, userText);
+    const wb = await buildExcel(d);
+    const today = new Date().toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric' }).replace(/\//g, '-');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="PMC_Report.xlsx"');
-    await wb.xlsx.write(res);
-    res.end();
-
+    res.setHeader('Content-Disposition', `attachment; filename="PMC_Report_${today}.xlsx"`);
+    await wb.xlsx.write(res); res.end();
   } catch (err) {
-    console.error('Export error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Excel error:', err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
 
-// Keep-alive ping every 14 min to prevent Render free tier sleep
-const APP_URL = process.env.RENDER_EXTERNAL_URL;
-if (APP_URL) {
-  setInterval(() => {
-    fetch(APP_URL + '/health').catch(() => {});
-  }, 14 * 60 * 1000);
-}
+// ─── 5. PDF ENDPOINT (print-ready HTML) ────────────────────────────
+app.post('/export-pdf', async (req, res) => {
+  try {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
+    const { files, userText } = req.body;
+    const d = await extractData(key, files, userText);
+    const today = new Date().toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric' });
+    const vendors = d.vendors || [];
+    const vc = Math.max(vendors.length, 1);
 
-// Health check
+    const th = (txt, bg = '#1F3864', fc = '#fff', bold = true) =>
+      `<th style="background:${bg};color:${fc};padding:6px 8px;font-size:9px;border:1px solid #000;text-align:center;font-weight:${bold?'bold':'normal'};">${txt}</th>`;
+    const td = (txt, bg = '#fff', align = 'center', bold = false, size = 9) =>
+      `<td style="background:${bg};color:#000;padding:6px 8px;font-size:${size}px;border:1px solid #ccc;text-align:${align};font-weight:${bold?'bold':'normal'};vertical-align:top;">${txt||''}</td>`;
+    const sectionHdr = (txt, bg = '#1F3864') =>
+      `<tr><td colspan="${vc+2}" style="background:${bg};color:#fff;font-weight:bold;padding:7px 10px;font-size:10px;border:1px solid #000;">${txt}</td></tr>`;
+    const fmtNum = (v) => typeof v === 'number' && v > 0 ? '₹' + v.toLocaleString('en-IN') : (v === 0 ? 'N/A' : (v || 'N/A'));
+
+    let html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+@page{size:A3 landscape;margin:8mm}
+*{box-sizing:border-box}
+body{font-family:Calibri,Arial,sans-serif;font-size:9px;margin:0;color:#000}
+h1{background:#1F3864;color:#fff;text-align:center;padding:9px;margin:0;font-size:15px}
+h2{background:#2E75B6;color:#fff;text-align:center;padding:7px;margin:0 0 4px;font-size:12px}
+table{width:100%;border-collapse:collapse;margin-bottom:2px}
+.rec-hdr{background:#375623;color:#fff;font-weight:bold;padding:7px 10px;font-size:10px;margin-top:4px}
+.rec-body{background:#E2EFDA;padding:10px;font-size:9px;border:1px solid #375623;white-space:pre-wrap}
+.summ{background:#BDD7EE;padding:7px 10px;font-size:8px;font-style:italic;margin-top:3px}
+.footer{text-align:center;font-size:8px;color:#595959;margin-top:6px;font-style:italic}
+</style></head><body>
+<h1>${d.company || 'VCT BHARUCH'}</h1>
+<h2>${(d.project_title || 'COMPARISON REPORT').toUpperCase()}</h2>
+<table>
+<tr>${th('SR NO')}${th('PARTICULARS')}${vendors.map(v => th(`${v.name||''}<br><small>(${v.brand||''})</small><br><small>${v.quote_date||''}</small>`)).join('')}</tr>
+${[['AGENCY NAME','BDD7EE',true,v=>v.name],['VENDOR NAME','F2F2F2',false,v=>v.vendor_name],['CONTACT NO','BDD7EE',false,v=>v.contact],['DATE OF QUOTATION','F2F2F2',false,v=>v.quote_date],['BRAND','BDD7EE',true,v=>v.brand]].map(([lbl,bg,bold,fn])=>`<tr>${td('',`#${bg}`)}<td style="background:#${bg};padding:6px 8px;font-size:9px;border:1px solid #ccc;font-weight:bold;">${lbl}</td>${vendors.map(v=>td(fn(v)||'',`#${bg}`,'center',bold)).join('')}</tr>`).join('')}
+${sectionHdr('PRODUCT DESCRIPTION','#2E75B6')}
+<tr>${td('1','#F2F2F2','center')}${td('<b>PRODUCT DESCRIPTION</b>','#F2F2F2','left',true)}${vendors.map(v=>td(v.product_description||'','#fff','left',false,8)).join('')}</tr>
+${d.pricing?.old_rate?.length ? sectionHdr('PRICING — OLD RATE') + d.pricing.old_rate.map(({label,values})=>{const isT=label?.toUpperCase().includes('TOTAL');const bg=isT?'#FFD966':'#fff';return`<tr>${td('',bg)}${td(label,bg,'left',isT)}${(values||[]).map(v=>td(fmtNum(v),bg,'center',isT)).join('')}</tr>`;}).join('') : ''}
+${d.pricing?.new_rate?.length ? sectionHdr('PRICING — NEW RATE') + d.pricing.new_rate.map(({label,values})=>{const isT=label?.toUpperCase().includes('TOTAL');const isD=label?.toUpperCase().includes('DISCOUNT');const bg=isT?'#FFD966':isD?'#E2EFDA':'#fff';return`<tr>${td('',bg)}${td(label,bg,'left',isT)}${(values||[]).map(v=>td(isT&&typeof v==='number'&&v>0?'₹'+v.toLocaleString('en-IN'):isD&&(v===0||!v)?'-':fmtNum(v),bg,'center',isT)).join('')}</tr>`;}).join('') : ''}
+${(()=>{const tr=d.pricing?.new_rate?.find(r=>r.label?.toUpperCase().includes('TOTAL'));if(!tr)return'';const nums=(tr.values||[]).map(v=>typeof v==='number'?v:0);const minV=Math.min(...nums.filter(n=>n>0));return sectionHdr('LOWEST QUOTED PRICE')+`<tr>${td('')}<td style="background:#E2EFDA;padding:6px 8px;font-size:9px;border:1px solid #ccc;font-weight:bold;">TOTAL WITH GST (HIGHLIGHT = LOWEST)</td>${nums.map(n=>n===minV&&n>0?`<td style="background:#00B050;color:#fff;padding:6px 8px;font-size:9px;border:1px solid #ccc;text-align:center;font-weight:bold;">₹${n.toLocaleString('en-IN')} ✓</td>`:td(n>0?'₹'+n.toLocaleString('en-IN'):'N/A','#fff','center')).join('')}</tr>`;})()}
+${d.commercial_terms?.length?sectionHdr('COMMERCIAL TERMS')+d.commercial_terms.map(({label,values},i)=>{const bg=i%2===0?'#fff':'#F2F2F2';return`<tr>${td('',bg)}<td style="background:${bg};padding:7px 8px;font-size:9px;border:1px solid #ccc;font-weight:bold;">${label}</td>${(values||[]).map(v=>td(v||'',bg,'center',false,8)).join('')}</tr>`;}).join(''):''}
+${d.technical_specs?.length?sectionHdr('TECHNICAL SPECIFICATIONS')+d.technical_specs.map(({label,values},i)=>{const bg=i%2===0?'#fff':'#F2F2F2';return`<tr>${td(i+1,bg,'center')}<td style="background:${bg};padding:6px 8px;font-size:9px;border:1px solid #ccc;font-weight:bold;">${label}</td>${(values||[]).map(v=>td(v||'',bg,'center')).join('')}</tr>`;}).join(''):''}
+${d.boq_items?.length?(()=>{let tot=0;const rows=d.boq_items.map(({sr,description,unit,qty,rate,amount},i)=>{tot+=parseFloat(amount)||0;const bg=i%2===0?'#fff':'#F2F2F2';return`<tr>${td(sr,bg,'center')}${td(description,bg,'left')}${td(unit,bg,'center')}${td(qty,bg,'center')}${td(rate?'₹'+rate.toLocaleString('en-IN'):'',bg,'center')}${td(amount?'₹'+amount.toLocaleString('en-IN'):'',bg,'center')}</tr>`;}).join('');return sectionHdr('BILL OF QUANTITIES')+`<tr>${['SR NO','DESCRIPTION','UNIT','QTY','RATE','AMOUNT'].map(h=>th(h,'#2E75B6')).join('')}</tr>${rows}<tr><td colspan="5" style="background:#FFD966;padding:7px;font-weight:bold;border:1px solid #000;text-align:right;">GRAND TOTAL</td><td style="background:#FFD966;padding:7px;font-weight:bold;border:1px solid #000;text-align:center;">₹${tot.toLocaleString('en-IN')}</td></tr>`;})():''}
+</table>
+<div class="rec-hdr">PMC RECOMMENDATION</div>
+<div class="rec-body">${d.recommendation||'Refer to chat analysis.'}</div>
+${d.summary?`<div class="summ">SUMMARY: ${d.summary}</div>`:''}
+<div class="footer">Prepared by: PMC Civil AI Agent &nbsp;|&nbsp; Date: ${today} &nbsp;|&nbsp; VCT Bharuch — Powered by Gemini AI</div>
+</body></html>`;
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="PMC_Report_${today.replace(/\//g,'-')}.html"`);
+    res.send(html);
+  } catch (err) {
+    console.error('PDF error:', err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── 6. HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   const key = process.env.GEMINI_API_KEY;
   res.json({ status: 'ok', gemini_key_set: !!key, key_preview: key ? key.slice(0, 8) + '...' : 'NOT SET' });
 });
 
+const APP_URL = process.env.RENDER_EXTERNAL_URL;
+if (APP_URL) setInterval(() => fetch(APP_URL + '/health').catch(() => {}), 14 * 60 * 1000);
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  const key = process.env.GEMINI_API_KEY;
-  console.log(`\n✅ PMC Civil AI Agent running on port ${PORT}`);
-  console.log(`🔑 GEMINI_API_KEY: ${key ? 'SET ✅' : 'NOT SET ❌'}`);
+  console.log(`\n✅ PMC Civil AI Agent on port ${PORT}`);
+  console.log(`🔑 GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? 'SET ✅' : 'NOT SET ❌'}`);
 });
