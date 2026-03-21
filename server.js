@@ -3,6 +3,10 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 const path = require('path');
 const ExcelJS = require('exceljs');
+const { extractDrawingData, buildDrawingExcel } = require('./server_drawing');
+const { geminiAnalyzeDrawing, runCVAnalysis, RATES } = require('./drawing_analyzer');
+const { parseDXF, extractCivilData } = require('./dxf_parser');
+const { buildDXFExcel } = require('./dxf_to_excel');
 
 const app = express();
 app.use(cors());
@@ -25,27 +29,48 @@ app.post('/gemini', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// ─── 2. EXTRACT DATA FROM FILES ────────────────────────────────────
-async function extractData(key, files, userText) {
+// ─── 2. EXTRACT DATA ─────────────────────────────────────────────
+// Strategy: Use AI chat response text as PRIMARY source (already has all data)
+// Files only used if no aiResponse available
+async function extractData(key, files, userText, aiResponse) {
   const parts = [];
-  for (const f of (files || [])) {
-    if (f.type === 'application/pdf' || f.name?.match(/\.pdf$/i))
-      parts.push({ inline_data: { mime_type: 'application/pdf', data: f.b64 } });
-    else if (f.type?.startsWith('image/'))
-      parts.push({ inline_data: { mime_type: f.type, data: f.b64 } });
+  
+  // If we have the AI response from chat, use it as primary input
+  // This avoids re-processing files and gives much better results
+  const primaryText = aiResponse || userText || '';
+  
+  // Only add files if no AI response available
+  if (!aiResponse) {
+    for (const f of (files || [])) {
+      if (f.type === 'application/pdf' || f.name?.match(/\.pdf$/i))
+        parts.push({ inline_data: { mime_type: 'application/pdf', data: f.b64 } });
+      else if (f.type?.startsWith('image/'))
+        parts.push({ inline_data: { mime_type: f.type, data: f.b64 } });
+    }
   }
-  parts.push({ text: `Return ONLY raw JSON. No markdown. No backticks. Start { end }.
 
-{"report_type":"comparison","project_title":"from doc","company":"from doc","date":"DD-MM-YYYY","summary":"summary",
-"vendors":[{"name":"agency","vendor_name":"person","contact":"phone","quote_date":"DD-MM-YYYY","brand":"brand","product_description":"full desc"}],
-"pricing":{"old_rate":[{"label":"BASIC AMOUNT (OLD RATE)","values":[1000,2000,0,0,0]},{"label":"18% GST","values":[180,360,0,0,0]},{"label":"TOTAL AMOUNT WITH GST","values":[1180,2360,0,0,0]}],
-"new_rate":[{"label":"BASIC AMOUNT (NEW RATE)","values":[900,1800,1200,800,1100]},{"label":"18% GST","values":[162,324,216,144,198]},{"label":"SPECIAL DISCOUNT","values":[0,0,0,50,100]},{"label":"TOTAL AMOUNT WITH GST","values":[1062,2124,1416,894,1198]}]},
+  const prompt = `You are a PMC data extraction expert. Extract ALL data from the content below and return ONLY raw JSON. No markdown. No backticks. Start with { end with }.
+
+CONTENT TO EXTRACT FROM:
+${primaryText}
+
+Return this JSON structure (fill ALL fields from the content above):
+{"report_type":"comparison","project_title":"extract from content","company":"extract company name","date":"DD-MM-YYYY","summary":"2-3 line summary",
+"vendors":[{"name":"agency/company name","vendor_name":"contact person name","contact":"phone number","quote_date":"DD-MM-YYYY","brand":"brand/make name","product_description":"full product description"}],
+"pricing":{"old_rate":[{"label":"BASIC AMOUNT (OLD RATE)","values":[1000,2000,0,0,0]},{"label":"18% GST","values":[180,360,0,0,0]},{"label":"TOTAL AMOUNT WITH GST","values":[1180,2360,0,0,0]}],"new_rate":[{"label":"BASIC AMOUNT (NEW RATE)","values":[900,1800,1200,800,1100]},{"label":"18% GST","values":[162,324,216,144,198]},{"label":"SPECIAL DISCOUNT","values":[0,0,0,50,100]},{"label":"TOTAL AMOUNT WITH GST","values":[1062,2124,1416,894,1198]}]},
 "commercial_terms":[{"label":"PAYMENT TERMS","values":["v1","v2","v3","v4","v5"]},{"label":"FREIGHT & TRANSIT INSURANCE","values":["v1","v2","v3","v4","v5"]},{"label":"DELIVERY TIME","values":["v1","v2","v3","v4","v5"]},{"label":"INSTALLATION & COMMISSIONING","values":["v1","v2","v3","v4","v5"]},{"label":"WARRANTY","values":["v1","v2","v3","v4","v5"]}],
-"technical_specs":[{"label":"SPEC","values":["v1","v2","v3","v4","v5"]}],
+"technical_specs":[{"label":"SPEC NAME","values":["v1","v2","v3","v4","v5"]}],
 "boq_items":[{"sr":1,"description":"item","unit":"unit","qty":1,"rate":1000,"amount":1000}],
-"recommendation":"PMC recommendation"}
+"recommendation":"PMC recommendation with winner and reasons"}
 
-Rules: exact numbers not strings | 0 for N/A in pricing | ONLY JSON` + (userText ? '\nNote: ' + userText : '') });
+CRITICAL RULES:
+- Extract ALL vendors/options found in content
+- Numbers must be actual numbers not strings  
+- 0 or "N/A" for missing pricing values
+- Extract every detail from the content
+- ONLY RETURN JSON, NOTHING ELSE`;
+
+  parts.push({ text: prompt });
 
   const r = await fetch(GEMINI_URL(key), {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -56,7 +81,8 @@ Rules: exact numbers not strings | 0 for N/A in pricing | ONLY JSON` + (userText
   if (fb !== -1 && lb !== -1) raw = raw.slice(fb, lb + 1);
   try { return JSON.parse(raw.replace(/```json|```/g, '').trim()); }
   catch (e) {
-    return { report_type: 'general', project_title: userText || 'PMC Report', company: 'PMC', date: new Date().toLocaleDateString('en-IN'), summary: '', vendors: [], pricing: { old_rate: [], new_rate: [] }, commercial_terms: [], technical_specs: [], boq_items: [], recommendation: 'Refer to chat analysis.' };
+    console.error('JSON parse fail:', raw.slice(0, 300));
+    return { report_type: 'general', project_title: 'PMC Report', company: 'PMC', date: new Date().toLocaleDateString('en-IN'), summary: primaryText.slice(0, 200), vendors: [], pricing: { old_rate: [], new_rate: [] }, commercial_terms: [], technical_specs: [], boq_items: [], recommendation: primaryText.slice(0, 500) };
   }
 }
 
@@ -302,8 +328,8 @@ app.post('/export-excel', async (req, res) => {
   try {
     const key = process.env.GEMINI_API_KEY;
     if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
-    const { files, userText } = req.body;
-    const d = await extractData(key, files, userText);
+    const { files, userText, aiResponse } = req.body;
+    const d = await extractData(key, files, userText, aiResponse);
     const wb = await buildExcel(d);
     const today = new Date().toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric' }).replace(/\//g, '-');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -320,8 +346,8 @@ app.post('/export-pdf', async (req, res) => {
   try {
     const key = process.env.GEMINI_API_KEY;
     if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
-    const { files, userText } = req.body;
-    const d = await extractData(key, files, userText);
+    const { files, userText, aiResponse } = req.body;
+    const d = await extractData(key, files, userText, aiResponse);
     const today = new Date().toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric' });
     const vendors = d.vendors || [];
     const vc = Math.max(vendors.length, 1);
@@ -376,7 +402,173 @@ ${d.summary?`<div class="summ">SUMMARY: ${d.summary}</div>`:''}
   }
 });
 
-// ─── 6. HEALTH ─────────────────────────────────────────────────────
+// ─── 6. DRAWING ANALYSIS → MULTI-SHEET EXCEL (CV + AI) ──────────
+app.post('/export-drawing', async (req, res) => {
+  try {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
+    const { files, userText, aiResponse } = req.body;
+
+    // Step 1: Run OpenCV pixel-level analysis on images
+    let cvData = {};
+    const imageFiles = (files||[]).filter(f => f.type?.startsWith('image/'));
+    if (imageFiles.length > 0) {
+      try { cvData = runCVAnalysis(imageFiles[0].b64); }
+      catch(e) { console.log('CV skipped:', e.message); }
+    }
+
+    // Step 2: Gemini Vision — reads scale, dimensions, annotations + our formula engine
+    let drawingData = null;
+    if (files?.length > 0) {
+      drawingData = await geminiAnalyzeDrawing(key, files, cvData, fetch);
+    }
+
+    // Step 3: Fallback to text-based extraction if needed
+    if (!drawingData) {
+      drawingData = await extractDrawingData(key, files, userText, aiResponse, fetch);
+    }
+
+    // Add CV metadata to drawing data
+    drawingData.cv_analysis = cvData;
+    drawingData.prepared_by = 'PMC Civil AI Agent';
+
+    // Step 4: Build multi-sheet Excel
+    const wb = await buildDrawingExcel(drawingData);
+    const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
+    const pname = (drawingData.project_name||'Drawing').replace(/[^a-zA-Z0-9_]/g,'_').slice(0,20);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${pname}_PMC_Analysis_${today}.xlsx"`);
+    await wb.xlsx.write(res); res.end();
+  } catch (err) {
+    console.error('Drawing Excel error:', err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── 7. DXF UPLOAD & ANALYSIS ─────────────────────────────────────
+app.post('/analyze-dxf', async (req, res) => {
+  try {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
+    const { dxfContent, filename } = req.body;
+
+    if (!dxfContent) return res.status(400).json({ error: 'No DXF content provided.' });
+
+    // Step 1: Parse DXF
+    const parsed = parseDXF(dxfContent);
+    const civilData = extractCivilData(parsed, filename);
+
+    // Step 2: Send extracted data to Gemini for interpretation
+    const prompt = `You are a senior PMC civil engineer. Analyze this DXF drawing data and extract civil quantities.
+
+DRAWING DATA:
+- Filename: ${filename}
+- Scale: ${civilData.scale || 'not detected'}
+- Layers: ${civilData.layer_names.join(', ')}
+- Total texts: ${civilData.stats.total_texts}
+- Total dimensions: ${civilData.stats.total_dims}
+- Drawing extents: ${JSON.stringify(civilData.drawing_extents)}
+
+ALL TEXT FOUND IN DRAWING:
+${civilData.all_texts.slice(0,100).join('\n')}
+
+DIMENSION VALUES FOUND:
+${civilData.dimension_values.slice(0,50).map(d => d.value_m + 'm (' + (d.layer||'') + ')').join(', ')}
+
+CLOSED POLYLINE AREAS:
+${civilData.polyline_areas.slice(0,20).map(p => p.area_sqm + 'sqm ('+p.layer+')').join(', ')}
+
+Based on this data, return ONLY raw JSON:
+{
+  "project_name": "extract from texts",
+  "drawing_type": "SITE_LAYOUT|ROAD|BUILDING|DRAINAGE|etc",
+  "scale": "1:500 or detected",
+  "date": "from texts",
+  "roads": [
+    {"id":"R1","name":"Road 1","dimensions":{"length_m":129.12,"width_m":24,"carriage_width_m":15},"remark":"extract from text"}
+  ],
+  "plots": [
+    {"id":"P1","area_sqmt":500,"width_m":20,"depth_m":25}
+  ],
+  "boq": [
+    {"description":"item","unit":"SQMT","qty":1000,"rate":655,"amount":655000}
+  ],
+  "cost_summary": {"total_crores":0,"total_lacs":0},
+  "observations": ["obs1"],
+  "pmc_recommendation": "full recommendation"
+}`;
+
+    const GEMINI_URL = k => `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k}`;
+    const r = await fetch(GEMINI_URL(key), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 4096, temperature: 0.0, responseMimeType: 'application/json' }
+      })
+    });
+    let raw = (await r.json())?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
+    let geminiResult = {};
+    if (fb !== -1) try { geminiResult = JSON.parse(raw.slice(fb, lb+1)); } catch(e) {}
+
+    // Return parsed data + gemini interpretation
+    res.json({ success: true, dxf_data: civilData, interpretation: geminiResult });
+
+  } catch (err) {
+    console.error('DXF analyze error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/export-dxf-excel', async (req, res) => {
+  try {
+    const { dxfContent, filename, aiResponse } = req.body;
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
+    if (!dxfContent) return res.status(400).json({ error: 'No DXF content.' });
+
+    // Parse DXF
+    const parsed = parseDXF(dxfContent);
+    const civilData = extractCivilData(parsed, filename);
+
+    // Get Gemini interpretation via analyze-dxf logic
+    let geminiResult = {};
+    try {
+      const fakeReq = { body: { dxfContent, filename } };
+      // reuse the prompt building
+      const GEMINI_URL = k => `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k}`;
+      const prompt = \`You are a senior PMC civil engineer. Analyze this DXF drawing data.
+Scale: \${civilData.scale||'not detected'}
+Layers: \${civilData.layer_names.join(', ')}
+Texts: \${civilData.all_texts.slice(0,80).join(' | ')}
+Dims: \${civilData.dimension_values.slice(0,30).map(d=>d.value_m+'m').join(', ')}
+Areas: \${civilData.polyline_areas.slice(0,15).map(p=>p.area_sqm+'sqm('+p.layer+')').join(', ')}
+Return ONLY JSON: {"project_name":"","drawing_type":"","scale":"","roads":[{"id":"R1","dimensions":{"length_m":0,"width_m":0}}],"plots":[],"boq":[],"observations":[],"pmc_recommendation":""}\`;
+
+      const r = await fetch(GEMINI_URL(key), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ role:'user', parts:[{text:prompt}] }], generationConfig: { maxOutputTokens:4096, temperature:0.0, responseMimeType:'application/json' } })
+      });
+      let raw = (await r.json())?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
+      if (fb !== -1) geminiResult = JSON.parse(raw.slice(fb,lb+1));
+    } catch(e) { console.log('Gemini interp fail:', e.message); }
+
+    // Build Excel
+    const wb = await buildDXFExcel(civilData, geminiResult, ExcelJS);
+    const today = new Date().toLocaleDateString('en-IN').replace(/\//g,'-');
+    const pname = (geminiResult.project_name||filename||'DXF').replace(/[^a-zA-Z0-9_]/g,'_').slice(0,20);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', \`attachment; filename="\${pname}_DXF_Analysis_\${today}.xlsx"\`);
+    await wb.xlsx.write(res); res.end();
+
+  } catch (err) {
+    console.error('DXF Excel error:', err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── 8. HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   const key = process.env.GEMINI_API_KEY;
   res.json({ status: 'ok', gemini_key_set: !!key, key_preview: key ? key.slice(0, 8) + '...' : 'NOT SET' });
