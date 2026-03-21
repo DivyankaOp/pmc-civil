@@ -6,6 +6,7 @@ const ExcelJS = require('exceljs');
 const { extractDrawingData, buildDrawingExcel } = require('./server_drawing');
 const { geminiAnalyzeDrawing, runCVAnalysis, RATES } = require('./drawing_analyzer');
 const { parseDXF, extractCivilData } = require('./dxf_parser');
+const { buildExcelFromDrawing, getDrawingPrompt } = require('./drawing_to_excel');
 const { buildDXFExcel } = require('./dxf_to_excel');
 
 const app = express();
@@ -37,38 +38,46 @@ async function extractData(key, files, userText, aiResponse) {
   
   // If we have the AI response from chat, use it as primary input
   // This avoids re-processing files and gives much better results
+  // STRATEGY: aiResponse (chat text) is PRIMARY source — it already has all data
+  // Only use files as fallback if no aiResponse
   const primaryText = aiResponse || userText || '';
-  
-  // Only add files if no AI response available
+
   if (!aiResponse) {
+    // No AI response yet — send actual files to Gemini
     for (const f of (files || [])) {
-      if (f.type === 'application/pdf' || f.name?.match(/\.pdf$/i))
-        parts.push({ inline_data: { mime_type: 'application/pdf', data: f.b64 } });
-      else if (f.type?.startsWith('image/'))
-        parts.push({ inline_data: { mime_type: f.type, data: f.b64 } });
+      try {
+        if (f.type === 'application/pdf' || f.name?.match(/\.pdf$/i))
+          parts.push({ inline_data: { mime_type: 'application/pdf', data: f.b64 } });
+        else if (f.type?.startsWith('image/'))
+          parts.push({ inline_data: { mime_type: f.type || 'image/png', data: f.b64 } });
+      } catch(e) { console.log('File skip:', e.message); }
     }
   }
+  // If STILL no content, use files as fallback even when aiResponse present
+  if (!aiResponse && parts.length === 0 && (files||[]).length === 0) {
+    return { report_type:'general', project_title: userText||'PMC Report', company:'PMC', date:new Date().toLocaleDateString('en-IN'), summary:'', vendors:[], pricing:{old_rate:[],new_rate:[]}, commercial_terms:[], technical_specs:[], boq_items:[], recommendation:'No data provided.' };
+  }
 
-  const prompt = `You are a PMC data extraction expert. Extract ALL data from the content below and return ONLY raw JSON. No markdown. No backticks. Start with { end with }.
+  const prompt = `You are a PMC data extraction expert. Extract ALL data from the content below into JSON.
+Return ONLY raw JSON. No markdown. No backticks. Start with { end with }.
 
 CONTENT TO EXTRACT FROM:
 ${primaryText}
 
-Return this JSON structure (fill ALL fields from the content above):
-{"report_type":"comparison","project_title":"extract from content","company":"extract company name","date":"DD-MM-YYYY","summary":"2-3 line summary",
-"vendors":[{"name":"agency/company name","vendor_name":"contact person name","contact":"phone number","quote_date":"DD-MM-YYYY","brand":"brand/make name","product_description":"full product description"}],
-"pricing":{"old_rate":[{"label":"BASIC AMOUNT (OLD RATE)","values":[1000,2000,0,0,0]},{"label":"18% GST","values":[180,360,0,0,0]},{"label":"TOTAL AMOUNT WITH GST","values":[1180,2360,0,0,0]}],"new_rate":[{"label":"BASIC AMOUNT (NEW RATE)","values":[900,1800,1200,800,1100]},{"label":"18% GST","values":[162,324,216,144,198]},{"label":"SPECIAL DISCOUNT","values":[0,0,0,50,100]},{"label":"TOTAL AMOUNT WITH GST","values":[1062,2124,1416,894,1198]}]},
-"commercial_terms":[{"label":"PAYMENT TERMS","values":["v1","v2","v3","v4","v5"]},{"label":"FREIGHT & TRANSIT INSURANCE","values":["v1","v2","v3","v4","v5"]},{"label":"DELIVERY TIME","values":["v1","v2","v3","v4","v5"]},{"label":"INSTALLATION & COMMISSIONING","values":["v1","v2","v3","v4","v5"]},{"label":"WARRANTY","values":["v1","v2","v3","v4","v5"]}],
-"technical_specs":[{"label":"SPEC NAME","values":["v1","v2","v3","v4","v5"]}],
-"boq_items":[{"sr":1,"description":"item","unit":"unit","qty":1,"rate":1000,"amount":1000}],
-"recommendation":"PMC recommendation with winner and reasons"}
+You MUST extract real data from the content above. Do NOT use placeholder values like "v1","v2".
+Extract actual vendor names, actual prices, actual specifications found in the content.
 
-CRITICAL RULES:
-- Extract ALL vendors/options found in content
-- Numbers must be actual numbers not strings  
-- 0 or "N/A" for missing pricing values
-- Extract every detail from the content
-- ONLY RETURN JSON, NOTHING ELSE`;
+Return this exact JSON structure:
+{"report_type":"comparison","project_title":"EXTRACT FROM CONTENT","company":"EXTRACT FROM CONTENT","date":"DD-MM-YYYY","summary":"2-3 lines from content",
+"vendors":[{"name":"ACTUAL VENDOR NAME","vendor_name":"ACTUAL PERSON NAME","contact":"ACTUAL PHONE","quote_date":"DD-MM-YYYY","brand":"ACTUAL BRAND","product_description":"ACTUAL DESCRIPTION"}],
+"pricing":{"old_rate":[{"label":"BASIC AMOUNT (OLD RATE)","values":[ACTUAL_NUMBERS]},{"label":"18% GST","values":[ACTUAL_NUMBERS]},{"label":"TOTAL AMOUNT WITH GST","values":[ACTUAL_NUMBERS]}],
+"new_rate":[{"label":"BASIC AMOUNT (NEW RATE)","values":[ACTUAL_NUMBERS]},{"label":"18% GST","values":[ACTUAL_NUMBERS]},{"label":"TOTAL AMOUNT WITH GST","values":[ACTUAL_NUMBERS]}]},
+"commercial_terms":[{"label":"PAYMENT TERMS","values":["ACTUAL VALUE FROM CONTENT"]},{"label":"DELIVERY TIME","values":["ACTUAL VALUE"]},{"label":"WARRANTY","values":["ACTUAL VALUE"]}],
+"technical_specs":[{"label":"ACTUAL SPEC NAME","values":["ACTUAL SPEC VALUE"]}],
+"boq_items":[{"sr":1,"description":"ACTUAL ITEM NAME","unit":"ACTUAL UNIT","qty":ACTUAL_NUMBER,"rate":ACTUAL_NUMBER,"amount":ACTUAL_NUMBER}],
+"recommendation":"ACTUAL PMC recommendation from content"}
+
+RULES: Use ACTUAL data from content | Numbers as numbers not strings | ONLY JSON`;
 
   parts.push({ text: prompt });
 
@@ -568,7 +577,70 @@ Return ONLY JSON: {"project_name":"","drawing_type":"","scale":"","roads":[{"id"
   }
 });
 
-// ─── 8. HEALTH ─────────────────────────────────────────────────────
+// ─── 8. DRAWING → EXCEL (AI Analysis + Auto Excel) ───────────────
+app.post('/drawing-to-excel', async (req, res) => {
+  try {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
+
+    const { files, userText, aiResponse } = req.body;
+    const GEMINI_URL = k => `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k}`;
+
+    // Build Gemini request parts
+    const parts = [];
+
+    // Add files if provided (images/PDFs)
+    for (const f of (files || [])) {
+      try {
+        if (f.type === 'application/pdf' || f.name?.match(/\.pdf$/i))
+          parts.push({ inline_data: { mime_type: 'application/pdf', data: f.b64 } });
+        else if (f.type?.startsWith('image/'))
+          parts.push({ inline_data: { mime_type: f.type || 'image/png', data: f.b64 } });
+      } catch(e) {}
+    }
+
+    // Use AI response text if no files (for chat-based flow)
+    const promptText = getDrawingPrompt() + (aiResponse ? `
+
+CHAT ANALYSIS:
+${aiResponse}` : '') + (userText ? `
+Note: ${userText}` : '');
+    parts.push({ text: promptText });
+
+    // Call Gemini
+    const r = await fetch(GEMINI_URL(key), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts }],
+        generationConfig: { maxOutputTokens: 8192, temperature: 0.0, responseMimeType: 'application/json' }
+      })
+    });
+
+    let raw = (await r.json())?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
+    let drawingData = {};
+    if (fb !== -1) {
+      try { drawingData = JSON.parse(raw.slice(fb, lb+1)); }
+      catch(e) { console.log('Parse fail:', e.message); }
+    }
+
+    // Build Excel
+    const wb = await buildExcelFromDrawing(drawingData);
+    const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
+    const pname = (drawingData.project_name || 'Drawing').replace(/[^a-zA-Z0-9_]/g,'_').slice(0,20);
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${pname}_PMC_Estimate_${today}.xlsx"`);
+    await wb.xlsx.write(res);
+    res.end();
+
+  } catch (err) {
+    console.error('Drawing→Excel error:', err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── 9. HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   const key = process.env.GEMINI_API_KEY;
   res.json({ status: 'ok', gemini_key_set: !!key, key_preview: key ? key.slice(0, 8) + '...' : 'NOT SET' });
