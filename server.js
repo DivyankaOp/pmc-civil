@@ -537,13 +537,13 @@ app.post('/export-dxf-excel', async (req, res) => {
       const fakeReq = { body: { dxfContent, filename } };
       // reuse the prompt building
       const GEMINI_URL = k => `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k}`;
-      const prompt = \`You are a senior PMC civil engineer. Analyze this DXF drawing data.
-Scale: \${civilData.scale||'not detected'}
-Layers: \${civilData.layer_names.join(', ')}
-Texts: \${civilData.all_texts.slice(0,80).join(' | ')}
-Dims: \${civilData.dimension_values.slice(0,30).map(d=>d.value_m+'m').join(', ')}
-Areas: \${civilData.polyline_areas.slice(0,15).map(p=>p.area_sqm+'sqm('+p.layer+')').join(', ')}
-Return ONLY JSON: {"project_name":"","drawing_type":"","scale":"","roads":[{"id":"R1","dimensions":{"length_m":0,"width_m":0}}],"plots":[],"boq":[],"observations":[],"pmc_recommendation":""}\`;
+      const prompt = `You are a senior PMC civil engineer. Analyze this DXF drawing data.
+Scale: ${civilData.scale||'not detected'}
+Layers: ${civilData.layer_names.join(', ')}
+Texts: ${civilData.all_texts.slice(0,80).join(' | ')}
+Dims: ${civilData.dimension_values.slice(0,30).map(d=>d.value_m+'m').join(', ')}
+Areas: ${civilData.polyline_areas.slice(0,15).map(p=>p.area_sqm+'sqm('+p.layer+')').join(', ')}
+Return ONLY JSON: {"project_name":"","drawing_type":"","scale":"","roads":[{"id":"R1","dimensions":{"length_m":0,"width_m":0}}],"plots":[],"boq":[],"observations":[],"pmc_recommendation":""}` ;
 
       const r = await fetch(GEMINI_URL(key), {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -559,7 +559,7 @@ Return ONLY JSON: {"project_name":"","drawing_type":"","scale":"","roads":[{"id"
     const today = new Date().toLocaleDateString('en-IN').replace(/\//g,'-');
     const pname = (geminiResult.project_name||filename||'DXF').replace(/[^a-zA-Z0-9_]/g,'_').slice(0,20);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', \`attachment; filename="\${pname}_DXF_Analysis_\${today}.xlsx"\`);
+    res.setHeader('Content-Disposition', `attachment; filename="${pname}_DXF_Analysis_${today}.xlsx"`);
     await wb.xlsx.write(res); res.end();
 
   } catch (err) {
