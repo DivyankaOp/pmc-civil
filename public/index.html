@@ -111,6 +111,7 @@ html,body{height:100%;font-family:'Inter',sans-serif;background:var(--sur);color
 .dl-btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;font-size:12px;font-weight:500;border:none;border-radius:8px;cursor:pointer;font-family:'Inter',sans-serif;transition:all .15s}
 .dl-btn.xl{background:#1D6F42;color:#fff}.dl-btn.xl:hover{background:#155233}
 .dl-btn.pdf{background:#B91C1C;color:#fff}.dl-btn.pdf:hover{background:#991B1B}
+.dl-btn.dwg{background:#6D28D9;color:#fff}.dl-btn.dwg:hover{background:#5B21B6}
 .dl-btn:disabled{opacity:.4;cursor:not-allowed}
 .dl-btn .sp{width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:none}
 .dl-btn.loading .sp{display:inline-block}
@@ -206,11 +207,11 @@ textarea.tin::placeholder{color:var(--tx3)}
         <textarea class="tin" id="tin" placeholder="Koi bhi file upload karo ya question type karo…" rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
         <button class="sbtn" id="sbtn" onclick="send()">➤</button>
       </div>
-      <div class="hint">PDF · JPG · PNG · Multiple files · <kbd>Enter</kbd> send · <kbd>Shift+Enter</kbd> new line</div>
+      <div class="hint">PDF · JPG · PNG · <strong>DXF (AutoCAD)</strong> · Multiple files · <kbd>Enter</kbd> send</div>
     </div>
   </div>
 </div>
-<input type="file" id="fi" accept="image/*,.pdf" multiple onchange="onFiles(event)">
+<input type="file" id="fi" accept="image/*,.pdf,.dxf,.DXF" multiple onchange="onFiles(event)">
 
 <script>
 // ── MODES ──────────────────────────────────────────────
@@ -225,7 +226,26 @@ const MODES={
 };
 const SYS={
   auto:`You are PMC Civil AI Agent — senior PMC civil construction expert for India (Surat, Gujarat). AUTO-DETECT input and give FULL DETAILED professional response. DETECTION: DRAWING→full analysis(type,title block,scale,dimensions,IS codes,structural elements,reinforcement); COST ESTIMATE→item table(Item|Unit|Qty|Rate INR|Amount INR),total,rate analysis; BOQ→full BOQ table,trade summary,material quantities; COMPARISON(2+files)→exec summary,each option,comparison table,differences,PMC recommendation(name winner); CONTRACTOR QUOTE→scope,rates,risk flags,PMC verdict; SITE PHOTO→condition,quality,issues; ANY QUERY→full civil expert response. ALWAYS: markdown tables|IS codes|INR rates Surat/Gujarat|end with PMC OBSERVATIONS & RECOMMENDATIONS`,
-  drawing:`Senior PMC civil drawing analyst. FULL ANALYSIS: drawing type, title block, scale, dimensions, grid, structural elements, reinforcement(dia/spacing/cover/lap), materials, IS codes(IS 456/1786/875/13920), symbols, discrepancies, PMC observations.`,
+  drawing:`You are a SENIOR PMC CIVIL ENGINEER (20 years India experience). Analyze this civil drawing with PIXEL-LEVEL PRECISION.
+
+STEP 1 — SCALE: Find scale bar or written scale (1:100, 1:500 etc). State exact scale found.
+STEP 2 — TITLE BLOCK: Project name, drawing no., date, engineer name, north direction.
+STEP 3 — DIMENSIONS: Read EVERY dimension annotation. List each one: "Road R1 = 129.12m × 24m wide".
+STEP 4 — QUANTITIES TABLE (calculate using read dimensions):
+
+| Element | Length (m) | Width (m) | Area (sqmt) | GSB Ton | WMM Ton | PQC CUM | Cost (₹) |
+For roads: Area = L×CarriageW | GSB = Area×1.15×0.3×1800 | WMM = Area×1.15×0.2×2100 | PQC = Area×1.05×0.25
+
+STEP 5 — STEEL BBS (if reinforcement drawing):
+| Bar | Dia | Nos | Cut Length | Total Length | Weight (kg) |
+Weight = Total_length × unit_weight (8mm:0.395, 10mm:0.617, 12mm:0.888, 16mm:1.58, 20mm:2.47, 25mm:3.86 kg/m)
+
+STEP 6 — COST SUMMARY (Surat/Gujarat 2025 rates):
+PQC Road: ₹1800/sqmt | GSB: ₹655/sqmt | WMM: ₹515/sqmt | RCC M25: ₹5500/cum | Steel: ₹56/kg
+
+STEP 7 — PMC OBSERVATIONS & IS CODES
+
+Format output as properly structured tables. Be PRECISE with every number.`,
   estimate:`PMC senior cost estimation engineer India. Item-wise table(Item No.|Description|Unit|Qty|Rate INR|Amount INR), trade-wise summary, total, rate analysis vs Gujarat DSR, missing scope, PMC observations.`,
   boq:`PMC quantity surveyor. Full BOQ(Item No.|Description|Unit|Qty|Rate INR|Amount INR), trade-wise breakup, material quantities(cement/steel/sand/aggregate), IS codes, PMC notes.`,
   compare:`Senior PMC consultant. FULL COMPARISON: exec summary, each option full analysis, item-wise comparison table(Item|Unit|A|B|Diff|Variance%), key differences, cost impact INR, PMC RECOMMENDATION — name winner clearly with reasons.`,
@@ -313,7 +333,7 @@ function renderChat(){
   const chatEl=document.getElementById('chat');chatEl.innerHTML='';
   hist.forEach(msg=>{
     if(msg.role==='user') addMsgEl('user',msg.content,msg.fnames||[]);
-    else if(msg.role==='assistant') addMsgEl('ai',msg.content,[],true,msg.files||[],msg.userText||'');
+    else if(msg.role==='assistant') addMsgEl('ai',msg.content,[],true,msg.files||[],msg.userText||'',msg.content);
   });
 }
 
@@ -340,9 +360,19 @@ function setMode(m,el){
 // ── FILES ───────────────────────────────────────────────
 function onFiles(e){
   Array.from(e.target.files).forEach(f=>{
-    const rd=new FileReader();
-    rd.onload=ev=>{files.push({name:f.name,type:f.type,b64:ev.target.result.split(',')[1]});renderChips();};
-    rd.readAsDataURL(f);
+    if(f.name.match(/\.dxf$/i)){
+      // DXF = plain text file
+      const rd=new FileReader();
+      rd.onload=ev=>{
+        files.push({name:f.name,type:'application/dxf',isDXF:true,dxfContent:ev.target.result});
+        renderChips();
+      };
+      rd.readAsText(f);
+    } else {
+      const rd=new FileReader();
+      rd.onload=ev=>{files.push({name:f.name,type:f.type,b64:ev.target.result.split(',')[1]});renderChips();};
+      rd.readAsDataURL(f);
+    }
   });document.getElementById('fi').value='';
 }
 function renderChips(){
@@ -365,7 +395,7 @@ function diBadge(text){
 // ── ADD MSG TO DOM ───────────────────────────────────────
 function hw(){const w=document.getElementById('welcome');if(w)w.style.display='none';}
 
-function addMsgEl(role,text,fnames,badge,msgFiles,msgText){
+function addMsgEl(role,text,fnames,badge,msgFiles,msgText,aiResponseText,dxfFile,dxfData){
   hw();
   const chat=document.getElementById('chat');
   const row=document.createElement('div');row.className=`msg ${role}`;
@@ -376,10 +406,18 @@ function addMsgEl(role,text,fnames,badge,msgFiles,msgText){
   const tx=document.createElement('div');
   if(role==='ai'){tx.innerHTML=mdt(text);}else{tx.style.whiteSpace='pre-wrap';tx.textContent=text;}
   bub.appendChild(tx);
-  if(role==='ai'&&msgFiles&&msgFiles.length>0){
+  // DXF file → show DXF Excel button
+  if(role==='ai'&&dxfFile){
     const br=document.createElement('div');br.className='btn-row';
-    const xlB=mkBtn('xl','📊','Download Excel',()=>dlFile(xlB,'/export-excel',msgFiles,msgText||''));
-    const pdB=mkBtn('pdf','📄','Download PDF',()=>dlFile(pdB,'/export-pdf',msgFiles,msgText||''));
+    const dxfB=mkBtn('dwg','📐','Download DXF Excel (7 Sheets)',()=>dlDXFExcel(dxfB,dxfFile));
+    br.appendChild(dxfB);bub.appendChild(br);
+  } else if(role==='ai'&&msgFiles&&msgFiles.length>0){
+    const br=document.createElement('div');br.className='btn-row';
+    const isDwg=(mode==='drawing'||mode==='auto'||mode==='boq'||mode==='estimate');
+    const dwgB=mkBtn('dwg','🏗️','Drawing Excel (Multi-Sheet)',()=>dlFile(dwgB,'/export-drawing',msgFiles,msgText||'',aiResponseText||text));
+    const xlB=mkBtn('xl','📊','Comparison Excel',()=>dlFile(xlB,'/export-excel',msgFiles,msgText||'',aiResponseText||text));
+    const pdB=mkBtn('pdf','📄','Download PDF',()=>dlFile(pdB,'/export-pdf',msgFiles,msgText||'',aiResponseText||text));
+    if(isDwg) br.appendChild(dwgB);
     br.appendChild(xlB);br.appendChild(pdB);bub.appendChild(br);
   }
   row.appendChild(av);row.appendChild(bub);chat.appendChild(row);chat.scrollTop=chat.scrollHeight;
@@ -392,12 +430,12 @@ function mkBtn(type,icon,label,fn){
 }
 
 // ── DOWNLOAD ─────────────────────────────────────────────
-async function dlFile(btn,endpoint,uploadedFiles,userText){
+async function dlFile(btn,endpoint,uploadedFiles,userText,aiResponse){
   btn.disabled=true;btn.classList.add('loading');
   const isPdf=endpoint.includes('pdf');
   btn.querySelector('span:last-child').textContent=isPdf?' Generating PDF…':' Generating Excel…';
   try{
-    const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({files:uploadedFiles,userText,mode})});
+    const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({files:uploadedFiles,userText,aiResponse,mode})});
     if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||'Export failed');}
     const blob=await res.blob();
     const url=URL.createObjectURL(blob);
@@ -408,6 +446,26 @@ async function dlFile(btn,endpoint,uploadedFiles,userText){
     btn.innerHTML=`<span class="ic">✅</span> Done!`;btn.style.background='#059669';
   }catch(err){
     btn.innerHTML=`<span class="ic">❌</span> ${err.message}`;
+    btn.style.background='#DC2626';btn.disabled=false;
+  }
+  btn.classList.remove('loading');
+}
+
+async function dlDXFExcel(btn,dxfFile){
+  btn.disabled=true;btn.classList.add('loading');
+  btn.querySelector('span:last-child').textContent=' Generating Excel...';
+  try{
+    const res=await fetch('/export-dxf-excel',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({dxfContent:dxfFile.dxfContent,filename:dxfFile.name})});
+    if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||'Export failed');}
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;
+    a.download=dxfFile.name.replace('.dxf','').replace('.DXF','')+'_PMC_Analysis.xlsx';
+    a.click();URL.revokeObjectURL(url);
+    btn.innerHTML='<span class="ic">✅</span> Done!';btn.style.background='#059669';
+  }catch(err){
+    btn.innerHTML='<span class="ic">❌</span> '+err.message;
     btn.style.background='#DC2626';btn.disabled=false;
   }
   btn.classList.remove('loading');
@@ -433,10 +491,60 @@ async function send(){
   const sentFiles=[...files];
   const sentText=txt;
   const fnames=files.map(f=>f.name);
+  const hasDXF=files.some(f=>f.isDXF);
   const disp=txt||(fnames.length?'Analyze uploaded file(s) and pull all proper details.':'');
   addMsgEl('user',disp,fnames);
   hist.push({role:'user',content:disp,fnames});
   tin.value='';tin.style.height='auto';
+
+  // DXF files → send to analyze-dxf endpoint for text parsing
+  if(hasDXF){
+    files=[];renderChips();
+    addLoad();
+    try{
+      const dxfFile=sentFiles.find(f=>f.isDXF);
+      const res=await fetch('/analyze-dxf',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({dxfContent:dxfFile.dxfContent,filename:dxfFile.name})});
+      const data=await res.json();
+      const gi=data.interpretation||{};
+      const dd=data.dxf_data||{};
+      const summary=`## DXF Drawing Analysis: ${gi.project_name||dxfFile.name}
+
+**Scale:** ${dd.scale||gi.scale||'Not detected'} | **Drawing Type:** ${gi.drawing_type||'Site Layout'} | **Date:** ${gi.date||'—'}
+
+**Drawing Statistics:**
+| Metric | Count |
+|--------|-------|
+| Layers | ${dd.stats?.total_layers||0} |
+| Text annotations | ${dd.stats?.total_texts||0} |
+| Dimension entities | ${dd.stats?.total_dims||0} |
+| Closed regions (polylines) | ${dd.polyline_areas?.length||0} |
+| Line entities | ${dd.stats?.total_lines||0} |
+
+**Drawing Extents:** ${dd.drawing_extents?.estimated_width_m||0}m × ${dd.drawing_extents?.estimated_height_m||0}m
+
+**Layers Found:** ${dd.layer_names?.join(', ')||'—'}
+
+**Roads Detected:** ${(gi.roads||[]).map(r=>`${r.id}: ${r.dimensions?.length_m||0}m × ${r.dimensions?.width_m||0}m wide`).join(' | ')||'See extracted texts below'}
+
+**All Text in Drawing:** ${dd.all_texts?.slice(0,30).join(' | ')||'—'}
+
+**Dimension Values Found:** ${dd.dimension_values?.slice(0,20).map(d=>d.value_m+'m').join(', ')||'—'}
+
+**PMC Observation:** ${gi.pmc_recommendation||'DXF parsed. Click 🏗️ DXF Excel button to generate full multi-sheet Excel with quantities.'}`;
+
+      rmLoad();
+      hist=hist.filter(m=>m.role!=='user_parts');
+      hist.push({role:'assistant',content:summary,dxfFile:dxfFile,dxfData:data});
+      addMsgEl('ai',summary,[],true,null,sentText,summary,dxfFile,data);
+      saveChatToHistory(dxfFile.name.slice(0,40));
+    }catch(err){
+      rmLoad();
+      addMsgEl('ai',`**DXF Error:** ${err.message}`);
+    }
+    busy=false;document.getElementById('sbtn').disabled=false;
+    return;
+  }
 
   const parts=[];
   files.forEach(f=>{
@@ -467,7 +575,8 @@ async function send(){
     hist=hist.filter(m=>m.role!=='user_parts');
     hist.push({role:'assistant',content:aiText,files:sentFiles.length?sentFiles:null,userText:sentText});
     rmLoad();
-    addMsgEl('ai',aiText,[],true,sentFiles.length?sentFiles:null,sentText);
+    // Pass both files AND aiText to export buttons
+    addMsgEl('ai',aiText,[],true,sentFiles.length?sentFiles:null,sentText,aiText);
     // Save to history
     const title=disp.slice(0,40)||(fnames[0]||'Chat');
     saveChatToHistory(title);
