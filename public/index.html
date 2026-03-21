@@ -112,6 +112,7 @@ html,body{height:100%;font-family:'Inter',sans-serif;background:var(--sur);color
 .dl-btn.xl{background:#1D6F42;color:#fff}.dl-btn.xl:hover{background:#155233}
 .dl-btn.pdf{background:#B91C1C;color:#fff}.dl-btn.pdf:hover{background:#991B1B}
 .dl-btn.dwg{background:#6D28D9;color:#fff}.dl-btn.dwg:hover{background:#5B21B6}
+.dl-btn.auto{background:#0F766E;color:#fff;font-weight:600}.dl-btn.auto:hover{background:#0D6460}
 .dl-btn:disabled{opacity:.4;cursor:not-allowed}
 .dl-btn .sp{width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:none}
 .dl-btn.loading .sp{display:inline-block}
@@ -190,7 +191,7 @@ textarea.tin::placeholder{color:var(--tx3)}
         <div class="wtit">PMC Civil AI Agent</div>
         <div class="wsub">Upload koi bhi file — PDF, image. AI auto-detect karega aur <strong>PMC format Excel + PDF</strong> download dega!</div>
         <div class="qgrid">
-          <button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Analyze drawing</span><span class="qd">Upload civil drawing → Excel report</span></button>
+          <button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Drawing → Auto Excel</span><span class="qd">Upload drawing → AI calculates → Excel auto banta hai</span></button>
           <button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Scope batao → Excel cost sheet</span></button>
           <button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Prepare BOQ</span><span class="qd">Drawing upload → Excel BOQ</span></button>
           <button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare quotes</span><span class="qd">2-3 PDFs → Excel comparison</span></button>
@@ -413,11 +414,16 @@ function addMsgEl(role,text,fnames,badge,msgFiles,msgText,aiResponseText,dxfFile
     br.appendChild(dxfB);bub.appendChild(br);
   } else if(role==='ai'&&msgFiles&&msgFiles.length>0){
     const br=document.createElement('div');br.className='btn-row';
-    const isDwg=(mode==='drawing'||mode==='auto'||mode==='boq'||mode==='estimate');
-    const dwgB=mkBtn('dwg','🏗️','Drawing Excel (Multi-Sheet)',()=>dlFile(dwgB,'/export-drawing',msgFiles,msgText||'',aiResponseText||text));
+    const isDwg=(mode==='drawing'||mode==='auto'||mode==='boq'||mode==='estimate'||mode==='study');
+    
+    // Drawing → Auto Excel (main button for drawings)
+    if(isDwg){
+      const autoXlB=mkBtn('auto','📐','Drawing → Auto Excel',()=>dlDrawingExcel(autoXlB,msgFiles,msgText||'',aiResponseText||text));
+      br.appendChild(autoXlB);
+    }
+    
     const xlB=mkBtn('xl','📊','Comparison Excel',()=>dlFile(xlB,'/export-excel',msgFiles,msgText||'',aiResponseText||text));
     const pdB=mkBtn('pdf','📄','Download PDF',()=>dlFile(pdB,'/export-pdf',msgFiles,msgText||'',aiResponseText||text));
-    if(isDwg) br.appendChild(dwgB);
     br.appendChild(xlB);br.appendChild(pdB);bub.appendChild(br);
   }
   row.appendChild(av);row.appendChild(bub);chat.appendChild(row);chat.scrollTop=chat.scrollHeight;
@@ -446,6 +452,28 @@ async function dlFile(btn,endpoint,uploadedFiles,userText,aiResponse){
     btn.innerHTML=`<span class="ic">✅</span> Done!`;btn.style.background='#059669';
   }catch(err){
     btn.innerHTML=`<span class="ic">❌</span> ${err.message}`;
+    btn.style.background='#DC2626';btn.disabled=false;
+  }
+  btn.classList.remove('loading');
+}
+
+async function dlDrawingExcel(btn, uploadedFiles, userText, aiResponse){
+  btn.disabled=true;btn.classList.add('loading');
+  btn.querySelector('span:last-child').textContent=' AI analyzing & building Excel...';
+  try{
+    const res=await fetch('/drawing-to-excel',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({files:uploadedFiles,userText,aiResponse,mode})
+    });
+    if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||'Export failed');}
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;
+    a.download=`PMC_Drawing_Estimate_${new Date().toISOString().slice(0,10)}.xlsx`;
+    a.click();URL.revokeObjectURL(url);
+    btn.innerHTML='<span class="ic">✅</span> Excel Downloaded!';btn.style.background='#059669';
+  }catch(err){
+    btn.innerHTML='<span class="ic">❌</span> '+err.message;
     btn.style.background='#DC2626';btn.disabled=false;
   }
   btn.classList.remove('loading');
@@ -573,11 +601,11 @@ async function send(){
     const data=await res.json();
     const aiText=data?.candidates?.[0]?.content?.parts?.[0]?.text||'No response received.';
     hist=hist.filter(m=>m.role!=='user_parts');
-    hist.push({role:'assistant',content:aiText,files:sentFiles.length?sentFiles:null,userText:sentText});
+    // Keep only text in hist — b64 files are too large for localStorage
+    hist.push({role:'assistant',content:aiText,userText:sentText});
     rmLoad();
-    // Pass both files AND aiText to export buttons
-    addMsgEl('ai',aiText,[],true,sentFiles.length?sentFiles:null,sentText,aiText);
-    // Save to history
+    // sentFiles still in memory — pass directly to buttons NOW (before cleared)
+    addMsgEl('ai',aiText,[],true,sentFiles,sentText,aiText);
     const title=disp.slice(0,40)||(fnames[0]||'Chat');
     saveChatToHistory(title);
   }catch(err){
@@ -595,7 +623,7 @@ function qs(type){document.getElementById('tin').value=QT[type];aRz(document.get
 function newChat(){
   hist=[];files=[];renderChips();currentChatId=null;
   const chat=document.getElementById('chat');
-  chat.innerHTML=`<div class="welcome" id="welcome"><div class="wico">🏗️</div><div class="wtit">PMC Civil AI Agent</div><div class="wsub">Upload koi bhi file — PDF, image. AI auto-detect karega aur <strong>PMC format Excel + PDF</strong> download dega!</div><div class="qgrid"><button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Analyze drawing</span><span class="qd">Upload civil drawing → Excel report</span></button><button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Scope batao → Excel cost sheet</span></button><button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Prepare BOQ</span><span class="qd">Drawing upload → Excel BOQ</span></button><button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare quotes</span><span class="qd">2-3 PDFs → Excel comparison</span></button><button class="qcard" onclick="qs('report')"><span class="qi">📊</span><span class="ql">Site report</span><span class="qd">Details do → Excel site report</span></button><button class="qcard" onclick="qs('study')"><span class="qi">🏗️</span><span class="ql">Drawing study</span><span class="qd">Upload → educational analysis</span></button></div></div>`;
+  chat.innerHTML=`<div class="welcome" id="welcome"><div class="wico">🏗️</div><div class="wtit">PMC Civil AI Agent</div><div class="wsub">Upload koi bhi file — PDF, image. AI auto-detect karega aur <strong>PMC format Excel + PDF</strong> download dega!</div><div class="qgrid"><button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Drawing → Auto Excel</span><span class="qd">Upload drawing → AI calculates → Excel auto banta hai</span></button><button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Scope batao → Excel cost sheet</span></button><button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Prepare BOQ</span><span class="qd">Drawing upload → Excel BOQ</span></button><button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare quotes</span><span class="qd">2-3 PDFs → Excel comparison</span></button><button class="qcard" onclick="qs('report')"><span class="qi">📊</span><span class="ql">Site report</span><span class="qd">Details do → Excel site report</span></button><button class="qcard" onclick="qs('study')"><span class="qi">🏗️</span><span class="ql">Drawing study</span><span class="qd">Upload → educational analysis</span></button></div></div>`;
   renderHistList();
 }
 
