@@ -1,0 +1,785 @@
+/**
+ * PMC Drawing → Excel Engine
+ * Drawing upload → AI analysis → Dynamic Excel based on drawing type
+ */
+
+const ExcelJS = require('exceljs');
+
+// ── GUJARAT DSR 2025 RATES ──────────────────────────────────────
+const DSR = {
+  // Roads
+  soil_stabilization_sqmt:  82,
+  soil_filling_cum:         285,
+  gsb_300mm_sqmt:           655,
+  wmm_200mm_sqmt:           515,
+  pqc_250mm_sqmt:           1800,
+  asphalt_sqmt:             900,
+  paver_block_sqmt:         1040,
+  service_corridor_sqmt:    1790,
+  kerbing_rmt:              130,
+  plot_boundary_rmt:        5000,
+  street_light_nos:         45000,
+  // Structure
+  rcc_m20_cum:              5200,
+  rcc_m25_cum:              5500,
+  rcc_m30_cum:              5800,
+  pcc_m10_cum:              3800,
+  brickwork_230_cum:        4675,
+  brickwork_115_cum:        4675,
+  plaster_sqmt:             350,
+  steel_fe500_kg:           56,
+  // Civil
+  excavation_cum:           175,
+  cp_wall_rmt:              8600,
+  gabion_wall_rmt:          14100,
+  // Services
+  pipeline_rmt:             4500,
+  stp_per_mld:              25000000,
+  borewell_nos:             75000,
+  water_treatment:          20000000,
+  water_pipeline_rmt:       3500,
+  electrical_ls:            25000000,
+};
+
+// ── EXCEL STYLES (matching original template) ──────────────────
+const C = {
+  TITLE_BG:   'FFDEEBF6',  // light blue - main headers
+  SECTION_BG: 'FFFFE599',  // light yellow - part/section headers
+  SUB_BG:     'FFEDEDED',  // light grey - subtotals
+  TOTAL_BG:   'FFFFC000',  // gold - grand totals
+  GREEN_BG:   'FFE2EFDA',  // light green
+  WHITE:      'FFFFFFFF',
+  BLACK:      'FF000000',
+  ALT_ROW:    'FFF2F2F2',  // alternating row
+};
+
+const thin = { style:'thin', color:{argb:'FF000000'} };
+const bdr  = { top:thin, left:thin, bottom:thin, right:thin };
+
+function sc(cell, bg, bold=false, fc='FF000000', size=11, align='left') {
+  if(bg) cell.fill = {type:'pattern',pattern:'solid',fgColor:{argb:bg}};
+  cell.font = {bold, color:{argb:fc}, size, name:'Calibri'};
+  cell.alignment = {horizontal:align, vertical:'middle', wrapText:true};
+  cell.border = bdr;
+}
+
+function mkTitle(ws, row, text, cols) {
+  ws.mergeCells(row,1,row,cols);
+  sc(ws.getCell(row,1), C.TITLE_BG, true, C.BLACK, 18, 'center');
+  ws.getCell(row,1).value = text;
+  ws.getRow(row).height = 22.5;
+  return row+1;
+}
+
+function mkSection(ws, row, text, cols) {
+  ws.mergeCells(row,1,row,cols);
+  sc(ws.getCell(row,1), C.SECTION_BG, true, C.BLACK, 14, 'left');
+  ws.getCell(row,1).value = text;
+  ws.getRow(row).height = 22.5;
+  return row+1;
+}
+
+function mkHeaders(ws, row, hdrs, widths) {
+  hdrs.forEach((h,i) => {
+    sc(ws.getCell(row,i+1), C.TITLE_BG, true, C.BLACK, 11, 'center');
+    ws.getCell(row,i+1).value = h;
+  });
+  ws.getRow(row).height = 42.75;
+  if(widths) widths.forEach((w,i) => { if(w) ws.getColumn(i+1).width=w; });
+  return row+1;
+}
+
+function mkDataRow(ws, row, vals, numCols=[]) {
+  vals.forEach((v,i) => {
+    const bg = row%2===0 ? C.ALT_ROW : C.WHITE;
+    sc(ws.getCell(row,i+1), bg, false, C.BLACK, 11, typeof v==='number'?'right':'left');
+    ws.getCell(row,i+1).value = v??'';
+    if(numCols.includes(i) && typeof v==='number') ws.getCell(row,i+1).numFmt = '#,##0.00';
+  });
+  ws.getRow(row).height = 15;
+  return row+1;
+}
+
+function mkSubtotal(ws, row, label, lacs, cols) {
+  ws.mergeCells(row,1,row,cols-2);
+  sc(ws.getCell(row,1), C.SUB_BG, true, C.BLACK, 11, 'right');
+  ws.getCell(row,1).value = label;
+  sc(ws.getCell(row,cols-1), C.SUB_BG, true, C.BLACK, 11, 'right');
+  ws.getCell(row,cols-1).value = lacs;
+  ws.getCell(row,cols-1).numFmt = '#,##0.00';
+  sc(ws.getCell(row,cols), C.SUB_BG, true, C.BLACK, 11, 'right');
+  ws.getCell(row,cols).value = lacs/100;
+  ws.getCell(row,cols).numFmt = '#,##0.0000';
+  ws.getRow(row).height = 16;
+  return row+2;
+}
+
+function mkGrandTotal(ws, row, label, lacs, cols) {
+  ws.mergeCells(row,1,row,cols-2);
+  sc(ws.getCell(row,1), C.TOTAL_BG, true, C.BLACK, 14, 'right');
+  ws.getCell(row,1).value = label;
+  sc(ws.getCell(row,cols-1), C.TOTAL_BG, true, C.BLACK, 14, 'right');
+  ws.getCell(row,cols-1).value = lacs;
+  ws.getCell(row,cols-1).numFmt = '#,##0.00';
+  sc(ws.getCell(row,cols), C.TOTAL_BG, true, C.BLACK, 14, 'right');
+  ws.getCell(row,cols).value = lacs/100;
+  ws.getCell(row,cols).numFmt = '#,##0.00';
+  ws.getRow(row).height = 20;
+  return row+2;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// GEMINI DRAWING ANALYSIS PROMPT
+// ══════════════════════════════════════════════════════════════════
+function getDrawingPrompt() {
+  return `You are a SENIOR PMC CIVIL ENGINEER. Analyze this drawing with MAXIMUM PRECISION.
+
+STEP 1 - IDENTIFY DRAWING TYPE:
+- ROAD_LAYOUT: roads, streets, carriageways
+- BUILDING: floor plans, sections, elevations  
+- COMPOUND_WALL: boundary walls, gates
+- DRAINAGE: storm water, sewage pipes
+- SITE_LAYOUT: master plan, plot layout
+- STRUCTURE: RCC, foundations, BBS
+
+STEP 2 - READ SCALE & TITLE BLOCK:
+Extract: project name, drawing number, scale, date, location
+
+STEP 3 - EXTRACT ALL DIMENSIONS:
+For each element found, read EVERY dimension annotation.
+
+STEP 4 - CALCULATE QUANTITIES:
+Use exact dimensions. Apply these formulas:
+- Road area = length × carriage_width
+- GSB ton = area × 1.15 × 0.300 × 1800 kg/cum  (15% compaction)
+- WMM ton = area × 1.15 × 0.200 × 2100 kg/cum
+- PQC cum = area × 1.05 × 0.250               (5% wastage)
+- Steel dowel kg = area × 3.87
+- Service corridor area = road_length × corridor_width
+- Soil filling cum = sub_base_area × filling_depth
+- Street lights = road_length / 20 (every 20m)
+- RCC volume = length × width × depth
+- Steel for RCC = volume × 120 kg/cum (slabs), 160 kg/cum (beams)
+- Brickwork cum = length × height × thickness
+
+RETURN ONLY THIS JSON (no markdown, no backticks):
+{
+  "drawing_type": "ROAD_LAYOUT",
+  "project_name": "from title block",
+  "location": "from drawing",
+  "scale": "1:500",
+  "date": "DD-MM-YYYY",
+  "total_area_sqmt": 264136.31,
+  "confidence": "HIGH",
+  
+  "roads": [
+    {
+      "id": "R1",
+      "road_no": "R1", 
+      "total_width_m": 24,
+      "carriage_width_m": 15,
+      "length_m": 129.12,
+      "sc_width_m": 9,
+      "road_top_level": 49.95,
+      "ngl": 48.796,
+      "remark": "4.5-4.5 MT B/S SERVICES"
+    }
+  ],
+  
+  "buildings": [
+    {
+      "id": "B1",
+      "name": "Admin Block",
+      "floors": 2,
+      "plinth_area_sqmt": 500,
+      "total_built_up_sqmt": 1000,
+      "wall_length_rmt": 120,
+      "wall_height_m": 3.0,
+      "slab_area_sqmt": 500,
+      "slab_thickness_m": 0.15
+    }
+  ],
+  
+  "compound_wall": {
+    "total_length_rmt": 3164.73,
+    "gabion_length_rmt": 605,
+    "cp_wall_length_rmt": 3164.73,
+    "height_m": 2.5,
+    "section_type": "CP_WALL"
+  },
+  
+  "drainage": {
+    "pipe_length_rmt": 6530,
+    "pipe_dia_mm": 450,
+    "culvert_nos": 2,
+    "culvert_width_m": 11.25,
+    "culvert_span_m": 24
+  },
+  
+  "structure": {
+    "element_type": "SLAB/BEAM/FOOTING",
+    "dimensions": {},
+    "reinforcement": []
+  },
+  
+  "site_details": {
+    "total_area_sqmt": 264136.31,
+    "road_area_sqmt": 36429.32,
+    "green_area_sqmt": 17811.88,
+    "plot_boundary_rmt": 6530.9,
+    "service_corridor_area_sqmt": 16843.73
+  },
+  
+  "extracted_dimensions": ["R1=129.12m", "W=24m"],
+  "pmcnotes": ["observations from drawing"]
+}`;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// SHEET BUILDERS - ONE PER DRAWING TYPE
+// ══════════════════════════════════════════════════════════════════
+
+// BLOCK COST - common to ALL drawing types
+function buildBlockCost(wb, data) {
+  const ws = wb.addWorksheet('BLOCK COST');
+  ws.getColumn(1).width=7; ws.getColumn(2).width=56;
+  ws.getColumn(3).width=14; ws.getColumn(4).width=9;
+  ws.getColumn(5).width=15; ws.getColumn(6).width=21;
+  ws.getColumn(7).width=20; ws.getColumn(8).width=44;
+  const COLS=8;
+
+  let row=1;
+  row = mkTitle(ws, row, data.project_name||'PMC CIVIL PROJECT', COLS);
+  row = mkTitle(ws, row, 'BLOCK COST', COLS);
+  ws.mergeCells(row,1,row,COLS); ws.getCell(row,1).value=`TOTAL AREA: ${(data.total_area_sqmt||0).toLocaleString('en-IN')} SQMT`;
+  sc(ws.getCell(row,1),C.TITLE_BG,true,C.BLACK,11,'left'); ws.getRow(row).height=18; row++;
+  row = mkHeaders(ws, row, ['SR NO','COMPONENT','ESTIMATE QUANTITY','UNITS','RATE','ESTIMATE VALUE (RS IN LACS)','ESTIMATE VALUE (RS IN CR.)','REMARK']);
+
+  const roads = data.roads||[];
+  const site = data.site_details||{};
+  const dtype = data.drawing_type||'SITE_LAYOUT';
+
+  row = mkSection(ws, row, 'PART-A (PROJECT WORKS)', COLS);
+
+  let grandTotal = 0;
+  let srNo = 1;
+
+  // Roads section (if applicable)
+  if(dtype==='ROAD_LAYOUT'||dtype==='SITE_LAYOUT'||roads.length>0) {
+    const totalArea = roads.reduce((s,r)=>s+((r.length_m||0)*(r.carriage_width_m||0)),0);
+    const soilFill = (data.soil_filling_cum||totalArea*0.65)*DSR.soil_filling_cum/100000;
+    const gsb = totalArea*DSR.gsb_300mm_sqmt/100000;
+    const wmm = totalArea*DSR.wmm_200mm_sqmt/100000;
+    const pqc = totalArea*DSR.pqc_250mm_sqmt/100000;
+    const steel = (totalArea*3.87*DSR.steel_fe500_kg)/100000;
+    const sc_area = site.service_corridor_area_sqmt||roads.reduce((s,r)=>s+(r.length_m||0)*(r.sc_width_m||5),0);
+    const sc_cost = sc_area*DSR.service_corridor_sqmt/100000;
+    const pb = (site.plot_boundary_rmt||0)*DSR.plot_boundary_rmt/100000;
+    const roadTotal = soilFill+gsb+wmm+pqc+steel+sc_cost+pb;
+
+    const addRow = (sr,label,qty,unit,rate,lacs,rem='') => {
+      ws.getCell(row,1).value=sr||''; sc(ws.getCell(row,1),sr?null:null,!!sr,C.BLACK,sr?12:11,'center'); ws.getCell(row,1).border=bdr;
+      ws.getCell(row,2).value=label; sc(ws.getCell(row,2),null,!!sr,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr;
+      ws.getCell(row,3).value=qty||''; ws.getCell(row,3).numFmt='#,##0.00'; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr;
+      ws.getCell(row,4).value=unit||''; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr;
+      ws.getCell(row,5).value=rate||''; ws.getCell(row,5).numFmt='#,##0.00'; sc(ws.getCell(row,5),null,false,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr;
+      ws.getCell(row,6).value=lacs||''; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr;
+      ws.getCell(row,7).value=lacs?(lacs/100):''; ws.getCell(row,7).numFmt='#,##0.0000'; sc(ws.getCell(row,7),null,false,C.BLACK,11,'right'); ws.getCell(row,7).border=bdr;
+      ws.mergeCells(row,8,row,8); ws.getCell(row,8).value=rem; sc(ws.getCell(row,8),null,false,C.BLACK,9,'left'); ws.getRow(row).height=15;
+      row++;
+    };
+
+    addRow(srNo++,'ROADS','','','','');
+    addRow(null,'SOIL FILLING IN ROAD AREA', Math.round((data.soil_filling_cum||totalArea*0.65)*100)/100,'CUM',DSR.soil_filling_cum,soilFill);
+    addRow(null,'GSB FILLING (300 MM LAYER)',Math.round(totalArea*100)/100,'SQMT',DSR.gsb_300mm_sqmt,gsb);
+    addRow(null,'WMM FILLING (200 MM LAYER)',Math.round(totalArea*100)/100,'SQMT',DSR.wmm_200mm_sqmt,wmm);
+    addRow(null,'RCC ROAD WORK (250 MM PQC)',Math.round(totalArea*100)/100,'SQMT',DSR.pqc_250mm_sqmt,pqc,'250 MM PQC (M30)');
+    addRow(null,'STEEL FOR DOWEL BAR',Math.round(totalArea*3.87/1000*100)/100,'TON',56000,steel);
+    if(sc_area>0) addRow(null,'SERVICE CORRIDOR',Math.round(sc_area*100)/100,'SQMT',DSR.service_corridor_sqmt,sc_cost,'YELLOW SOIL+GSB+PAVER BLOCK');
+    if(pb>0) addRow(null,'PLOT BOUNDARY WITH ROAD BEAM',(site.plot_boundary_rmt||0),'RMT',DSR.plot_boundary_rmt,pb);
+    row = mkSubtotal(ws, row, 'SUBTOTAL - ROADS', roadTotal, COLS);
+    grandTotal += roadTotal;
+  }
+
+  // Buildings section
+  if(dtype==='BUILDING'||dtype==='SITE_LAYOUT') {
+    const bldgs = data.buildings||[];
+    const bldgTotal = bldgs.reduce((s,b)=>{
+      const rcc = (b.slab_area_sqmt||0)*(b.slab_thickness_m||0.15)*DSR.rcc_m25_cum/100000;
+      const brick = (b.wall_length_rmt||0)*(b.wall_height_m||3)*0.23*DSR.brickwork_230_cum/100000;
+      const plaster = (b.wall_length_rmt||0)*(b.wall_height_m||3)*2*DSR.plaster_sqmt/100000;
+      return s+rcc+brick+plaster;
+    },0);
+    if(bldgs.length>0) {
+      ws.getCell(row,1).value=srNo++; sc(ws.getCell(row,1),null,true,C.BLACK,12,'center'); ws.getCell(row,1).border=bdr;
+      ws.mergeCells(row,2,row,COLS); ws.getCell(row,2).value='BUILDINGS'; sc(ws.getCell(row,2),null,true,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getRow(row).height=18; row++;
+      bldgs.forEach(b=>{
+        const rcc=(b.slab_area_sqmt||0)*(b.slab_thickness_m||0.15)*DSR.rcc_m25_cum/100000;
+        ws.getCell(row,2).value=b.name||'BUILDING'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr;
+        ws.getCell(row,3).value=b.total_built_up_sqmt||0; ws.getCell(row,3).numFmt='#,##0.00'; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr;
+        ws.getCell(row,4).value='SQMT'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr;
+        ws.getCell(row,6).value=rcc; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr;
+        ws.getRow(row).height=15; row++;
+      });
+      row = mkSubtotal(ws, row, 'SUBTOTAL - BUILDINGS', bldgTotal, COLS);
+      grandTotal += bldgTotal;
+    }
+  }
+
+  // Compound Wall
+  if(data.compound_wall && (data.compound_wall.total_length_rmt||0)>0) {
+    const cw = data.compound_wall;
+    const cp_cost = (cw.cp_wall_length_rmt||0)*DSR.cp_wall_rmt/100000;
+    const gab_cost = (cw.gabion_length_rmt||0)*DSR.gabion_wall_rmt/100000;
+    ws.getCell(row,1).value=srNo++; sc(ws.getCell(row,1),null,true,C.BLACK,12,'center'); ws.getCell(row,1).border=bdr;
+    ws.mergeCells(row,2,row,COLS); ws.getCell(row,2).value='COMPOUND WALL'; sc(ws.getCell(row,2),null,true,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getRow(row).height=18; row++;
+    if(cw.cp_wall_length_rmt>0) { ws.getCell(row,2).value='CP WALL'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getCell(row,3).value=cw.cp_wall_length_rmt; ws.getCell(row,3).numFmt='#,##0.00'; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr; ws.getCell(row,4).value='RMT'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr; ws.getCell(row,5).value=DSR.cp_wall_rmt; sc(ws.getCell(row,5),null,false,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr; ws.getCell(row,6).value=cp_cost; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr; ws.getRow(row).height=15; row++; }
+    if(cw.gabion_length_rmt>0) { ws.getCell(row,2).value='GABION WALL'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getCell(row,3).value=cw.gabion_length_rmt; ws.getCell(row,3).numFmt='#,##0.00'; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr; ws.getCell(row,4).value='RMT'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr; ws.getCell(row,5).value=DSR.gabion_wall_rmt; sc(ws.getCell(row,5),null,false,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr; ws.getCell(row,6).value=gab_cost; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr; ws.getRow(row).height=15; row++; }
+    row = mkSubtotal(ws, row, 'SUBTOTAL - COMPOUND WALL', cp_cost+gab_cost, COLS);
+    grandTotal += (cp_cost+gab_cost);
+  }
+
+  // Services
+  const stp_cost = (data.stp_mld||3)*DSR.stp_per_mld/100000;
+  const elec_cost = DSR.electrical_ls/100000;
+  const sl_nos = data.street_lights_nos||roads.reduce((s,r)=>s+Math.ceil((r.length_m||0)/20),0)||0;
+  const sl_cost = sl_nos*DSR.street_light_nos/100000;
+  const totalServices = stp_cost+elec_cost+sl_cost;
+
+  ws.getCell(row,1).value=srNo++; sc(ws.getCell(row,1),null,true,C.BLACK,12,'center'); ws.getCell(row,1).border=bdr;
+  ws.mergeCells(row,2,row,COLS); ws.getCell(row,2).value='SERVICES (DRAINAGE / UTILITIES)'; sc(ws.getCell(row,2),null,true,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getRow(row).height=18; row++;
+  ws.getCell(row,2).value='SEWAGE TREATMENT PLANT'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getCell(row,3).value=data.stp_mld||3; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr; ws.getCell(row,4).value='MLD'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr; ws.getCell(row,5).value=DSR.stp_per_mld; ws.getCell(row,5).numFmt='#,##0'; sc(ws.getCell(row,5),null,false,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr; ws.getCell(row,6).value=stp_cost; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr; ws.getRow(row).height=15; row++;
+  ws.getCell(row,2).value='ELECTRICAL INFRASTRUCTURE'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getCell(row,3).value=1; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr; ws.getCell(row,4).value='L/S'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr; ws.getCell(row,5).value=DSR.electrical_ls; ws.getCell(row,5).numFmt='#,##0'; sc(ws.getCell(row,5),null,false,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr; ws.getCell(row,6).value=elec_cost; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr; ws.getRow(row).height=15; row++;
+  if(sl_nos>0) { ws.getCell(row,2).value='STREET LIGHTING'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getCell(row,3).value=sl_nos; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr; ws.getCell(row,4).value='NOS'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr; ws.getCell(row,5).value=DSR.street_light_nos; ws.getCell(row,5).numFmt='#,##0'; sc(ws.getCell(row,5),null,false,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr; ws.getCell(row,6).value=sl_cost; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr; ws.getRow(row).height=15; row++; }
+  row = mkSubtotal(ws, row, 'SUBTOTAL - SERVICES', totalServices, COLS);
+  grandTotal += totalServices;
+
+  // Grand Total
+  const contingency = grandTotal * 0.10;
+  const finalTotal = grandTotal + contingency;
+  row++;
+  row = mkGrandTotal(ws, row, 'TOTAL COST (PART-A)', grandTotal, COLS);
+  row = mkGrandTotal(ws, row, '10% CONTINGENCY', contingency, COLS);
+  row = mkGrandTotal(ws, row, 'GRAND TOTAL (WITH CONTINGENCY)', finalTotal, COLS);
+  row++;
+  ws.mergeCells(row,1,row,4); ws.getCell(row,1).value='LACS'; sc(ws.getCell(row,1),null,true,C.BLACK,11,'right'); ws.getCell(row,1).border=bdr;
+  ws.mergeCells(row,5,row,COLS); ws.getCell(row,5).value='CR'; sc(ws.getCell(row,5),null,true,C.BLACK,11,'center'); ws.getCell(row,5).border=bdr;
+
+  ws.views = [{state:'frozen', ySplit:4}];
+  return { grandTotal, finalTotal };
+}
+
+// ROAD ESTIMATE SHEET
+function buildRoadEstimate(wb, data) {
+  const roads = data.roads||[];
+  if(!roads.length) return;
+
+  const ws = wb.addWorksheet('ROAD ESTIMATE');
+  [9,12,10,18,14,16,16,18,17,17,26].forEach((w,i)=>ws.getColumn(i+1).width=w);
+
+  let row=1;
+  row = mkTitle(ws, row, data.project_name||'PROJECT', 11);
+  row = mkTitle(ws, row, 'ROAD WORK (SUB-BASE & BASE COURSE ESTIMATE)', 11);
+  row = mkHeaders(ws, row,
+    ['SR NO','ROAD WIDE','ROAD NO','ROAD LENGTH (METER)','CARRIAGE WAY WIDTH (METER)',
+     'AREA (SQMT)','BOX CUTTING (SQMT)','GSB FILLING\n300MM THK\n(15% EXTRA) TON',
+     'WMM FILLING\n200MM THK\n(15% EXTRA) TON','PQC ROAD M30\n250MM THK\n(5% EXTRA) CUM','REMARK']);
+  ws.getRow(row-1).height=52;
+
+  // Layer labels row
+  ['','','','','','','','LAYER-3','LAYER-4','LAYER-5',''].forEach((h,i)=>{
+    ws.getCell(row,i+1).value=h;
+    sc(ws.getCell(row,i+1),C.TITLE_BG,true,C.BLACK,10,'center');
+  });
+  ws.getRow(row).height=16; row++;
+
+  let totLen=0, totArea=0, totBoxCut=0, totGSB=0, totWMM=0, totPQC=0;
+
+  roads.forEach((rd,i)=>{
+    const L = rd.length_m||0;
+    const CW = rd.carriage_width_m||rd.total_width_m*0.65||0;
+    const area = L*CW;
+    const boxcut = area*1.05;
+    const gsb = area*1.15*0.300*1.800;  // ton
+    const wmm = area*1.15*0.200*2.100;  // ton
+    const pqc = area*1.05*0.250;        // cum
+    totLen+=L; totArea+=area; totBoxCut+=boxcut; totGSB+=gsb; totWMM+=wmm; totPQC+=pqc;
+
+    const bg = i%2===0?C.WHITE:C.ALT_ROW;
+    const vals = [i+1, `${rd.total_width_m||''} MT`, rd.road_no||`R${i+1}`,
+      Math.round(L*100)/100, Math.round(CW*100)/100,
+      Math.round(area*100)/100, Math.round(boxcut*100)/100,
+      Math.round(gsb*100)/100, Math.round(wmm*100)/100,
+      Math.round(pqc*100)/100, rd.remark||''];
+    vals.forEach((v,ci)=>{
+      const c=ws.getCell(row,ci+1); c.value=v;
+      sc(c,bg,false,C.BLACK,11,typeof v==='number'?'right':'left');
+      if(typeof v==='number') c.numFmt='#,##0.00';
+    });
+    ws.getRow(row).height=15; row++;
+  });
+
+  // Totals
+  row++;
+  const totVals = ['TOTAL','','',Math.round(totLen*100)/100,'',
+    Math.round(totArea*100)/100, Math.round(totBoxCut*100)/100,
+    Math.round(totGSB*100)/100, Math.round(totWMM*100)/100,
+    Math.round(totPQC*100)/100,''];
+  ws.mergeCells(row,1,row,3);
+  totVals.forEach((v,ci)=>{
+    const c=ws.getCell(row,ci===0?1:ci+1);
+    if(ci===0){c.value='TOTAL';}else if(ci>2){c.value=v;}
+    sc(c,C.TOTAL_BG,true,C.BLACK,11,'right');
+    if(typeof v==='number') c.numFmt='#,##0.00';
+  });
+  ws.getRow(row).height=18; row+=2;
+
+  // Units row
+  ['METER','','','RMT','SQMT','SQMT','TON','TON','CUM',''].forEach((u,i)=>{
+    ws.getCell(row,i+(i<2?4:4)).value=u;
+    sc(ws.getCell(row,i+3),null,false,C.BLACK,10,'center');
+  });
+
+  // Summary
+  row+=2;
+  row = mkTitle(ws, row, `${data.project_name||'PROJECT'} - SUMMARY`, 11);
+  row = mkTitle(ws, row, 'ROAD WORK MATERIAL SUMMARY', 11);
+  row = mkHeaders(ws, row, ['SR.NO.','MATERIAL','','','QTY.','UNIT','','REMARKS']);
+  const summary = [
+    ['BOX CUTTING', Math.round(totBoxCut*100)/100, 'SQMT'],
+    ['GSB FILLING (300 MM THK)', Math.round(totGSB*100)/100, 'TON'],
+    ['WMM FILLING (200 MM THK)', Math.round(totWMM*100)/100, 'TON'],
+    ['PQC ROAD (250 MM THK M30)', Math.round(totPQC*100)/100, 'CUM'],
+    ['TOTAL ROAD RMT', Math.round(totLen*100)/100, 'RMT'],
+    ['AREA OF ROAD', Math.round(totArea*100)/100, 'SQMT'],
+  ];
+  summary.forEach(([mat,qty,unit],i)=>{
+    const bg=i%2===0?C.WHITE:C.ALT_ROW;
+    ws.getCell(row,1).value=i+1; sc(ws.getCell(row,1),bg,false,C.BLACK,11,'center'); ws.getCell(row,1).border=bdr;
+    ws.mergeCells(row,2,row,4); ws.getCell(row,2).value=mat; sc(ws.getCell(row,2),bg,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr;
+    ws.getCell(row,5).value=qty; ws.getCell(row,5).numFmt='#,##0.00'; sc(ws.getCell(row,5),bg,true,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr;
+    ws.getCell(row,6).value=unit; sc(ws.getCell(row,6),bg,false,C.BLACK,11,'center'); ws.getCell(row,6).border=bdr;
+    ws.getRow(row).height=15; row++;
+  });
+
+  ws.views=[{state:'frozen',ySplit:4}];
+  return {totLen, totArea, totGSB, totWMM, totPQC};
+}
+
+// SOIL FILLING SHEET
+function buildSoilFilling(wb, data) {
+  const roads = data.roads||[];
+  if(!roads.length) return;
+
+  const ws = wb.addWorksheet('SOIL FILLING WORK');
+  [7,8,10,14,13,12,10,10,10,12,12,15,12,24].forEach((w,i)=>ws.getColumn(i+1).width=w);
+
+  let row=1;
+  row = mkTitle(ws, row, data.project_name||'PROJECT', 14);
+  row = mkTitle(ws, row, 'RCC ROAD CUTTING / FILLING', 14);
+  row = mkHeaders(ws, row,
+    ['SR NO','ROAD NO','ROAD WIDTH','SUB BASE WIDTH\n(CW+0.3+0.3)','ROAD LENGTH\n(MTR)',
+     'SUB BASE AREA\n(SQMT)','ROAD TOP\nLEVEL (A)','NGL OF\nROAD (B)',
+     'TOTAL SECTION\n(C=0.75m)','FILLING DEPTH\n(A-B-C+0.15)',
+     'EXTRA FILLING','TOTAL FILLING\n(CUM)','HYWAS\n(14 CUM)','REMARK']);
+
+  let totFill=0, totHywas=0;
+
+  roads.forEach((rd,i)=>{
+    const bg=i%2===0?C.WHITE:C.ALT_ROW;
+    const CW = rd.carriage_width_m||rd.total_width_m*0.65||0;
+    const subW = CW+0.6;
+    const L = rd.length_m||0;
+    const area = subW*L;
+    const A = rd.road_top_level||0;
+    const B = rd.ngl||0;
+    const C_depth = 0.75; // GSB+WMM+PQC
+    const fillDepth = A>0&&B>0 ? Math.max(0, A-B-C_depth+0.15) : 0;
+    const extraFill = fillDepth<0.5 ? Math.max(0,0.5-fillDepth) : 0;
+    const totFillingCum = fillDepth>0 ? area*fillDepth : area*(data.avg_fill_depth||0.65);
+    const hywas = totFillingCum/14;
+    totFill+=totFillingCum; totHywas+=hywas;
+
+    const vals=[i+1,rd.road_no,rd.total_width_m,Math.round(subW*100)/100,L,
+      Math.round(area*100)/100,A||0,B||0,C_depth,
+      Math.round(fillDepth*1000)/1000,Math.round(extraFill*1000)/1000,
+      Math.round(totFillingCum*100)/100,Math.round(hywas*100)/100,rd.remark||''];
+    vals.forEach((v,ci)=>{
+      const c=ws.getCell(row,ci+1); c.value=v;
+      sc(c,bg,false,C.BLACK,11,typeof v==='number'?'right':'left');
+      if(typeof v==='number'&&ci>2) c.numFmt='#,##0.00';
+    });
+    ws.getRow(row).height=15; row++;
+  });
+
+  row++;
+  // Totals
+  ws.mergeCells(row,1,row,4); ws.getCell(row,1).value='TOTAL'; sc(ws.getCell(row,1),C.TOTAL_BG,true,C.BLACK,11,'right'); ws.getCell(row,1).border=bdr;
+  ws.getCell(row,5).value=Math.round(roads.reduce((s,r)=>s+(r.length_m||0),0)*100)/100; sc(ws.getCell(row,5),C.TOTAL_BG,true,C.BLACK,11,'right'); ws.getCell(row,5).numFmt='#,##0.00'; ws.getCell(row,5).border=bdr;
+  ws.getCell(row,12).value=Math.round(totFill*100)/100; sc(ws.getCell(row,12),C.TOTAL_BG,true,C.BLACK,11,'right'); ws.getCell(row,12).numFmt='#,##0.00'; ws.getCell(row,12).border=bdr;
+  ws.getCell(row,13).value=Math.round(totHywas*100)/100; sc(ws.getCell(row,13),C.TOTAL_BG,true,C.BLACK,11,'right'); ws.getCell(row,13).numFmt='#,##0.00'; ws.getCell(row,13).border=bdr;
+  ws.getRow(row).height=18; row+=2;
+
+  ws.getCell(row,12).value=`${DSR.soil_filling_cum} RS/CUM`;
+  ws.getCell(row+1,12).value=Math.round(totFill*DSR.soil_filling_cum);
+  ws.getCell(row+1,12).numFmt='#,##0';
+  sc(ws.getCell(row+1,12),C.TOTAL_BG,true,C.BLACK,11,'right');
+
+  ws.views=[{state:'frozen',ySplit:3}];
+}
+
+// SERVICE CORRIDOR SHEET
+function buildServiceCorridor(wb, data) {
+  const roads = data.roads||[];
+  if(!roads.length) return;
+
+  const ws = wb.addWorksheet('SERVICE CORRIDOR');
+  [7,10,9,16,12,14,14,16,15,13,14,26].forEach((w,i)=>ws.getColumn(i+1).width=w);
+
+  let row=1;
+  row = mkTitle(ws, row, data.project_name||'PROJECT', 12);
+  row = mkTitle(ws, row, 'SERVICE CORRIDOR (SUB-BASE & BASE COURSE ESTIMATE)', 12);
+  row = mkHeaders(ws, row,
+    ['SR NO','ROAD WIDE','ROAD NO','ROAD LENGTH (METER)','SC WIDTH (METER)',
+     'AREA (SQMT)','EXCAVATION (SQMT)',
+     'YELLOW SOIL\n300MM (15% EXTRA)\nTON',
+     'GSB FILLING\n230MM (15% EXTRA)\nTON',
+     'PAVER BLOCK\n80MM (5% EXTRA)\nSQMT','KERBING (RMT)','REMARK']);
+  ws.getRow(row-1).height=52;
+  ['','','','','','','','LAYER-1','LAYER-2','LAYER-3','',''].forEach((h,i)=>{
+    ws.getCell(row,i+1).value=h; sc(ws.getCell(row,i+1),C.TITLE_BG,true,C.BLACK,10,'center');
+  });
+  ws.getRow(row).height=16; row++;
+
+  let totLen=0,totArea=0,totSoil=0,totGSB=0,totPaver=0;
+  roads.forEach((rd,i)=>{
+    const bg=i%2===0?C.WHITE:C.ALT_ROW;
+    const SC_W = rd.sc_width_m||5;
+    const L=rd.length_m||0;
+    const area=L*SC_W;
+    const excav=area*1.05;
+    const soil=area*1.15*0.300*1.5; // yellow soil ton
+    const gsb=area*1.15*0.230*1.800;
+    const paver=area*1.05;
+    const kerb=0;
+    totLen+=L; totArea+=area; totSoil+=soil; totGSB+=gsb; totPaver+=paver;
+
+    const vals=[i+1,`${rd.total_width_m||''} MT`,rd.road_no,Math.round(L*100)/100,SC_W,
+      Math.round(area*100)/100,Math.round(excav*100)/100,Math.round(soil*100)/100,
+      Math.round(gsb*100)/100,Math.round(paver*100)/100,kerb,rd.remark||''];
+    vals.forEach((v,ci)=>{
+      const c=ws.getCell(row,ci+1); c.value=v;
+      sc(c,bg,false,C.BLACK,11,typeof v==='number'?'right':'left');
+      if(typeof v==='number'&&ci>2) c.numFmt='#,##0.00';
+    });
+    ws.getRow(row).height=15; row++;
+  });
+
+  row++;
+  ws.mergeCells(row,1,row,3); ws.getCell(row,1).value='TOTAL'; sc(ws.getCell(row,1),C.TOTAL_BG,true,C.BLACK,11,'right'); ws.getCell(row,1).border=bdr;
+  [null,null,null,Math.round(totLen*100)/100,null,Math.round(totArea*100)/100,null,Math.round(totSoil*100)/100,Math.round(totGSB*100)/100,Math.round(totPaver*100)/100].forEach((v,i)=>{
+    if(v!==null){const c=ws.getCell(row,i+1);c.value=v;sc(c,C.TOTAL_BG,true,C.BLACK,11,'right');c.numFmt='#,##0.00';c.border=bdr;}
+  });
+  ws.getRow(row).height=18;
+  ws.views=[{state:'frozen',ySplit:4}];
+}
+
+// STREET LIGHT SHEET
+function buildStreetLight(wb, data) {
+  const roads = data.roads||[];
+  if(!roads.length) return;
+
+  const ws = wb.addWorksheet('STREET LIGHT');
+  [7,10,10,20,18,30].forEach((w,i)=>ws.getColumn(i+1).width=w);
+
+  let row=1;
+  row = mkTitle(ws, row, data.project_name||'PROJECT', 6);
+  row = mkTitle(ws, row, 'STREET LIGHT', 6);
+  row = mkHeaders(ws, row, ['SR NO','ROAD WIDE','ROAD NO','ROAD LENGTH (METER)','STREET LIGHTS (NOS)','REMARK']);
+
+  let totLen=0, totLights=0;
+  roads.forEach((rd,i)=>{
+    const bg=i%2===0?C.WHITE:C.ALT_ROW;
+    const lights = Math.ceil((rd.length_m||0)/20);
+    totLen+=(rd.length_m||0); totLights+=lights;
+    const vals=[i+1,`${rd.total_width_m||''} MT`,rd.road_no,Math.round((rd.length_m||0)*100)/100,lights,'EVERY 20 MT'];
+    vals.forEach((v,ci)=>{const c=ws.getCell(row,ci+1);c.value=v;sc(c,bg,false,C.BLACK,11,typeof v==='number'?'right':'left');if(typeof v==='number')c.numFmt='#,##0.00';});
+    ws.getRow(row).height=15; row++;
+  });
+
+  row++;
+  ws.mergeCells(row,1,row,3); ws.getCell(row,1).value='TOTAL'; sc(ws.getCell(row,1),C.TOTAL_BG,true,C.BLACK,11,'right'); ws.getCell(row,1).border=bdr;
+  ws.getCell(row,4).value=Math.round(totLen*100)/100; sc(ws.getCell(row,4),C.TOTAL_BG,true,C.BLACK,11,'right'); ws.getCell(row,4).numFmt='#,##0.00'; ws.getCell(row,4).border=bdr;
+  ws.getCell(row,5).value=totLights; sc(ws.getCell(row,5),C.TOTAL_BG,true,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr;
+  ws.getRow(row).height=18;
+}
+
+// RATE ANALYSIS SHEET
+function buildRateAnalysis(wb, data) {
+  const ws = wb.addWorksheet('RATE ANALYSIS');
+  [7,44,10,10,12,14,14,16].forEach((w,i)=>ws.getColumn(i+1).width=w);
+
+  let row=1;
+  row = mkTitle(ws, row, data.project_name||'PROJECT', 8);
+  row = mkTitle(ws, row, 'ROAD RATE ANALYSIS', 8);
+
+  const items = [
+    {label:'SOIL STABILIZATION (LIME-FLYASH)', rate:DSR.soil_stabilization_sqmt, unit:'RS/SQMT'},
+    {label:'SOIL FILLING', rate:DSR.soil_filling_cum, unit:'RS/CUM'},
+    {label:'GSB FILLING (300 MM THK)', rate:DSR.gsb_300mm_sqmt, unit:'RS/SQMT'},
+    {label:'WMM FILLING (200 MM THK)', rate:DSR.wmm_200mm_sqmt, unit:'RS/SQMT'},
+    {label:'PQC ROAD WORK (250 MM THK M30)', rate:DSR.pqc_250mm_sqmt, unit:'RS/SQMT'},
+    {label:'SERVICE CORRIDOR (YELLOW SOIL+GSB+PAVER)', rate:DSR.service_corridor_sqmt, unit:'RS/SQMT'},
+    {label:'STREET LIGHT', rate:DSR.street_light_nos, unit:'RS/NOS'},
+    {label:'CP WALL', rate:DSR.cp_wall_rmt, unit:'RS/RMT'},
+    {label:'GABION WALL', rate:DSR.gabion_wall_rmt, unit:'RS/RMT'},
+  ];
+
+  row = mkHeaders(ws, row, ['SR.NO.','PARTICULAR','WITH MATERIAL RATE','UNIT','','','','REMARK']);
+  items.forEach((item,i)=>{
+    const bg=i%2===0?C.WHITE:C.ALT_ROW;
+    ws.getCell(row,1).value=i+1; sc(ws.getCell(row,1),bg,false,C.BLACK,11,'center'); ws.getCell(row,1).border=bdr;
+    ws.mergeCells(row,2,row,2); ws.getCell(row,2).value=item.label; sc(ws.getCell(row,2),bg,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr;
+    ws.getCell(row,3).value=item.rate; ws.getCell(row,3).numFmt='#,##0.00'; sc(ws.getCell(row,3),bg,true,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr;
+    ws.getCell(row,4).value=item.unit; sc(ws.getCell(row,4),bg,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr;
+    ws.getRow(row).height=15; row++;
+  });
+}
+
+// BOQ SHEET (for buildings/structures)
+function buildBOQ(wb, data) {
+  const ws = wb.addWorksheet('BOQ');
+  [7,50,12,14,14,18].forEach((w,i)=>ws.getColumn(i+1).width=w);
+
+  let row=1;
+  row = mkTitle(ws, row, data.project_name||'PROJECT', 6);
+  row = mkTitle(ws, row, 'BILL OF QUANTITIES', 6);
+  row = mkHeaders(ws, row, ['SR NO','DESCRIPTION OF WORK','UNIT','QUANTITY','RATE (INR)','AMOUNT (INR)']);
+
+  const boqItems = data.boq_items || generateBOQFromData(data);
+  let total=0;
+  boqItems.forEach((item,i)=>{
+    const bg=i%2===0?C.WHITE:C.ALT_ROW;
+    const amt=(item.qty||0)*(item.rate||0);
+    total+=amt;
+    [i+1,item.description||'',item.unit||'',item.qty||0,item.rate||0,amt].forEach((v,ci)=>{
+      const c=ws.getCell(row,ci+1); c.value=v;
+      sc(c,bg,false,C.BLACK,11,ci===1?'left':typeof v==='number'?'right':'center');
+      if(ci>=2&&typeof v==='number') c.numFmt=ci===5?'₹#,##0':'#,##0.00';
+    });
+    ws.getRow(row).height=15; row++;
+  });
+  ws.mergeCells(row,1,row,4);
+  sc(ws.getCell(row,1),C.TOTAL_BG,true,C.BLACK,12,'right'); ws.getCell(row,1).value='GRAND TOTAL';
+  const tc=ws.getCell(row,6); tc.value=total; tc.numFmt='₹#,##0'; sc(tc,C.TOTAL_BG,true,C.BLACK,12,'right');
+  ws.getRow(row).height=20;
+  ws.views=[{state:'frozen',ySplit:3}];
+}
+
+function generateBOQFromData(data) {
+  const items = [];
+  const roads = data.roads||[];
+  const totalArea = roads.reduce((s,r)=>s+(r.length_m||0)*(r.carriage_width_m||0),0);
+  if(totalArea>0) {
+    items.push({description:'SOIL FILLING IN ROAD AREA', unit:'CUM', qty:Math.round(totalArea*0.65*100)/100, rate:DSR.soil_filling_cum});
+    items.push({description:'GSB FILLING (300 MM THK)', unit:'SQMT', qty:Math.round(totalArea*100)/100, rate:DSR.gsb_300mm_sqmt});
+    items.push({description:'WMM FILLING (200 MM THK)', unit:'SQMT', qty:Math.round(totalArea*100)/100, rate:DSR.wmm_200mm_sqmt});
+    items.push({description:'PQC ROAD WORK M30 (250 MM THK)', unit:'SQMT', qty:Math.round(totalArea*100)/100, rate:DSR.pqc_250mm_sqmt});
+    items.push({description:'STEEL DOWEL BAR', unit:'TON', qty:Math.round(totalArea*3.87/1000*100)/100, rate:56000});
+  }
+  const bldgs = data.buildings||[];
+  bldgs.forEach(b=>{
+    items.push({description:`RCC WORK - ${b.name}`, unit:'CUM', qty:Math.round((b.slab_area_sqmt||0)*(b.slab_thickness_m||0.15)*100)/100, rate:DSR.rcc_m25_cum});
+    items.push({description:`BRICKWORK - ${b.name}`, unit:'CUM', qty:Math.round((b.wall_length_rmt||0)*(b.wall_height_m||3)*0.23*100)/100, rate:DSR.brickwork_230_cum});
+    items.push({description:`PLASTER - ${b.name}`, unit:'SQMT', qty:Math.round((b.wall_length_rmt||0)*(b.wall_height_m||3)*2*100)/100, rate:DSR.plaster_sqmt});
+    items.push({description:`STEEL - ${b.name}`, unit:'KG', qty:Math.round((b.slab_area_sqmt||0)*(b.slab_thickness_m||0.15)*120*100)/100, rate:DSR.steel_fe500_kg});
+  });
+  if(data.compound_wall?.cp_wall_length_rmt>0) {
+    items.push({description:'COMPOUND WALL (CP WALL)', unit:'RMT', qty:data.compound_wall.cp_wall_length_rmt, rate:DSR.cp_wall_rmt});
+  }
+  return items;
+}
+
+// PMC OBSERVATIONS SHEET
+function buildObservations(wb, data) {
+  const ws = wb.addWorksheet('PMC OBSERVATIONS');
+  ws.getColumn(1).width=6; ws.getColumn(2).width=90;
+
+  let row=1;
+  row = mkTitle(ws, row, data.project_name||'PROJECT', 2);
+  row = mkTitle(ws, row, 'PMC OBSERVATIONS & RECOMMENDATIONS', 2);
+
+  const obs = [
+    `Drawing Type: ${data.drawing_type||'SITE LAYOUT'}`,
+    `Scale: ${data.scale||'Not detected - please verify'}`,
+    `Location: ${data.location||'Not specified'}`,
+    `Total Area: ${(data.total_area_sqmt||0).toLocaleString('en-IN')} SQMT`,
+    `Roads extracted: ${(data.roads||[]).length} road segments`,
+    `Extraction confidence: ${data.confidence||'MEDIUM'}`,
+    ...(data.pmcnotes||[]),
+    ...(data.extracted_dimensions||[]).map(d=>`Dimension found: ${d}`),
+  ];
+
+  obs.forEach((o,i)=>{
+    ws.getCell(row,1).value=i+1; sc(ws.getCell(row,1),i%2===0?C.WHITE:C.ALT_ROW,false,C.BLACK,11,'center'); ws.getCell(row,1).border=bdr;
+    ws.getCell(row,2).value=o; sc(ws.getCell(row,2),i%2===0?C.WHITE:C.ALT_ROW,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr;
+    ws.getRow(row).height=20; row++;
+  });
+
+  row+=2;
+  row = mkTitle(ws, row, 'PMC RECOMMENDATION', 2);
+  ws.mergeCells(row,1,row,2);
+  ws.getCell(row,1).value = data.pmc_recommendation||'Drawing analyzed. Verify scale and dimensions with original drawing before proceeding.';
+  sc(ws.getCell(row,1), C.GREEN_BG, true, C.BLACK, 11, 'left');
+  ws.getRow(row).height=80;
+
+  row+=2;
+  ws.mergeCells(row,1,row,2);
+  ws.getCell(row,1).value=`Prepared by: PMC Civil AI Agent | Date: ${new Date().toLocaleDateString('en-IN')} | Powered by Gemini AI`;
+  ws.getCell(row,1).font={italic:true,size:9,color:{argb:'FF595959'},name:'Calibri'};
+  ws.getCell(row,1).alignment={horizontal:'center',vertical:'middle'};
+  ws.getRow(row).height=14;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// MAIN BUILD FUNCTION - DECIDES WHICH SHEETS TO CREATE
+// ══════════════════════════════════════════════════════════════════
+async function buildExcelFromDrawing(data) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'PMC Civil AI Agent';
+  wb.created = new Date();
+
+  const dtype = data.drawing_type||'SITE_LAYOUT';
+
+  // BLOCK COST always first
+  buildBlockCost(wb, data);
+
+  // Sheets based on drawing type
+  if(['ROAD_LAYOUT','SITE_LAYOUT'].includes(dtype) && (data.roads||[]).length>0) {
+    buildRoadEstimate(wb, data);
+    buildSoilFilling(wb, data);
+    buildServiceCorridor(wb, data);
+    buildStreetLight(wb, data);
+    buildRateAnalysis(wb, data);
+  }
+
+  if(['BUILDING','SITE_LAYOUT'].includes(dtype) && (data.buildings||[]).length>0) {
+    buildBOQ(wb, data);
+  }
+
+  if(['COMPOUND_WALL'].includes(dtype)) {
+    buildBOQ(wb, data);
+    buildRateAnalysis(wb, data);
+  }
+
+  if(['DRAINAGE'].includes(dtype)) {
+    buildBOQ(wb, data);
+  }
+
+  // Always add observations last
+  buildObservations(wb, data);
+
+  return wb;
+}
+
+module.exports = { buildExcelFromDrawing, getDrawingPrompt, DSR };
