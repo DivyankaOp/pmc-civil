@@ -634,6 +634,50 @@ Note: ${userText}` : '');
   }
 });
 
+
+// ─── DWG BINARY ANALYSIS ──────────────────────────────────────────
+// DWG is AutoCAD binary — we extract readable ASCII chunks and send to Gemini
+app.post('/analyze-dwg', async (req, res) => {
+  try {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
+    const { dwgText, filename } = req.body;
+    if (!dwgText) return res.status(400).json({ error: 'No DWG text provided.' });
+
+    const prompt = `You are a senior PMC civil engineer. This is extracted ASCII text from an AutoCAD DWG binary file: "${filename}".
+DWG files contain drawing data in binary format. The text below was extracted from readable portions of the binary.
+Analyze it carefully — it contains layer names, dimension values, text annotations, coordinates, and block names from the original AutoCAD drawing.
+
+EXTRACTED TEXT FROM DWG:
+${dwgText.slice(0, 8000)}
+
+Based on this extracted data:
+1. Identify drawing type (road plan, floor plan, structural, site layout, etc.)
+2. Extract all dimension values found
+3. Extract all text labels and annotations
+4. Extract layer names (these tell you what elements exist)
+5. Calculate quantities using Gujarat DSR 2025 rates wherever possible
+6. Provide full PMC analysis with tables
+
+Gujarat DSR 2025 rates: PQC ₹1800/sqmt | GSB ₹655/sqmt | WMM ₹515/sqmt | RCC M25 ₹5500/cum | Steel ₹56/kg | Excavation ₹180/cum
+
+Return a comprehensive PMC civil analysis report in markdown with tables.`;
+
+    const r = await fetch(GEMINI_URL(key), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 4096, temperature: 0.1 }
+      })
+    });
+    const data = await r.json();
+    const analysis = data?.candidates?.[0]?.content?.parts?.[0]?.text || 'Could not analyze DWG file.';
+    res.json({ success: true, analysis });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── 9. HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   const key = process.env.GEMINI_API_KEY;
