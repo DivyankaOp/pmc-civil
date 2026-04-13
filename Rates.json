@@ -1,0 +1,57 @@
+{
+  "_comment": "PMC Civil Rates Config — Edit this file to update rates. No code change needed.",
+  "_last_updated": "2025-04",
+  "_source": "Gujarat DSR 2025",
+
+  "roads": {
+    "soil_stabilization_sqmt":  { "rate": 82,    "unit": "sqmt", "description": "Soil stabilization" },
+    "soil_filling_cum":         { "rate": 285,   "unit": "cum",  "description": "Soil filling & compaction" },
+    "gsb_300mm_sqmt":           { "rate": 655,   "unit": "sqmt", "description": "GSB 300mm thick" },
+    "wmm_200mm_sqmt":           { "rate": 515,   "unit": "sqmt", "description": "WMM 200mm thick" },
+    "pqc_250mm_sqmt":           { "rate": 1800,  "unit": "sqmt", "description": "PQC road 250mm" },
+    "asphalt_60mm_sqmt":        { "rate": 750,   "unit": "sqmt", "description": "Asphalt 60mm" },
+    "paver_block_80mm_sqmt":    { "rate": 1040,  "unit": "sqmt", "description": "Paver block 80mm" },
+    "service_corridor_sqmt":    { "rate": 1790,  "unit": "sqmt", "description": "Service corridor" },
+    "kerbing_rmt":              { "rate": 350,   "unit": "rmt",  "description": "Kerbing / kerbstone" },
+    "street_light_nos":         { "rate": 35000, "unit": "nos",  "description": "Street light pole" }
+  },
+
+  "structure": {
+    "rcc_m20_cum":              { "rate": 5200,  "unit": "cum",  "description": "RCC M20" },
+    "rcc_m25_cum":              { "rate": 5500,  "unit": "cum",  "description": "RCC M25" },
+    "rcc_m30_cum":              { "rate": 5800,  "unit": "cum",  "description": "RCC M30" },
+    "pcc_m10_cum":              { "rate": 3800,  "unit": "cum",  "description": "PCC M10" },
+    "brickwork_230mm_cum":      { "rate": 4500,  "unit": "cum",  "description": "Brickwork 230mm" },
+    "brickwork_115mm_cum":      { "rate": 4200,  "unit": "cum",  "description": "Brickwork 115mm" },
+    "plaster_15mm_sqmt":        { "rate": 120,   "unit": "sqmt", "description": "Plaster 15mm" },
+    "steel_fe500_kg":           { "rate": 56,    "unit": "kg",   "description": "Steel Fe500" },
+    "steel_fe415_kg":           { "rate": 54,    "unit": "kg",   "description": "Steel Fe415" },
+    "formwork_sqmt":            { "rate": 180,   "unit": "sqmt", "description": "Formwork" },
+    "waterproofing_sqmt":       { "rate": 450,   "unit": "sqmt", "description": "Waterproofing" }
+  },
+
+  "civil": {
+    "excavation_cum":           { "rate": 180,   "unit": "cum",  "description": "Excavation" },
+    "backfilling_cum":          { "rate": 120,   "unit": "cum",  "description": "Backfilling" },
+    "compound_wall_rmt":        { "rate": 8600,  "unit": "rmt",  "description": "Compound wall" },
+    "gabion_wall_rmt":          { "rate": 14100, "unit": "rmt",  "description": "Gabion wall" },
+    "retaining_wall_cum":       { "rate": 6500,  "unit": "cum",  "description": "Retaining wall RCC" }
+  },
+
+  "mep": {
+    "pipeline_rmt":             { "rate": 4500,  "unit": "rmt",  "description": "Pipeline (avg)" },
+    "borewell_nos":             { "rate": 75000, "unit": "nos",  "description": "Borewell" },
+    "stp_per_kld":              { "rate": 25000, "unit": "kld",  "description": "STP per KLD capacity" },
+    "water_tank_kl":            { "rate": 18000, "unit": "kl",   "description": "Overhead water tank" },
+    "electrical_sqmt":          { "rate": 850,   "unit": "sqmt", "description": "Electrical (per sqmt BUA)" }
+  },
+
+  "finishes": {
+    "flooring_vitrified_sqmt":  { "rate": 1200,  "unit": "sqmt", "description": "Vitrified tile flooring" },
+    "flooring_marble_sqmt":     { "rate": 2500,  "unit": "sqmt", "description": "Marble flooring" },
+    "door_flush_nos":           { "rate": 8500,  "unit": "nos",  "description": "Flush door (per nos)" },
+    "window_aluminum_sqmt":     { "rate": 2800,  "unit": "sqmt", "description": "Aluminum window" },
+    "painting_sqmt":            { "rate": 85,    "unit": "sqmt", "description": "Interior painting" },
+    "external_paint_sqmt":      { "rate": 120,   "unit": "sqmt", "description": "External painting" }
+  }
+}
