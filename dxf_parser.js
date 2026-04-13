@@ -1,436 +1,469 @@
 /**
- * PMC DXF Parser — Pure JavaScript, no dependencies
- * Reads AutoCAD/ZWCAD DXF files and extracts:
- * - All entities (LINE, TEXT, MTEXT, DIMENSION, LWPOLYLINE, CIRCLE, ARC)
- * - Layer names with their entities
- * - Title block info (project name, scale, date)
- * - All text annotations and dimension values
+ * PMC DXF Parser — v2.0
+ * Pure JavaScript, zero dependencies.
+ *
+ * Extracts ALL data directly from the DXF file:
+ *   - Every TEXT and MTEXT entity (room names, annotations, labels)
+ *   - Every DIMENSION entity (walls, openings, lengths)
+ *   - Every LWPOLYLINE / POLYLINE (room boundaries → areas)
+ *   - All layer names and which entities live on each layer
+ *   - Title block info (project, scale, date, drawn-by)
+ *   - Drawing extents and inferred scale
+ *   - INSERT references (block instances: doors, columns, windows)
+ *
+ * NO rates hardcoded here. All rates come from rates.json.
  */
+
+'use strict';
+
+// ── LOAD RATES FROM CONFIG (no hardcoding) ───────────────────────
+let RATES = {};
+try {
+  const fs   = require('fs');
+  const path = require('path');
+  const raw  = JSON.parse(fs.readFileSync(path.join(__dirname, 'rates.json'), 'utf8'));
+  for (const category of Object.values(raw)) {
+    if (typeof category === 'object' && !Array.isArray(category)) {
+      for (const [key, val] of Object.entries(category)) {
+        if (val && typeof val.rate === 'number') RATES[key] = val.rate;
+      }
+    }
+  }
+} catch(e) {
+  console.warn('rates.json not loaded:', e.message);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 1 — RAW DXF PARSER
+// ─────────────────────────────────────────────────────────────────
 
 function parseDXF(dxfContent) {
   const lines = dxfContent.split(/\r?\n/);
   const result = {
-    version: '',
-    units: 'mm',
-    layers: {},
-    entities: [],
-    texts: [],
-    dimensions: [],
-    polylines: [],
-    blocks: {},
-    title_block: {},
-    extents: { xmin: Infinity, xmax: -Infinity, ymin: Infinity, ymax: -Infinity }
+    version: '', units: 'mm',
+    layers: {}, entities: [], texts: [], dimensions: [],
+    polylines: [], inserts: [], blocks: {}, title_block: {},
+    extents: { xmin: Infinity, xmax: -Infinity, ymin: Infinity, ymax: -Infinity },
+    header_vars: {}
   };
 
   let i = 0;
-  const next = () => { const v = lines[i]?.trim(); i++; return v; };
+  const next = () => lines[i++]?.trim();
   const peek = () => lines[i]?.trim();
 
-  // ── Parse group code/value pairs ──────────────────────────────
+  function updateExtents(x, y) {
+    if (!isNaN(x) && !isNaN(y)) {
+      if (x < result.extents.xmin) result.extents.xmin = x;
+      if (x > result.extents.xmax) result.extents.xmax = x;
+      if (y < result.extents.ymin) result.extents.ymin = y;
+      if (y > result.extents.ymax) result.extents.ymax = y;
+    }
+  }
+
+  // Read all group-code / value pairs until next entity (code 0)
   function readPairs() {
-    const pairs = {};
-    while (i < lines.length) {
-      const code = next();
-      const value = next();
-      if (code === undefined || value === undefined) break;
-      const codeNum = parseInt(code);
-      if (!isNaN(codeNum)) {
-        pairs[codeNum] = value;
-        if (codeNum === 0) { i -= 2; break; } // Entity type marker
-      }
-    }
-    return pairs;
-  }
-
-  // ── Parse ENTITIES section ─────────────────────────────────────
-  function parseEntities(inBlock = false) {
-    while (i < lines.length) {
-      const code = parseInt(next());
-      const value = next();
-
-      if (isNaN(code)) continue;
-      if (code !== 0) continue;
-
-      const entityType = value?.trim().toUpperCase();
-
-      if (entityType === 'ENDSEC' || entityType === 'ENDBLK') break;
-
-      if (entityType === 'TEXT' || entityType === 'MTEXT') {
-        const e = readTextEntity(entityType);
-        if (e) {
-          result.texts.push(e);
-          result.entities.push({ type: entityType, ...e });
-        }
-      } else if (entityType === 'DIMENSION') {
-        const e = readDimEntity();
-        if (e) {
-          result.dimensions.push(e);
-          result.entities.push({ type: 'DIMENSION', ...e });
-        }
-      } else if (entityType === 'LWPOLYLINE' || entityType === 'POLYLINE') {
-        const e = readPolyline(entityType);
-        if (e) {
-          result.polylines.push(e);
-          updateExtents(e.vertices);
-        }
-      } else if (entityType === 'LINE') {
-        const e = readLine();
-        if (e) {
-          result.entities.push({ type: 'LINE', ...e });
-          updateExtents([{x: e.x1, y: e.y1}, {x: e.x2, y: e.y2}]);
-        }
-      } else if (entityType === 'INSERT') {
-        readInsert(); // block reference
-      } else if (entityType === 'CIRCLE' || entityType === 'ARC') {
-        skipEntity();
-      } else if (entityType === 'HATCH' || entityType === 'SOLID') {
-        skipEntity();
-      }
-    }
-  }
-
-  function updateExtents(vertices) {
-    for (const v of vertices) {
-      if (v.x < result.extents.xmin) result.extents.xmin = v.x;
-      if (v.x > result.extents.xmax) result.extents.xmax = v.x;
-      if (v.y < result.extents.ymin) result.extents.ymin = v.y;
-      if (v.y > result.extents.ymax) result.extents.ymax = v.y;
-    }
-  }
-
-  function readTextEntity(type) {
     const props = {};
     while (i < lines.length) {
-      const code = parseInt(peek());
-      if (isNaN(code)) { next(); next(); continue; }
-      if (code === 0) break;
-      next(); const val = next();
-      if (code === 1)  props.text = val;      // actual text content
-      if (code === 3)  props.text = (props.text||'') + val; // MTEXT continuation
-      if (code === 10) props.x = parseFloat(val);
-      if (code === 20) props.y = parseFloat(val);
-      if (code === 40) props.height = parseFloat(val);
-      if (code === 8)  props.layer = val;
-      if (code === 50) props.rotation = parseFloat(val);
-    }
-    // Clean MTEXT formatting codes
-    if (props.text) {
-      props.text = props.text
-        .replace(/\\P/g, '\n')
-        .replace(/\{[^}]*\}/g, '')
-        .replace(/\\[a-zA-Z][^;]*;/g, '')
-        .trim();
-    }
-    return props.text ? props : null;
-  }
-
-  function readDimEntity() {
-    const props = {};
-    while (i < lines.length) {
-      const code = parseInt(peek());
-      if (isNaN(code)) { next(); next(); continue; }
-      if (code === 0) break;
-      next(); const val = next();
-      if (code === 1)  props.dimtext = val;         // override text
-      if (code === 42) props.actual_measurement = parseFloat(val); // actual dim value
-      if (code === 10) props.x1 = parseFloat(val);
-      if (code === 20) props.y1 = parseFloat(val);
-      if (code === 13) props.x2 = parseFloat(val);
-      if (code === 23) props.y2 = parseFloat(val);
-      if (code === 11) props.xtext = parseFloat(val);
-      if (code === 21) props.ytext = parseFloat(val);
-      if (code === 8)  props.layer = val;
-      if (code === 3)  props.dimstyle = val;
+      const cRaw = peek();
+      const c = parseInt(cRaw);
+      if (isNaN(c)) { next(); next(); continue; }
+      if (c === 0) break;
+      next(); // consume code
+      const v = next(); // consume value
+      if (c in props) {
+        if (!Array.isArray(props[c])) props[c] = [props[c]];
+        props[c].push(v);
+      } else {
+        props[c] = v;
+      }
     }
     return props;
   }
 
-  function readPolyline(type) {
-    const props = { vertices: [], layer: '' };
-    let cx = 0, cy = 0;
+  function cleanMtext(s) {
+    if (!s) return '';
+    return s
+      .replace(/\\P/g, '\n')
+      .replace(/\\p[^;]*;/g, '')
+      .replace(/\\f[^;]*;/g, '')
+      .replace(/\\H[^;]*;/g, '')
+      .replace(/\\W[^;]*;/g, '')
+      .replace(/\\C[^;]*;/g, '')
+      .replace(/\{\\[^}]*\}/g, '')
+      .replace(/\\[AaLlOoSsUuQqTt]/g, '')
+      .replace(/%%[cCdDpP]/g, '')
+      .replace(/\\\\/g, '\\')
+      .trim();
+  }
+
+  function readTextEntity() {
+    const p = readPairs();
+    let text = p[1] || '';
+    if (p[3]) {
+      const extra = Array.isArray(p[3]) ? p[3].join('') : p[3];
+      text = extra + text;
+    }
+    text = cleanMtext(text);
+    if (!text) return null;
+    const x = parseFloat(p[10]) || 0, y = parseFloat(p[20]) || 0;
+    updateExtents(x, y);
+    return { text, x, y, height: parseFloat(p[40]) || 0, layer: p[8] || '0', rotation: parseFloat(p[50]) || 0 };
+  }
+
+  function readDimension() {
+    const p = readPairs();
+    const x1 = parseFloat(p[10]) || 0, y1 = parseFloat(p[20]) || 0;
+    const x2 = parseFloat(p[13]) || 0, y2 = parseFloat(p[23]) || 0;
+    const measured = parseFloat(p[42]);
+    const geom = Math.sqrt((x2-x1)**2 + (y2-y1)**2);
+    updateExtents(x1, y1); updateExtents(x2, y2);
+    return {
+      dimtext: p[1] || '',
+      value_mm: (!isNaN(measured) && measured > 0) ? measured : geom,
+      x1, y1, x2, y2,
+      xt: parseFloat(p[11]) || 0, yt: parseFloat(p[21]) || 0,
+      layer: p[8] || '0', dimstyle: p[3] || ''
+    };
+  }
+
+  function readLWPolyline() {
+    const p = readPairs();
+    const closed = (parseInt(p[70]) & 1) === 1;
+    const vertices = [];
+    const xs = Array.isArray(p[10]) ? p[10].map(parseFloat) : (p[10] !== undefined ? [parseFloat(p[10])] : []);
+    const ys = Array.isArray(p[20]) ? p[20].map(parseFloat) : (p[20] !== undefined ? [parseFloat(p[20])] : []);
+    for (let k = 0; k < Math.min(xs.length, ys.length); k++) {
+      vertices.push({ x: xs[k], y: ys[k] });
+      updateExtents(xs[k], ys[k]);
+    }
+    return vertices.length >= 2 ? { vertices, closed, layer: p[8] || '0' } : null;
+  }
+
+  function readOldPolyline() {
+    const p = readPairs();
+    const closed = (parseInt(p[70]) & 1) === 1;
+    const layer = p[8] || '0';
+    const vertices = [];
     while (i < lines.length) {
-      const code = parseInt(peek());
-      if (isNaN(code)) { next(); next(); continue; }
-      if (code === 0) break;
-      next(); const val = next();
-      if (code === 8)  props.layer = val;
-      if (code === 90) props.vertex_count = parseInt(val);
-      if (type === 'LWPOLYLINE') {
-        if (code === 10) { cx = parseFloat(val); }
-        if (code === 20) { cy = parseFloat(val); props.vertices.push({x: cx, y: cy}); }
+      const c = parseInt(peek());
+      if (isNaN(c)) { next(); next(); continue; }
+      if (c !== 0) { next(); next(); continue; }
+      next(); const etype = next();
+      if (!etype) continue;
+      if (etype.trim().toUpperCase() === 'SEQEND') break;
+      if (etype.trim().toUpperCase() === 'VERTEX') {
+        const vp = readPairs();
+        const x = parseFloat(vp[10]) || 0, y = parseFloat(vp[20]) || 0;
+        vertices.push({ x, y }); updateExtents(x, y);
       }
     }
-    return props.vertices.length > 0 ? props : null;
+    return vertices.length >= 2 ? { vertices, closed, layer } : null;
   }
 
   function readLine() {
-    const props = {};
-    while (i < lines.length) {
-      const code = parseInt(peek());
-      if (isNaN(code)) { next(); next(); continue; }
-      if (code === 0) break;
-      next(); const val = next();
-      if (code === 10) props.x1 = parseFloat(val);
-      if (code === 20) props.y1 = parseFloat(val);
-      if (code === 11) props.x2 = parseFloat(val);
-      if (code === 21) props.y2 = parseFloat(val);
-      if (code === 8)  props.layer = val;
-    }
-    return (props.x1 !== undefined) ? props : null;
+    const p = readPairs();
+    const x1 = parseFloat(p[10]) || 0, y1 = parseFloat(p[20]) || 0;
+    const x2 = parseFloat(p[11]) || 0, y2 = parseFloat(p[21]) || 0;
+    updateExtents(x1, y1); updateExtents(x2, y2);
+    return { x1, y1, x2, y2, layer: p[8] || '0' };
   }
 
   function readInsert() {
-    while (i < lines.length) {
-      const code = parseInt(peek());
-      if (isNaN(code)) { next(); next(); continue; }
-      if (code === 0) break;
-      next(); next();
+    const p = readPairs();
+    const x = parseFloat(p[10]) || 0, y = parseFloat(p[20]) || 0;
+    updateExtents(x, y);
+    return { block: p[2] || '', x, y, sx: parseFloat(p[41]) || 1, sy: parseFloat(p[42]) || 1, rotation: parseFloat(p[50]) || 0, layer: p[8] || '0' };
+  }
+
+  function skipEntity() { readPairs(); }
+
+  function dispatchEntity(etype, dest) {
+    const t = (etype || '').trim().toUpperCase();
+    if      (t === 'TEXT' || t === 'ATTDEF' || t === 'ATTRIB') {
+      const e = readTextEntity(); if (e) { dest.texts.push(e); dest.entities.push({ type: t, ...e }); }
+    } else if (t === 'MTEXT') {
+      const e = readTextEntity(); if (e) { dest.texts.push(e); dest.entities.push({ type: t, ...e }); }
+    } else if (t === 'DIMENSION') {
+      const e = readDimension(); if (e) { dest.dimensions.push(e); dest.entities.push({ type: t, ...e }); }
+    } else if (t === 'LWPOLYLINE') {
+      const e = readLWPolyline(); if (e) { dest.polylines.push(e); dest.entities.push({ type: t, ...e }); }
+    } else if (t === 'POLYLINE') {
+      const e = readOldPolyline(); if (e) { dest.polylines.push(e); dest.entities.push({ type: t, ...e }); }
+    } else if (t === 'LINE') {
+      const e = readLine(); if (e) dest.entities.push({ type: t, ...e });
+    } else if (t === 'INSERT') {
+      const e = readInsert(); if (e) { dest.inserts.push(e); dest.entities.push({ type: t, ...e }); }
+    } else {
+      skipEntity();
     }
   }
 
-  function skipEntity() {
+  function parseSection(dest) {
     while (i < lines.length) {
-      const code = parseInt(peek());
-      if (isNaN(code)) { next(); next(); continue; }
-      if (code === 0) break;
-      next(); next();
+      const c = parseInt(peek());
+      if (isNaN(c)) { next(); next(); continue; }
+      if (c !== 0) { next(); next(); continue; }
+      next(); const etype = next();
+      if (!etype) continue;
+      const up = etype.trim().toUpperCase();
+      if (up === 'ENDSEC' || up === 'ENDBLK') break;
+      dispatchEntity(etype, dest);
     }
   }
 
-  // ── Main parse loop ────────────────────────────────────────────
-  while (i < lines.length) {
-    const code = parseInt(next());
-    const value = next();
-    if (isNaN(code) || value === undefined) continue;
+  function parseHeader() {
+    let curVar = '';
+    while (i < lines.length) {
+      const c = parseInt(peek());
+      if (isNaN(c)) { next(); next(); continue; }
+      next(); const v = next();
+      if (c === 0 && v === 'ENDSEC') break;
+      if (c === 9) { curVar = v; }
+      else if (curVar) {
+        result.header_vars[curVar] = v;
+        if (curVar === '$INSUNITS') {
+          const u = parseInt(v);
+          result.units = u===4?'mm': u===5?'cm': u===6?'m': u===1?'in': u===2?'ft': 'mm';
+        }
+      }
+    }
+    result.version = result.header_vars['$ACADVER'] || '';
+  }
 
-    if (code === 0 && value === 'SECTION') {
-      const secCode = parseInt(next());
-      const secName = next();
-      if (secName === 'HEADER') {
-        // Parse header for units and extents
-        while (i < lines.length) {
-          const c = parseInt(peek());
-          if (isNaN(c)) { next(); next(); continue; }
-          next(); const v = next();
-          if (c === 9 && v === '$INSUNITS') {
-            const uc = parseInt(next()); const uv = next();
-            if (uv === '4') result.units = 'mm';
-            else if (uv === '5') result.units = 'cm';
-            else if (uv === '6') result.units = 'm';
-          }
-          if (c === 0 && v === 'ENDSEC') break;
-        }
-      } else if (secName === 'TABLES') {
-        // Parse layers
-        while (i < lines.length) {
-          const c = parseInt(peek());
-          if (isNaN(c)) { next(); next(); continue; }
-          next(); const v = next();
-          if (c === 0 && v === 'LAYER') {
-            let layerName = '';
-            while (i < lines.length) {
-              const lc = parseInt(peek());
-              if (isNaN(lc)) { next(); next(); continue; }
-              if (lc === 0) break;
-              next(); const lv = next();
-              if (lc === 2) layerName = lv;
-            }
-            if (layerName) result.layers[layerName] = { entities: [] };
-          }
-          if (c === 0 && v === 'ENDSEC') break;
-        }
-      } else if (secName === 'ENTITIES') {
-        parseEntities();
-      } else if (secName === 'BLOCKS') {
-        // Parse blocks (contains reusable geometry like title blocks)
-        let currentBlock = null;
-        while (i < lines.length) {
-          const c = parseInt(peek());
-          if (isNaN(c)) { next(); next(); continue; }
-          next(); const v = next();
-          if (c === 0 && v === 'BLOCK') {
-            currentBlock = { texts: [], name: '' };
-          }
-          if (c === 2 && currentBlock) currentBlock.name = v;
-          if (c === 0 && v === 'TEXT') {
-            const t = readTextEntity('TEXT');
-            if (t && currentBlock) currentBlock.texts.push(t);
-          }
-          if (c === 0 && v === 'MTEXT') {
-            const t = readTextEntity('MTEXT');
-            if (t && currentBlock) currentBlock.texts.push(t);
-          }
-          if (c === 0 && v === 'ENDBLK' && currentBlock) {
-            if (currentBlock.name) result.blocks[currentBlock.name] = currentBlock;
-            currentBlock = null;
-          }
-          if (c === 0 && v === 'ENDSEC') break;
+  function parseTables() {
+    let inLayer = false, lName = '', lColor = 0, lLtype = '';
+    while (i < lines.length) {
+      const c = parseInt(peek());
+      if (isNaN(c)) { next(); next(); continue; }
+      next(); const v = next();
+      if (c === 0 && v === 'ENDSEC') break;
+      if (c === 0 && v === 'TABLE') inLayer = false;
+      if (c === 2 && v === 'LAYER') inLayer = true;
+      if (inLayer) {
+        if (c === 0 && v === 'LAYER') { lName = ''; lColor = 0; lLtype = ''; }
+        if (c === 2 && !lName)        lName  = v;
+        if (c === 62)                 lColor = Math.abs(parseInt(v) || 0);
+        if (c === 6)                  lLtype = v;
+        if (c === 0 && v !== 'LAYER' && lName) {
+          result.layers[lName] = { color: lColor, linetype: lLtype, entities: [] };
+          lName = '';
         }
       }
     }
   }
 
+  function parseBlocks() {
+    let cb = null;
+    while (i < lines.length) {
+      const c = parseInt(peek());
+      if (isNaN(c)) { next(); next(); continue; }
+      next(); const v = next();
+      if (c === 0 && v === 'ENDSEC') break;
+      if (c === 0 && v === 'BLOCK') {
+        cb = { name: '', texts: [], dimensions: [], polylines: [], entities: [], inserts: [] };
+      }
+      if (c === 2 && cb && !cb.name) cb.name = v;
+      if (c === 0 && cb && !['BLOCK','ENDSEC','ENDBLK'].includes(v)) dispatchEntity(v, cb);
+      if (c === 0 && v === 'ENDBLK' && cb) {
+        if (cb.name) result.blocks[cb.name] = cb;
+        cb = null;
+      }
+    }
+  }
+
+  // ── Main parse loop ──────────────────────────────────────────
+  while (i < lines.length) {
+    const c = parseInt(next());
+    const v = next();
+    if (isNaN(c) || v === undefined) continue;
+    if (c === 0 && v === 'SECTION') {
+      next(); // code 2
+      const sec = next();
+      if      (sec === 'HEADER')   parseHeader();
+      else if (sec === 'TABLES')   parseTables();
+      else if (sec === 'BLOCKS')   parseBlocks();
+      else if (sec === 'ENTITIES') parseSection(result);
+    }
+  }
   return result;
 }
 
-// ── EXTRACT CIVIL DATA FROM PARSED DXF ──────────────────────────
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 2 — INTELLIGENT EXTRACTION (100% from drawing data)
+// ─────────────────────────────────────────────────────────────────
+
 function extractCivilData(parsed, filename) {
   const allTexts = [
     ...parsed.texts,
     ...Object.values(parsed.blocks).flatMap(b => b.texts || [])
+  ].filter(t => t && t.text && t.text.trim());
+
+  const allDims = [
+    ...parsed.dimensions,
+    ...Object.values(parsed.blocks).flatMap(b => b.dimensions || [])
   ];
 
-  // ── Scale detection ─────────────────────────────────────────
-  let scale = null;
-  let scaleFactor = 1; // mm per drawing unit
+  const allPolylines = [
+    ...parsed.polylines,
+    ...Object.values(parsed.blocks).flatMap(b => b.polylines || [])
+  ];
 
+  const allInserts = [
+    ...parsed.inserts,
+    ...Object.values(parsed.blocks).flatMap(b => b.inserts || [])
+  ];
+
+  // 1. Scale
+  let scale = null, scaleFactor = 1;
   for (const t of allTexts) {
-    if (!t.text) continue;
-    const m = t.text.match(/1\s*:\s*(\d+)/);
-    if (m) { scale = `1:${m[1]}`; scaleFactor = parseInt(m[1]); break; }
+    const m = t.text.match(/1\s*[:/]\s*(\d+(?:\.\d+)?)/);
+    if (m) { scale = `1:${m[1]}`; scaleFactor = parseFloat(m[1]); break; }
   }
 
-  // Auto-detect from extents if no scale found
-  const extW = parsed.extents.xmax - parsed.extents.xmin;
-  const extH = parsed.extents.ymax - parsed.extents.ymin;
+  // 2. Unit factor → mm
+  const u2m = parsed.units === 'm' ? 1000 : parsed.units === 'cm' ? 10 : parsed.units === 'ft' ? 304.8 : parsed.units === 'in' ? 25.4 : 1;
 
-  // ── Title block extraction ──────────────────────────────────
+  // 3. Extents
+  const ext = parsed.extents;
+  const extW = (ext.xmax - ext.xmin) * u2m;
+  const extH = (ext.ymax - ext.ymin) * u2m;
+
+  // 4. Title block
   const titleBlock = {};
-  const titleKeywords = {
-    project: /project|work|name|title/i,
-    drawing_no: /drg\.?\s*no|drawing\s*no|dwg/i,
-    date: /date|dt/i,
-    scale: /scale/i,
-    prepared: /prepared|designed|drawn/i,
-    location: /location|site|place/i
+  const titleREs = {
+    project_name: /project\s*(name)?|work\s*name|title/i,
+    drawing_no:   /drg\s*(no\.?)?|drawing\s*(no\.?)|sheet\s*(no\.?)/i,
+    date:         /\bdate\b|\bdt\b/i,
+    scale:        /\bscale\b/i,
+    drawn_by:     /prepared|designed|drawn\s*by|architect|engineer/i,
+    client:       /client|owner/i,
+    revision:     /rev(ision)?\s*(no\.?)?/i
   };
-
-  // Cluster texts that are near each other (title block region)
-  const sortedTexts = [...allTexts].sort((a, b) => (a.y || 0) - (b.y || 0));
-
   for (const t of allTexts) {
-    if (!t.text) continue;
-    for (const [key, regex] of Object.entries(titleKeywords)) {
-      if (regex.test(t.text) && !titleBlock[key]) {
-        titleBlock[key] = t.text;
-      }
+    for (const [k, re] of Object.entries(titleREs)) {
+      if (!titleBlock[k] && re.test(t.text)) titleBlock[k] = t.text.trim();
     }
   }
 
-  // ── Dimension extraction ────────────────────────────────────
-  const dimValues = parsed.dimensions
-    .filter(d => d.actual_measurement && d.actual_measurement > 0)
+  // 5. Dimension values
+  const dimValues = allDims
+    .filter(d => d.value_mm > 0)
     .map(d => ({
-      value_mm: d.actual_measurement,
-      value_m: d.actual_measurement / 1000,
-      text: d.dimtext || d.actual_measurement.toFixed(2),
-      layer: d.layer || ''
-    }));
+      value_mm:  Math.round(d.value_mm * u2m),
+      value_m:   Math.round(d.value_mm * u2m / 1000 * 100) / 100,
+      text:      d.dimtext || String(Math.round(d.value_mm)),
+      layer:     d.layer || ''
+    }))
+    .sort((a, b) => b.value_mm - a.value_mm);
 
-  // ── Layer-wise geometry analysis ────────────────────────────
+  // 6. Polyline → areas
+  const polylineAreas = allPolylines
+    .filter(pl => pl.vertices.length >= 3)
+    .map(pl => {
+      const rawArea = Math.abs(shoelaceArea(pl.vertices));
+      const areaMm2 = rawArea * u2m * u2m;
+      return {
+        area_sqm:    Math.round(areaMm2 / 1e6 * 100) / 100,
+        area_sqft:   Math.round(areaMm2 / 1e6 * 10.764 * 100) / 100,
+        perimeter_m: Math.round(perimeter(pl.vertices) * u2m / 1000 * 100) / 100,
+        layer:       pl.layer || '',
+        closed:      pl.closed || false,
+        vertices:    pl.vertices.length
+      };
+    })
+    .filter(a => a.area_sqm > 0.01)
+    .sort((a, b) => b.area_sqm - a.area_sqm);
+
+  // 7. Room annotations from text
+  const spaceRE = /bed\s*room|bedroom|living|drawing\s*room|dining|kitchen|bath|toilet|wc|passage|corridor|lobby|hall|store|staircase|stair|lift|balcony|terrace|utility|servant|garage|office|flat|unit|room/i;
+  const roomAnnotations = allTexts
+    .filter(t => spaceRE.test(t.text))
+    .map(t => ({ text: t.text.trim(), x: t.x, y: t.y, layer: t.layer }));
+
+  // 8. Inline dimension text (e.g. "3000x4500")
+  const inlineDims = [];
+  const dimRE = /(\d+(?:\.\d+)?)\s*[xX×]\s*(\d+(?:\.\d+)?)/g;
+  for (const t of allTexts) {
+    let m;
+    while ((m = dimRE.exec(t.text)) !== null) {
+      const l = parseFloat(m[1]) * u2m, w = parseFloat(m[2]) * u2m;
+      if (l > 50 && w > 50) inlineDims.push({ label: t.text, length_mm: Math.round(l), width_mm: Math.round(w), area_sqm: Math.round(l*w/1e6*100)/100, layer: t.layer });
+    }
+  }
+
+  // 9. Layer groups
   const layerGroups = {};
   for (const e of parsed.entities) {
     const layer = e.layer || 'DEFAULT';
-    if (!layerGroups[layer]) layerGroups[layer] = { texts: [], lines: [], polylines: [], dims: [] };
+    if (!layerGroups[layer]) layerGroups[layer] = { texts: [], lines: [], dims: [], polylines: [], inserts: [], count: 0 };
+    layerGroups[layer].count++;
     if (e.type === 'TEXT' || e.type === 'MTEXT') layerGroups[layer].texts.push(e.text);
-    if (e.type === 'LINE') layerGroups[layer].lines.push(e);
-    if (e.type === 'DIMENSION') layerGroups[layer].dims.push(e.actual_measurement);
+    if (e.type === 'LINE')       layerGroups[layer].lines.push(e);
+    if (e.type === 'DIMENSION')  layerGroups[layer].dims.push(e.value_mm);
+    if (e.type === 'LWPOLYLINE' || e.type === 'POLYLINE') layerGroups[layer].polylines.push(e);
+    if (e.type === 'INSERT')     layerGroups[layer].inserts.push(e.block);
   }
 
-  // ── Extract road/space data from text annotations ───────────
-  const spacesFound = [];
-  const roadPattern = /([A-Z]+-?\d+|ROAD\s*[A-Z0-9-]+|R\s*[-=]?\s*\d+)/gi;
-  const dimPattern = /(\d+\.?\d*)\s*[Xx×]\s*(\d+\.?\d*)/g;
-  const areaPattern = /(\d+[\.,]?\d*)\s*(sqmt|sqm|sq\.?m|m2|sqft|sft)/gi;
-  const lengthPattern = /(\d+[\.,]?\d*)\s*(rmt|rmt|m|mt|meter|mtr)/gi;
+  // 10. Block counts
+  const blockCounts = {};
+  for (const ins of allInserts) blockCounts[ins.block] = (blockCounts[ins.block] || 0) + 1;
 
-  for (const t of allTexts) {
-    if (!t.text) continue;
-    const txt = t.text;
+  // 11. Drawing type
+  const drawingType = inferDrawingType(Object.keys(layerGroups), allTexts.map(t => t.text), filename || '');
 
-    // Extract L×W dimensions
-    let m;
-    while ((m = dimPattern.exec(txt)) !== null) {
-      const l = parseFloat(m[1]), w = parseFloat(m[2]);
-      if (l > 0 && w > 0 && l < 5000 && w < 5000) {
-        spacesFound.push({ label: txt, length: l, width: w, area: l * w, source: 'annotation' });
-      }
-    }
-  }
-
-  // ── Calculate polyline areas (closed regions = rooms/plots) ──
-  const polylineAreas = [];
-  for (const pl of parsed.polylines) {
-    if (pl.vertices.length >= 3) {
-      const area = Math.abs(shoelaceArea(pl.vertices));
-      if (area > 100) { // filter tiny artifacts
-        const unitArea = area / (scaleFactor * scaleFactor); // convert to m²
-        polylineAreas.push({
-          area_sqm: Math.round(unitArea * 100) / 100,
-          perimeter_m: Math.round(perimeter(pl.vertices) / scaleFactor * 100) / 100,
-          layer: pl.layer,
-          vertices: pl.vertices.length
-        });
-      }
-    }
-  }
-  polylineAreas.sort((a, b) => b.area_sqm - a.area_sqm);
-
-  // ── Line length analysis ─────────────────────────────────────
-  const lineLengths = [];
-  for (const e of parsed.entities) {
-    if (e.type === 'LINE') {
-      const len = Math.sqrt((e.x2-e.x1)**2 + (e.y2-e.y1)**2) / scaleFactor;
-      if (len > 0.5) lineLengths.push({ length_m: Math.round(len*100)/100, layer: e.layer || '' });
-    }
-  }
+  // 12. Unique text list
+  const uniqueTexts = [...new Set(allTexts.map(t => t.text.trim()))].filter(Boolean);
 
   return {
-    filename: filename || 'drawing.dxf',
-    scale,
-    scale_factor: scaleFactor,
-    units: parsed.units,
-    drawing_extents: {
-      width_units: Math.round(extW),
-      height_units: Math.round(extH),
-      estimated_width_m: Math.round(extW / scaleFactor * 100) / 100,
-      estimated_height_m: Math.round(extH / scaleFactor * 100) / 100
-    },
-    title_block: titleBlock,
-    all_texts: allTexts.filter(t => t.text).map(t => t.text).filter((v, i, a) => a.indexOf(v) === i),
-    layer_names: Object.keys(layerGroups).filter(l => l.trim()),
+    filename,
+    drawing_type:    drawingType,
+    scale, scale_factor: scaleFactor,
+    units: parsed.units, unit_to_mm: u2m,
+    drawing_extents: { width_mm: Math.round(extW), height_mm: Math.round(extH), width_m: Math.round(extW/1000*100)/100, height_m: Math.round(extH/1000*100)/100 },
+    title_block:     titleBlock,
+    all_texts:       uniqueTexts,
+    room_annotations: roomAnnotations,
+    layer_names:     Object.keys(layerGroups).filter(Boolean),
+    layer_groups:    layerGroups,
     dimension_values: dimValues,
-    spaces_from_annotations: spacesFound,
-    polyline_areas: polylineAreas.slice(0, 50),
-    line_lengths: lineLengths.slice(0, 200),
+    inline_dims:     inlineDims,
+    polyline_areas:  polylineAreas.slice(0, 300),
+    block_counts:    blockCounts,
     stats: {
-      total_texts: allTexts.length,
-      total_dims: parsed.dimensions.length,
-      total_lines: parsed.entities.filter(e => e.type === 'LINE').length,
-      total_polylines: parsed.polylines.length,
-      total_layers: Object.keys(layerGroups).length
+      total_texts:     allTexts.length,
+      total_dims:      allDims.length,
+      total_lines:     parsed.entities.filter(e => e.type === 'LINE').length,
+      total_polylines: allPolylines.length,
+      total_inserts:   allInserts.length,
+      total_layers:    Object.keys(layerGroups).length,
+      unique_blocks:   Object.keys(blockCounts).length
     }
   };
 }
 
-// ── Math helpers ─────────────────────────────────────────────────
+function inferDrawingType(layers, texts, filename) {
+  const all = [...layers, ...texts, filename].join(' ').toLowerCase();
+  if (/section|sectional/.test(all))                 return 'SECTION';
+  if (/floor\s*plan|flat\s*plan|layout/.test(all))   return 'FLOOR_PLAN';
+  if (/elevation/.test(all))                         return 'ELEVATION';
+  if (/site\s*plan|master\s*plan/.test(all))         return 'SITE_PLAN';
+  if (/road|highway|carriageway/.test(all))          return 'ROAD_PLAN';
+  if (/rcc|reinforcement|bbs/.test(all))             return 'STRUCTURAL';
+  if (/detail/.test(all))                            return 'DETAIL';
+  return 'GENERAL';
+}
+
 function shoelaceArea(pts) {
-  let area = 0;
-  for (let i = 0; i < pts.length; i++) {
-    const j = (i + 1) % pts.length;
-    area += pts[i].x * pts[j].y;
-    area -= pts[j].x * pts[i].y;
-  }
-  return area / 2;
+  let a = 0;
+  for (let i = 0; i < pts.length; i++) { const j = (i+1)%pts.length; a += pts[i].x*pts[j].y - pts[j].x*pts[i].y; }
+  return a / 2;
 }
 
 function perimeter(pts) {
   let p = 0;
-  for (let i = 0; i < pts.length; i++) {
-    const j = (i + 1) % pts.length;
-    p += Math.sqrt((pts[j].x - pts[i].x) ** 2 + (pts[j].y - pts[i].y) ** 2);
-  }
+  for (let i = 0; i < pts.length; i++) { const j = (i+1)%pts.length; p += Math.sqrt((pts[j].x-pts[i].x)**2+(pts[j].y-pts[i].y)**2); }
   return p;
 }
 
-module.exports = { parseDXF, extractCivilData };
+module.exports = { parseDXF, extractCivilData, RATES };
