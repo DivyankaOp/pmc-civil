@@ -212,7 +212,7 @@ textarea.tin::placeholder{color:var(--tx3)}
     </div>
   </div>
 </div>
-<input type="file" id="fi" accept="image/*,.pdf,.dxf,.DXF" multiple onchange="onFiles(event)">
+<input type="file" id="fi" accept="image/*,.pdf,.dxf,.DXF,.dwg,.DWG,.xlsx,.xls,.csv,.doc,.docx,.txt" multiple onchange="onFiles(event)">
 
 <script>
 // ── MODES ──────────────────────────────────────────────
@@ -226,32 +226,66 @@ const MODES={
   study:{t:'Drawing Study',s:'Educational walkthrough with IS codes',b:'Study'}
 };
 const SYS={
-  auto:`You are PMC Civil AI Agent — senior PMC civil construction expert for India (Surat, Gujarat). AUTO-DETECT input and give FULL DETAILED professional response. DETECTION: DRAWING→full analysis(type,title block,scale,dimensions,IS codes,structural elements,reinforcement); COST ESTIMATE→item table(Item|Unit|Qty|Rate INR|Amount INR),total,rate analysis; BOQ→full BOQ table,trade summary,material quantities; COMPARISON(2+files)→exec summary,each option,comparison table,differences,PMC recommendation(name winner); CONTRACTOR QUOTE→scope,rates,risk flags,PMC verdict; SITE PHOTO→condition,quality,issues; ANY QUERY→full civil expert response. ALWAYS: markdown tables|IS codes|INR rates Surat/Gujarat|end with PMC OBSERVATIONS & RECOMMENDATIONS`,
-  drawing:`You are a SENIOR PMC CIVIL ENGINEER (20 years India experience). Analyze this civil drawing with PIXEL-LEVEL PRECISION.
+  auto:`You are PMC Civil AI Agent — senior PMC civil construction expert for India (Surat, Gujarat).
 
-STEP 1 — SCALE: Find scale bar or written scale (1:100, 1:500 etc). State exact scale found.
-STEP 2 — TITLE BLOCK: Project name, drawing no., date, engineer name, north direction.
-STEP 3 — DIMENSIONS: Read EVERY dimension annotation. List each one: "Road R1 = 129.12m × 24m wide".
-STEP 4 — QUANTITIES TABLE (calculate using read dimensions):
+CRITICAL VISION RULE: You have FULL multimodal vision. When any image, PDF, or drawing is attached, you DIRECTLY SEE everything in it — every line, number, annotation, scale bar, title block, table, stamp. NEVER say "I cannot see", "I cannot access files", "please describe the drawing", or "as an AI I cannot view". This is WRONG. You CAN see. Just analyze what is in front of you like a human engineer would in AutoCAD.
 
-| Element | Length (m) | Width (m) | Area (sqmt) | GSB Ton | WMM Ton | PQC CUM | Cost (₹) |
-For roads: Area = L×CarriageW | GSB = Area×1.15×0.3×1800 | WMM = Area×1.15×0.2×2100 | PQC = Area×1.05×0.25
+AUTO-DETECT input type and give FULL DETAILED professional response:
+- DRAWING/BLUEPRINT → Read scale+title block+ALL dimensions → calculate quantities → apply Gujarat DSR 2025 rates → full PMC report with tables
+- COST ESTIMATE/BOQ FILE → Extract all items → verify rates vs DSR 2025 → flag discrepancies → corrected BOQ
+- 2+ SIMILAR FILES → Auto COMPARISON → full comparison table + PMC recommendation (name winner clearly)
+- CONTRACTOR QUOTE → Scope review, rate analysis, risk flags, PMC verdict
+- SITE PHOTO → Observe condition, quality issues, IS code compliance, defects
+- ANY TEXT QUERY → Full civil expert response with tables and IS codes
 
-STEP 5 — STEEL BBS (if reinforcement drawing):
-| Bar | Dia | Nos | Cut Length | Total Length | Weight (kg) |
-Weight = Total_length × unit_weight (8mm:0.395, 10mm:0.617, 12mm:0.888, 16mm:1.58, 20mm:2.47, 25mm:3.86 kg/m)
+ALWAYS: markdown tables | IS code references | INR rates Surat/Gujarat 2025 | end with PMC OBSERVATIONS & RECOMMENDATIONS`,
 
-STEP 6 — COST SUMMARY (Surat/Gujarat 2025 rates):
-PQC Road: ₹1800/sqmt | GSB: ₹655/sqmt | WMM: ₹515/sqmt | RCC M25: ₹5500/cum | Steel: ₹56/kg
+  drawing:`You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience. You have FULL VISION — you directly see every pixel of the uploaded drawing like opening it in AutoCAD.
 
-STEP 7 — PMC OBSERVATIONS & IS CODES
+NEVER say you cannot see or access the file. Read everything directly from the image/PDF in front of you.
 
-Format output as properly structured tables. Be PRECISE with every number.`,
-  estimate:`PMC senior cost estimation engineer India. Item-wise table(Item No.|Description|Unit|Qty|Rate INR|Amount INR), trade-wise summary, total, rate analysis vs Gujarat DSR, missing scope, PMC observations.`,
-  boq:`PMC quantity surveyor. Full BOQ(Item No.|Description|Unit|Qty|Rate INR|Amount INR), trade-wise breakup, material quantities(cement/steel/sand/aggregate), IS codes, PMC notes.`,
-  compare:`Senior PMC consultant. FULL COMPARISON: exec summary, each option full analysis, item-wise comparison table(Item|Unit|A|B|Diff|Variance%), key differences, cost impact INR, PMC RECOMMENDATION — name winner clearly with reasons.`,
-  report:`PMC site engineer. Formal report: project info, work executed, progress%, resources, quality tests(IS code/result), safety, issues/RFIs/NCRs, next plan, signature block.`,
-  study:`PMC drawing tutor. Educational walkthrough: drawing type, how to read, symbols, dimensions, each structural element with IS code, IS standards, common mistakes, 3 quiz questions.`
+STEP 1 — SCALE: Look for scale bar or text "1:100", "1:500", "SCALE 1:1000". State exact scale found in this drawing.
+STEP 2 — TITLE BLOCK: Read project name, drawing number, revision, date, engineer/firm name, north arrow.
+STEP 3 — DIMENSIONS: Read EVERY dimension annotation visible in drawing. List each: "Road R1 = 129.12m × 24m wide"
+STEP 4 — QUANTITIES TABLE (calculate from actual dimensions you read):
+
+| Element | Length (m) | Width (m) | Area (sqmt) | GSB (Ton) | WMM (Ton) | PQC (CUM) | Cost (Rs.) |
+
+Formulas: Area=L x CarriageW | GSB=Area x 1.15 x 0.3 x 1800 | WMM=Area x 1.15 x 0.2 x 2100 | PQC=Area x 1.05 x 0.25
+
+STEP 5 — STEEL BBS (only if reinforcement/structural drawing visible):
+| Element | Bar Dia (mm) | Nos | Cutting Length (m) | Total Length (m) | Unit Wt (kg/m) | Weight (kg) |
+Unit weights: 8mm=0.395 | 10mm=0.617 | 12mm=0.888 | 16mm=1.58 | 20mm=2.47 | 25mm=3.86 kg/m
+
+STEP 6 — COST SUMMARY using Gujarat DSR 2025 rates:
+PQC Road 250mm: Rs.1800/sqmt | GSB 300mm: Rs.655/sqmt | WMM 200mm: Rs.515/sqmt | Soil stabilization: Rs.82/sqmt
+RCC M25: Rs.5500/cum | RCC M30: Rs.5800/cum | Steel Fe500: Rs.56/kg | Brickwork: Rs.4500/cum | Formwork: Rs.180/sqmt
+Excavation: Rs.180/cum | Compound wall: Rs.8600/rmt | Street light: Rs.35000/nos | Pipeline: Rs.4500/rmt
+
+STEP 7 — PMC OBSERVATIONS & IS CODE COMPLIANCE
+Reference IS codes: IS 456 (RCC), IS 1786 (steel), IS 383 (aggregate), IRC 58 (PQC roads), IRC 37 (flexible pavement)
+
+IMPORTANT: Use ONLY actual numbers read from this drawing. No placeholder values. No invented dimensions.`,
+
+  estimate:`You are a PMC senior cost estimation engineer for India. You have FULL VISION to read any uploaded file directly — read it like a human engineer.
+NEVER say you cannot see the file. Read and extract all data directly.
+Output: Item-wise table (Sr.No.|Description|Unit|Qty|Rate INR|Amount INR), trade-wise summary, grand total, rate analysis vs Gujarat DSR 2025, missing scope items flagged, PMC observations.`,
+
+  boq:`You are a PMC quantity surveyor for India. You have FULL VISION to read any uploaded drawing or document directly.
+NEVER say you cannot see the file. Read every dimension and calculate quantities yourself.
+Output: Full BOQ (Sr.No.|Description of Work|Unit|Qty|Rate INR|Amount INR), trade-wise breakup, material quantities (cement bags/steel kg/sand cum/aggregate cum), IS code references, PMC notes.`,
+
+  compare:`You are a senior PMC consultant for India. You have FULL VISION to read all uploaded files directly.
+NEVER say you cannot see the files. Read both/all documents and compare directly.
+Output: Executive summary, each option full analysis, item-wise comparison table (Item|Unit|Option A|Option B|Difference|Variance%), key differences list, cost impact in INR, PMC RECOMMENDATION — clearly name the winner with reasons.`,
+
+  report:`You are a PMC site engineer for India. You have FULL VISION to read any uploaded photos or documents.
+NEVER say you cannot see the file. Analyze site photos and documents directly.
+Output: Formal PMC site report — project info, work executed this period, overall progress%, resources deployed, quality test results (IS code|test|result|status), safety observations, open issues/RFIs/NCRs, next fortnight plan, signature block.`,
+
+  study:`You are a PMC drawing tutor for India. You have FULL VISION to read any uploaded drawing directly.
+NEVER say you cannot see the file. Read and explain everything visible in the drawing.
+Output: Drawing type identification, how to read this drawing, symbols and conventions used, each structural element explained with IS code, construction sequence, common mistakes to avoid, 3 quiz questions for learning.`
 };
 const QT={
   drawing:`I want to analyze a civil drawing. Uploading now — please do complete PMC analysis.`,
@@ -359,26 +393,103 @@ function setMode(m,el){
 }
 
 // ── FILES ───────────────────────────────────────────────
+function fileIcon(name){
+  if(name.match(/\.(jpg|jpeg|png|gif|webp|bmp|tiff?)$/i)) return '🖼️';
+  if(name.match(/\.pdf$/i)) return '📄';
+  if(name.match(/\.(dxf|dwg)$/i)) return '📐';
+  if(name.match(/\.(xlsx|xls|csv)$/i)) return '📊';
+  if(name.match(/\.(doc|docx)$/i)) return '📝';
+  if(name.match(/\.txt$/i)) return '📃';
+  return '📎';
+}
+
 function onFiles(e){
   Array.from(e.target.files).forEach(f=>{
-    if(f.name.match(/\.dxf$/i)){
-      // DXF = plain text file
+    const name = f.name.toLowerCase();
+
+    // ── DXF: parse as text, send to /analyze-dxf
+    if(name.match(/\.dxf$/)){
       const rd=new FileReader();
       rd.onload=ev=>{
         files.push({name:f.name,type:'application/dxf',isDXF:true,dxfContent:ev.target.result});
         renderChips();
       };
       rd.readAsText(f);
-    } else {
+    }
+    // ── DWG: binary — read as base64, tell Gemini it is AutoCAD DWG + extract any readable text
+    else if(name.match(/\.dwg$/)){
+      const rd=new FileReader();
+      rd.onload=ev=>{
+        // DWG is binary — we read as text to extract any ASCII portions
+        const raw = ev.target.result;
+        // Extract readable ASCII chunks (dimension values, text annotations)
+        const ascii = raw.replace(/[^\x20-\x7E\n\r]/g,' ').replace(/\s+/g,' ');
+        const chunks = ascii.match(/[A-Za-z0-9_.\-+/: ]{4,}/g)||[];
+        const readable = chunks.filter(s=>s.trim().length>3).slice(0,300).join(' | ');
+        files.push({
+          name:f.name,
+          type:'application/dwg',
+          isDWG:true,
+          dwgText: readable,
+          hint:'AutoCAD DWG binary file — ASCII text extracted for analysis'
+        });
+        renderChips();
+      };
+      rd.readAsBinaryString(f);
+    }
+    // ── Excel/CSV: read as text via FileReader (browser cannot run xlsx parser)
+    else if(name.match(/\.csv$/)){
+      const rd=new FileReader();
+      rd.onload=ev=>{
+        files.push({name:f.name,type:'text/csv',isText:true,textContent:ev.target.result.slice(0,50000)});
+        renderChips();
+      };
+      rd.readAsText(f);
+    }
+    else if(name.match(/\.(xlsx|xls)$/)){
+      // Read as base64 — send to Gemini as document
+      const rd=new FileReader();
+      rd.onload=ev=>{
+        files.push({name:f.name,type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',b64:ev.target.result.split(',')[1],isExcel:true});
+        renderChips();
+      };
+      rd.readAsDataURL(f);
+    }
+    // ── Word docs: read as base64
+    else if(name.match(/\.(doc|docx)$/)){
+      const rd=new FileReader();
+      rd.onload=ev=>{
+        files.push({name:f.name,type:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',b64:ev.target.result.split(',')[1],isWord:true});
+        renderChips();
+      };
+      rd.readAsDataURL(f);
+    }
+    // ── Plain text
+    else if(name.match(/\.txt$/)){
+      const rd=new FileReader();
+      rd.onload=ev=>{
+        files.push({name:f.name,type:'text/plain',isText:true,textContent:ev.target.result.slice(0,50000)});
+        renderChips();
+      };
+      rd.readAsText(f);
+    }
+    // ── Images + PDF: base64 for Gemini vision
+    else {
       const rd=new FileReader();
       rd.onload=ev=>{files.push({name:f.name,type:f.type,b64:ev.target.result.split(',')[1]});renderChips();};
       rd.readAsDataURL(f);
     }
-  });document.getElementById('fi').value='';
+  });
+  document.getElementById('fi').value='';
 }
+
 function renderChips(){
   const c=document.getElementById('chips');c.innerHTML='';
-  files.forEach((f,i)=>{const ch=document.createElement('div');ch.className='chip';const ic=f.name.match(/\.pdf$/i)?'📄':'🖼️';ch.innerHTML=`<span>${ic}</span><span class="cn">${f.name}</span><span class="rm" onclick="rmF(${i})">✕</span>`;c.appendChild(ch);});
+  files.forEach((f,i)=>{
+    const ch=document.createElement('div');ch.className='chip';
+    ch.innerHTML=`<span>${fileIcon(f.name)}</span><span class="cn">${f.name}</span><span class="rm" onclick="rmF(${i})">✕</span>`;
+    c.appendChild(ch);
+  });
 }
 function rmF(i){files.splice(i,1);renderChips();}
 
@@ -574,13 +685,62 @@ async function send(){
     return;
   }
 
+  // DWG files → send to /analyze-dwg for server-side Gemini analysis
+  const hasDWG=sentFiles.some(f=>f.isDWG);
+  if(hasDWG){
+    files=[];renderChips();
+    addLoad();
+    try{
+      const dwgFile=sentFiles.find(f=>f.isDWG);
+      const res=await fetch('/analyze-dwg',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({dwgText:dwgFile.dwgText,filename:dwgFile.name})});
+      const data=await res.json();
+      const aiText=data.analysis||'DWG analysis failed.';
+      rmLoad();
+      hist=hist.filter(m=>m.role!=='user_parts');
+      hist.push({role:'assistant',content:aiText,userText:sentText});
+      addMsgEl('ai',aiText,[],true,null,sentText,aiText);
+      saveChatToHistory(dwgFile.name.slice(0,40));
+    }catch(err){
+      rmLoad();
+      addMsgEl('ai',`**DWG Error:** ${err.message}`);
+    }
+    busy=false;document.getElementById('sbtn').disabled=false;
+    return;
+  }
+
   const parts=[];
+  const textExtras=[];
+
   files.forEach(f=>{
-    if(f.type==='application/pdf'||f.name.match(/\.pdf$/i))parts.push({inline_data:{mime_type:'application/pdf',data:f.b64}});
-    else if(f.type?.startsWith('image/'))parts.push({inline_data:{mime_type:f.type,data:f.b64}});
+    // Images — Gemini vision directly
+    if(f.type?.startsWith('image/')){
+      parts.push({inline_data:{mime_type:f.type,data:f.b64}});
+    }
+    // PDF — Gemini reads natively
+    else if(f.type==='application/pdf'||f.name?.match(/\.pdf$/i)){
+      parts.push({inline_data:{mime_type:'application/pdf',data:f.b64}});
+    }
+    // DWG — send extracted ASCII text as context
+    else if(f.isDWG){
+      textExtras.push(`\n\n=== AutoCAD DWG FILE: ${f.name} ===\n${f.hint}\nExtracted readable text from DWG binary:\n${f.dwgText||'(no readable text found)'}\n\nAnalyze this as a civil drawing. Extract any dimensions, room names, layer names, coordinates, and annotations visible in the text above. Apply Gujarat DSR 2025 rates to calculate quantities and costs.`);
+    }
+    // Excel/Word — base64, Gemini treats as document
+    else if(f.isExcel){
+      parts.push({inline_data:{mime_type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',data:f.b64}});
+    }
+    else if(f.isWord){
+      parts.push({inline_data:{mime_type:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',data:f.b64}});
+    }
+    // Plain text / CSV
+    else if(f.isText){
+      textExtras.push(`\n\n=== FILE: ${f.name} ===\n${f.textContent}`);
+    }
   });
+
   let prompt=txt||'Auto-detect these file(s) and provide full detailed professional PMC civil construction analysis.';
   if(files.length>1)prompt+=`\n\n${files.length} files uploaded — if two similar documents, auto-treat as COMPARISON and generate full comparison report.`;
+  if(textExtras.length)prompt+=textExtras.join('\n');
   parts.push({text:prompt});
   files=[];renderChips();
   hist.push({role:'user_parts',parts});
@@ -595,7 +755,7 @@ async function send(){
 
   addLoad();
   try{
-    const body={system_instruction:{parts:[{text:SYS[mode]}]},contents:geminiMsgs,generationConfig:{maxOutputTokens:8192,temperature:0.3}};
+    const body={system_instruction:{parts:[{text:SYS[mode]}]},contents:geminiMsgs,generationConfig:{maxOutputTokens:8192,temperature:0.1}};
     const res=await fetch('/gemini',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body})});
     if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e?.error?.message||'HTTP '+res.status);}
     const data=await res.json();
