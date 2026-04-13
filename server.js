@@ -463,49 +463,40 @@ app.post('/analyze-dxf', async (req, res) => {
 
     if (!dxfContent) return res.status(400).json({ error: 'No DXF content provided.' });
 
-    // Step 1: Parse DXF
+    // Step 1: Parse DXF — extract everything dynamically from drawing
     const parsed = parseDXF(dxfContent);
     const civilData = extractCivilData(parsed, filename);
+    // Attach raw positioned texts for Excel (x,y coordinates per annotation)
+    civilData._raw_texts = parsed.texts.map(t => ({ text: t.text, layer: t.layer, x: t.x, y: t.y }));
 
-    // Step 2: Send extracted data to Gemini for interpretation
-    const prompt = `You are a senior PMC civil engineer. Analyze this DXF drawing data and extract civil quantities.
+    // Step 2: Build rich Gemini prompt from ACTUAL extracted data (no hardcoded values)
+    const { RATES: ratesMap } = require('./dxf_parser');
+    const ratesSummary = Object.entries(ratesMap).slice(0, 30).map(([k,v]) => `${k}:${v}`).join(', ');
 
-DRAWING DATA:
-- Filename: ${filename}
-- Scale: ${civilData.scale || 'not detected'}
-- Layers: ${civilData.layer_names.join(', ')}
-- Total texts: ${civilData.stats.total_texts}
-- Total dimensions: ${civilData.stats.total_dims}
-- Drawing extents: ${JSON.stringify(civilData.drawing_extents)}
+    const prompt = `You are a senior PMC civil engineer analyzing a DXF drawing.
+ALL DATA BELOW IS EXTRACTED DIRECTLY FROM THE DXF FILE. DO NOT INVENT VALUES.
 
-ALL TEXT FOUND IN DRAWING:
-${civilData.all_texts.slice(0,100).join('\n')}
+FILE: ${filename}
+TYPE: ${civilData.drawing_type}
+SCALE: ${civilData.scale || 'not detected'}
+UNITS: ${civilData.units}
+SIZE: ${civilData.drawing_extents.width_m}m x ${civilData.drawing_extents.height_m}m
 
-DIMENSION VALUES FOUND:
-${civilData.dimension_values.slice(0,50).map(d => d.value_m + 'm (' + (d.layer||'') + ')').join(', ')}
+TEXT ANNOTATIONS (${civilData.stats.total_texts}):
+${civilData.all_texts.slice(0,150).join('\n')}
 
-CLOSED POLYLINE AREAS:
-${civilData.polyline_areas.slice(0,20).map(p => p.area_sqm + 'sqm ('+p.layer+')').join(', ')}
+ROOM LABELS: ${(civilData.room_annotations||[]).map(r=>r.text).join(', ')||'none'}
 
-Based on this data, return ONLY raw JSON:
-{
-  "project_name": "extract from texts",
-  "drawing_type": "SITE_LAYOUT|ROAD|BUILDING|DRAINAGE|etc",
-  "scale": "1:500 or detected",
-  "date": "from texts",
-  "roads": [
-    {"id":"R1","name":"Road 1","dimensions":{"length_m":129.12,"width_m":24,"carriage_width_m":15},"remark":"extract from text"}
-  ],
-  "plots": [
-    {"id":"P1","area_sqmt":500,"width_m":20,"depth_m":25}
-  ],
-  "boq": [
-    {"description":"item","unit":"SQMT","qty":1000,"rate":655,"amount":655000}
-  ],
-  "cost_summary": {"total_crores":0,"total_lacs":0},
-  "observations": ["obs1"],
-  "pmc_recommendation": "full recommendation"
-}`;
+DIMENSIONS (top 60): ${civilData.dimension_values.slice(0,60).map(d=>`${d.value_m}m[${d.layer}]`).join(', ')}
+
+AREAS from polylines (${civilData.polyline_areas.length}): ${civilData.polyline_areas.slice(0,30).map(p=>`${p.area_sqm}sqm(${p.layer})`).join(', ')}
+
+LAYERS: ${civilData.layer_names.join(', ')}
+BLOCKS: ${Object.entries(civilData.block_counts||{}).slice(0,20).map(([k,v])=>`${k}x${v}`).join(', ')||'none'}
+RATES AVAILABLE: ${ratesSummary}
+
+Return ONLY raw JSON (no markdown):
+{"project_name":"from texts above","drawing_type":"FLOOR_PLAN|SECTION|ELEVATION|SITE_PLAN|ROAD_PLAN|STRUCTURAL|GENERAL","scale":"detected or not","date":"from texts","spaces":[{"name":"room name from text","area_sqm":0}],"boq":[{"description":"from drawing data only","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0}],"total_bua_sqm":0,"observations":["based on actual data"],"pmc_recommendation":"based on actual extracted data"}`;
 
     const GEMINI_URL = k => `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k}`;
     const r = await fetch(GEMINI_URL(key), {
@@ -546,13 +537,16 @@ app.post('/export-dxf-excel', async (req, res) => {
       const fakeReq = { body: { dxfContent, filename } };
       // reuse the prompt building
       const GEMINI_URL = k => `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k}`;
-      const prompt = `You are a senior PMC civil engineer. Analyze this DXF drawing data.
-Scale: ${civilData.scale||'not detected'}
-Layers: ${civilData.layer_names.join(', ')}
-Texts: ${civilData.all_texts.slice(0,80).join(' | ')}
-Dims: ${civilData.dimension_values.slice(0,30).map(d=>d.value_m+'m').join(', ')}
-Areas: ${civilData.polyline_areas.slice(0,15).map(p=>p.area_sqm+'sqm('+p.layer+')').join(', ')}
-Return ONLY JSON: {"project_name":"","drawing_type":"","scale":"","roads":[{"id":"R1","dimensions":{"length_m":0,"width_m":0}}],"plots":[],"boq":[],"observations":[],"pmc_recommendation":""}` ;
+      const { RATES: rMap } = require('./dxf_parser');
+      const rSummary = Object.entries(rMap).slice(0,20).map(([k,v])=>`${k}:${v}`).join(',');
+      const prompt = `PMC civil engineer. Analyze DXF. Use ONLY data below, no invented values.
+FILE:${filename} TYPE:${civilData.drawing_type} SCALE:${civilData.scale||'?'}
+TEXTS:${civilData.all_texts.slice(0,100).join(' | ')}
+DIMS:${civilData.dimension_values.slice(0,30).map(d=>d.value_m+'m['+d.layer+']').join(', ')}
+AREAS:${civilData.polyline_areas.slice(0,15).map(p=>p.area_sqm+'sqm('+p.layer+')').join(', ')}
+LAYERS:${civilData.layer_names.join(', ')}
+RATES:${rSummary}
+Return ONLY JSON:{"project_name":"","drawing_type":"","scale":"","spaces":[],"boq":[{"description":"","unit":"","qty":0,"rate":0,"amount":0}],"observations":[],"pmc_recommendation":""}`;
 
       const r = await fetch(GEMINI_URL(key), {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
