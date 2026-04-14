@@ -731,6 +731,7 @@ OUTPUT FORMAT — Full PMC Analysis Report:
         contents: [{ role: 'user', parts }],
         generationConfig: { maxOutputTokens: 8192, temperature: 0.1 }
       })
+    });
     const data = await r.json();
     // Debug: log Gemini response if no candidates
     if (!data?.candidates?.[0]) {
