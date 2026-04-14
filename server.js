@@ -17,16 +17,44 @@ app.use(express.static(path.join(__dirname, 'public')));
 const GEMINI_URL = (key) =>
   `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`;
 
+/**
+ * Calls the Gemini API with automatic retry + exponential backoff.
+ * Retries on 503 (overloaded) and 429 (rate-limited) up to maxRetries times.
+ */
+async function fetchGeminiWithRetry(key, body, { maxRetries = 5, baseDelayMs = 2000 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const r = await fetch(GEMINI_URL(key), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+
+    // Success — return immediately
+    if (r.ok && data?.candidates?.[0]) return data;
+
+    const code = data?.error?.code;
+    const retryable = code === 503 || code === 429;
+
+    // Non-retryable error — return the data as-is so callers handle it normally
+    if (!retryable || attempt === maxRetries) return data;
+
+    // Exponential backoff: 2s, 4s, 8s, 16s, 32s …
+    const delay = baseDelayMs * Math.pow(2, attempt);
+    console.warn(`Gemini ${code} on attempt ${attempt + 1}/${maxRetries + 1}. Retrying in ${delay}ms…`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+}
+
 // ─── 1. CHAT ───────────────────────────────────────────────────────
 app.post('/gemini', async (req, res) => {
   try {
     const key = process.env.GEMINI_API_KEY;
     if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
     const { body } = req.body;
-    const r = await fetch(GEMINI_URL(key), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
-    });
-    return res.status(r.status).json(await r.json());
+    const data = await fetchGeminiWithRetry(key, body);
+    return res.json(data);
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
@@ -81,11 +109,8 @@ RULES: Use ACTUAL data from content | Numbers as numbers not strings | ONLY JSON
 
   parts.push({ text: prompt });
 
-  const r = await fetch(GEMINI_URL(key), {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { maxOutputTokens: 8192, temperature: 0.0, responseMimeType: 'application/json' } })
-  });
-  let raw = (await r.json())?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  const geminiData = await fetchGeminiWithRetry(key, { contents: [{ role: 'user', parts }], generationConfig: { maxOutputTokens: 8192, temperature: 0.0, responseMimeType: 'application/json' } });
+  let raw = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
   const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
   if (fb !== -1 && lb !== -1) raw = raw.slice(fb, lb + 1);
   try { return JSON.parse(raw.replace(/```json|```/g, '').trim()); }
@@ -498,15 +523,11 @@ RATES AVAILABLE: ${ratesSummary}
 Return ONLY raw JSON (no markdown):
 {"project_name":"from texts above","drawing_type":"FLOOR_PLAN|SECTION|ELEVATION|SITE_PLAN|ROAD_PLAN|STRUCTURAL|GENERAL","scale":"detected or not","date":"from texts","spaces":[{"name":"room name from text","area_sqm":0}],"boq":[{"description":"from drawing data only","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0}],"total_bua_sqm":0,"observations":["based on actual data"],"pmc_recommendation":"based on actual extracted data"}`;
 
-    const GEMINI_URL = k => `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k}`;
-    const r = await fetch(GEMINI_URL(key), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const geminiData3 = await fetchGeminiWithRetry(key, {
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         generationConfig: { maxOutputTokens: 4096, temperature: 0.0, responseMimeType: 'application/json' }
-      })
-    });
-    let raw = (await r.json())?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      });
+    let raw = geminiData3?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
     const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
     let geminiResult = {};
     if (fb !== -1) try { geminiResult = JSON.parse(raw.slice(fb, lb+1)); } catch(e) {}
@@ -548,11 +569,8 @@ LAYERS:${civilData.layer_names.join(', ')}
 RATES:${rSummary}
 Return ONLY JSON:{"project_name":"","drawing_type":"","scale":"","spaces":[],"boq":[{"description":"","unit":"","qty":0,"rate":0,"amount":0}],"observations":[],"pmc_recommendation":""}`;
 
-      const r = await fetch(GEMINI_URL(key), {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ role:'user', parts:[{text:prompt}] }], generationConfig: { maxOutputTokens:4096, temperature:0.0, responseMimeType:'application/json' } })
-      });
-      let raw = (await r.json())?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      const geminiData4 = await fetchGeminiWithRetry(key, { contents: [{ role:'user', parts:[{text:prompt}] }], generationConfig: { maxOutputTokens:4096, temperature:0.0, responseMimeType:'application/json' } });
+      let raw = geminiData4?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
       const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
       if (fb !== -1) geminiResult = JSON.parse(raw.slice(fb,lb+1));
     } catch(e) { console.log('Gemini interp fail:', e.message); }
@@ -602,15 +620,12 @@ Note: ${userText}` : '');
     parts.push({ text: promptText });
 
     // Call Gemini
-    const r = await fetch(GEMINI_URL(key), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const geminiData5 = await fetchGeminiWithRetry(key, {
         contents: [{ role: 'user', parts }],
         generationConfig: { maxOutputTokens: 8192, temperature: 0.0, responseMimeType: 'application/json' }
-      })
-    });
+      });
 
-    let raw = (await r.json())?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    let raw = geminiData5?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
     const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
     let drawingData = {};
     if (fb !== -1) {
@@ -724,15 +739,11 @@ OUTPUT FORMAT — Full PMC Analysis Report:
 
     parts.push({ text: prompt });
 
-    // Call Gemini
-    const r = await fetch(GEMINI_URL(key), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts }],
-        generationConfig: { maxOutputTokens: 8192, temperature: 0.1 }
-      })
+    // Call Gemini (with retry)
+    const data = await fetchGeminiWithRetry(key, {
+      contents: [{ role: 'user', parts }],
+      generationConfig: { maxOutputTokens: 8192, temperature: 0.1 }
     });
-    const data = await r.json();
     // Debug: log Gemini response if no candidates
     if (!data?.candidates?.[0]) {
       console.error("DWG Gemini raw response:", JSON.stringify(data).slice(0,500));
