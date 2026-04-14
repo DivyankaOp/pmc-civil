@@ -466,4 +466,22 @@ function perimeter(pts) {
   return p;
 }
 
-module.exports = { parseDXF, extractCivilData, RATES };
+// NEW: Total area from all closed polylines
+function extractTotalAreaSqft(dxfContent) {
+  const parsed = parseDXF(dxfContent);
+  const u2m = parsed.units==='m'?1000 : parsed.units==='cm'?10 : parsed.units==='ft'?304.8 : parsed.units==='in'?25.4 : 1;
+  const allPolylines = [
+    ...parsed.polylines,
+    ...Object.values(parsed.blocks).flatMap(b => b.polylines)
+  ];
+  const total = allPolylines
+    .filter(pl => pl.vertices && pl.vertices.length >= 3 && pl.closed)
+    .reduce((sum, pl) => {
+      const rawArea = Math.abs(shoelaceArea(pl.vertices));
+      const sqft = (rawArea * u2m * u2m) / 1e6 * 10.764;
+      return sum + (sqft > 1 ? sqft : 0);
+    }, 0);
+  return Math.round(total * 100) / 100;
+}
+
+module.exports = { parseDXF, extractCivilData, extractTotalAreaSqft, RATES };
