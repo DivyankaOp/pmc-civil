@@ -5,7 +5,7 @@ const path = require('path');
 const ExcelJS = require('exceljs');
 const { extractDrawingData, buildDrawingExcel } = require('./server_drawing');
 const { geminiAnalyzeDrawing, runCVAnalysis, RATES } = require('./drawing_analyzer');
-const { parseDXF, extractCivilData } = require('./dxf_parser');
+const { parseDXF, extractCivilData, extractTotalAreaSqft } = require('./dxf_parser');
 const { buildExcelFromDrawing, getDrawingPrompt } = require('./drawing_to_excel');
 const { buildDXFExcel } = require('./dxf_to_excel');
 
@@ -648,7 +648,51 @@ Note: ${userText}` : '');
     if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
+// ── NEW: DXF → AREA STATEMENT + OVERALL SUMMARY auto-update ──
+app.post('/update-area-from-dxf', async (req, res) => {
+  try {
+    const { dxfContent, filename } = req.body;
+    if (!dxfContent) return res.status(400).json({ error: 'No DXF content provided.' });
 
+    const totalAreaSqft = extractTotalAreaSqft(dxfContent);
+    if (!totalAreaSqft || totalAreaSqft <= 0)
+      return res.status(400).json({ error: 'No closed polylines found in DXF. Area calculate nahi hui.' });
+
+    const estimatePath = path.join(__dirname, 'UPDATED-OVERALL-ESTIMATE-MODESTAA-10.04.2026.xlsx');
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(estimatePath);
+
+    // Update AREA STATEMENT C73
+    const wsArea = wb.getWorksheet('AREA STATEMENT');
+    if (wsArea) wsArea.getCell('C73').value = totalAreaSqft;
+
+    // Update OVERALL SUMMARY
+    const wsOS = wb.getWorksheet('OVERALL SUMMARY');
+    if (wsOS) {
+      // Row 6 display text
+      wsOS.getCell('B6').value = `TOTAL AREA: ${totalAreaSqft.toLocaleString('en-IN', {maximumFractionDigits:2})} SQFT`;
+      // Helper cell J6 stores area value
+      wsOS.getCell('J6').value = totalAreaSqft;
+      // Replace all hardcoded 273613.53 with dynamic reference to J6
+      wsOS.eachRow(row => {
+        row.eachCell({ includeEmpty: false }, cell => {
+          if (typeof cell.value === 'string' && cell.value.includes('273613.53')) {
+            cell.value = cell.value.split('273613.53').join("'OVERALL SUMMARY'!$J$6");
+          }
+        });
+      });
+    }
+
+    const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=ESTIMATE-UPDATED-${today}.xlsx`);
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error('Area update error:', err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
 
 // ─── DWG/DXF ANALYSIS — Convert to PNG + Gemini Vision ───────────
 // Strategy: dwg_converter.py renders DXF/DWG to PNG using ezdxf+matplotlib
