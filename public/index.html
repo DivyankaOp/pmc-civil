@@ -416,32 +416,26 @@ function onFiles(e){
       };
       rd.readAsText(f);
     }
-    // ── DWG: read as base64 for server-side PNG conversion + ASCII text fallback
-    else if(name.match(/\.dwg$/i)){
-      // Read as base64 for server-side ezdxf conversion
-      const rdB64=new FileReader();
-      rdB64.onload=evB64=>{
-        const b64=evB64.target.result.split(',')[1];
-        // Also read as binary text for ASCII fallback
-        const rdTxt=new FileReader();
-        rdTxt.onload=evTxt=>{
-          const raw=evTxt.target.result;
-          const ascii=raw.replace(/[^\x20-\x7E\n\r]/g,' ').replace(/\s+/g,' ');
-          const chunks=ascii.match(/[A-Za-z0-9_.\-+/: ]{4,}/g)||[];
-          const readable=chunks.filter(s=>s.trim().length>3).slice(0,300).join(' | ');
-          files.push({
-            name:f.name,
-            type:'application/dwg',
-            isDWG:true,
-            dwgB64:b64,
-            dwgText:readable,
-            hint:'AutoCAD DWG — will be converted to image for Gemini Vision analysis'
-          });
-          renderChips();
-        };
-        rdTxt.readAsBinaryString(f);
+    // ── DWG: binary — read as base64, tell Gemini it is AutoCAD DWG + extract any readable text
+    else if(name.match(/\.dwg$/)){
+      const rd=new FileReader();
+      rd.onload=ev=>{
+        // DWG is binary — we read as text to extract any ASCII portions
+        const raw = ev.target.result;
+        // Extract readable ASCII chunks (dimension values, text annotations)
+        const ascii = raw.replace(/[^\x20-\x7E\n\r]/g,' ').replace(/\s+/g,' ');
+        const chunks = ascii.match(/[A-Za-z0-9_.\-+/: ]{4,}/g)||[];
+        const readable = chunks.filter(s=>s.trim().length>3).slice(0,300).join(' | ');
+        files.push({
+          name:f.name,
+          type:'application/dwg',
+          isDWG:true,
+          dwgText: readable,
+          hint:'AutoCAD DWG binary file — ASCII text extracted for analysis'
+        });
+        renderChips();
       };
-      rdB64.readAsDataURL(f);
+      rd.readAsBinaryString(f);
     }
     // ── Excel/CSV: read as text via FileReader (browser cannot run xlsx parser)
     else if(name.match(/\.csv$/)){
