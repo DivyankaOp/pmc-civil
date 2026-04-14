@@ -635,45 +635,120 @@ Note: ${userText}` : '');
 });
 
 
-// ─── DWG BINARY ANALYSIS ──────────────────────────────────────────
-// DWG is AutoCAD binary — we extract readable ASCII chunks and send to Gemini
+// ─── DWG/DXF ANALYSIS — Convert to PNG + Gemini Vision ───────────
+// Strategy: dwg_converter.py renders DXF/DWG to PNG using ezdxf+matplotlib
+// Then Gemini SEES the actual drawing like a human engineer
 app.post('/analyze-dwg', async (req, res) => {
   try {
     const key = process.env.GEMINI_API_KEY;
     if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
-    const { dwgText, filename } = req.body;
-    if (!dwgText) return res.status(400).json({ error: 'No DWG text provided.' });
 
-    const prompt = `You are a senior PMC civil engineer. This is extracted ASCII text from an AutoCAD DWG binary file: "${filename}".
-DWG files contain drawing data in binary format. The text below was extracted from readable portions of the binary.
-Analyze it carefully — it contains layer names, dimension values, text annotations, coordinates, and block names from the original AutoCAD drawing.
+    const { b64, filename } = req.body;
+    if (!b64) return res.status(400).json({ error: 'No file data provided.' });
 
-EXTRACTED TEXT FROM DWG:
-${dwgText.slice(0, 8000)}
+    const fs = require('fs');
+    const { execSync } = require('child_process');
+    const os = require('os');
 
-Based on this extracted data:
-1. Identify drawing type (road plan, floor plan, structural, site layout, etc.)
-2. Extract all dimension values found
-3. Extract all text labels and annotations
-4. Extract layer names (these tell you what elements exist)
-5. Calculate quantities using Gujarat DSR 2025 rates wherever possible
-6. Provide full PMC analysis with tables
+    // Write uploaded file to temp
+    const ext = filename?.match(/\.(dxf|dwg)$/i)?.[1]?.toLowerCase() || 'dxf';
+    const tmpIn  = path.join(os.tmpdir(), `pmc_dwg_${Date.now()}.${ext}`);
+    const tmpPng = path.join(os.tmpdir(), `pmc_dwg_${Date.now()}.png`);
 
-Gujarat DSR 2025 rates: PQC ₹1800/sqmt | GSB ₹655/sqmt | WMM ₹515/sqmt | RCC M25 ₹5500/cum | Steel ₹56/kg | Excavation ₹180/cum
+    fs.writeFileSync(tmpIn, Buffer.from(b64, 'base64'));
 
-Return a comprehensive PMC civil analysis report in markdown with tables.`;
+    // Run Python converter
+    const scriptPath = path.join(__dirname, 'dwg_converter.py');
+    let converterResult = {};
+    try {
+      const out = execSync(`python3 "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 60000 });
+      converterResult = JSON.parse(out.toString());
+    } catch (e) {
+      converterResult = { success: false, error: e.message };
+    }
 
+    // Build Gemini parts
+    const parts = [];
+
+    // If PNG rendered successfully — send image to Gemini Vision
+    if (converterResult.png_path && fs.existsSync(converterResult.png_path)) {
+      const pngB64 = fs.readFileSync(converterResult.png_path).toString('base64');
+      parts.push({ inline_data: { mime_type: 'image/png', data: pngB64 } });
+      try { fs.unlinkSync(converterResult.png_path); } catch(e) {}
+    }
+
+    // Always include extracted text + dimension data
+    const textSummary = (converterResult.texts || []).map(t => t.text).slice(0, 150).join(' | ');
+    const dimSummary  = (converterResult.dimensions || [])
+      .filter(d => d.value).map(d => `${d.value}${d.text ? ' ('+d.text+')' : ''}`).slice(0, 80).join(', ');
+    const layers = (converterResult.layers || []).join(', ');
+
+    const prompt = `You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience.
+${converterResult.png_path ? 'The image above is the actual rendered AutoCAD drawing — analyze it directly with full vision.' : 'The drawing image could not be rendered, use the extracted data below.'}
+
+FILE: ${filename}
+DRAWING TYPE (auto-detected): ${converterResult.drawing_type || 'Unknown'}
+SCALE (from drawing): ${converterResult.scale || 'Not detected — estimate from dimensions'}
+DRAWING EXTENTS: ${JSON.stringify(converterResult.extents || {})}
+
+LAYERS IN DRAWING: ${layers || 'None extracted'}
+
+ALL TEXT ANNOTATIONS (${(converterResult.texts||[]).length} found):
+${textSummary || 'None extracted'}
+
+DIMENSION VALUES (${(converterResult.dimensions||[]).length} found):
+${dimSummary || 'None extracted'}
+
+${converterResult.error ? 'NOTE: File reading had issues: ' + converterResult.error : ''}
+
+INSTRUCTIONS:
+1. If image is shown above — read EVERY dimension, annotation, scale bar, title block directly from it
+2. Use extracted text + dimensions above to supplement/verify what you see
+3. Calculate ALL quantities using proper PMC formulas:
+   Roads: Area=L×W | GSB=Area×1.15×0.3×1800kg/m³ | WMM=Area×1.15×0.2×2100 | PQC=Area×1.05×0.25
+   Structure: Volume=L×W×H | Steel=Volume×120kg/m³(slab) or 160(beam)
+4. Apply Gujarat DSR 2025 rates:
+   PQC ₹1800/sqmt | GSB ₹655/sqmt | WMM ₹515/sqmt | Soil stab ₹82/sqmt
+   RCC M25 ₹5500/cum | RCC M30 ₹5800/cum | Steel Fe500 ₹56/kg
+   Brickwork ₹4500/cum | Formwork ₹180/sqmt | Excavation ₹180/cum
+   Compound wall ₹8600/rmt | Street light ₹35000/nos | Pipeline ₹4500/rmt
+
+OUTPUT FORMAT — Full PMC Analysis Report:
+## Drawing Details (Title Block)
+## Scale & Dimensions
+## Element-wise Quantities Table
+| Element | Length(m) | Width(m) | Area(sqmt) | Qty | Unit | Rate(₹) | Amount(₹) |
+## Cost Summary
+## Steel BBS (if structural drawing)
+## PMC Observations & IS Code References`;
+
+    parts.push({ text: prompt });
+
+    // Call Gemini
     const r = await fetch(GEMINI_URL(key), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 4096, temperature: 0.1 }
+        contents: [{ role: 'user', parts }],
+        generationConfig: { maxOutputTokens: 8192, temperature: 0.1 }
       })
     });
     const data = await r.json();
-    const analysis = data?.candidates?.[0]?.content?.parts?.[0]?.text || 'Could not analyze DWG file.';
-    res.json({ success: true, analysis });
+    const analysis = data?.candidates?.[0]?.content?.parts?.[0]?.text ||
+      `## DWG Analysis — ${filename}
+
+Extracted data:
+- Layers: ${layers}
+- Texts found: ${(converterResult.texts||[]).length}
+- Dimensions found: ${(converterResult.dimensions||[]).length}
+
+Gemini API did not return analysis. Check GEMINI_API_KEY.`;
+
+    // Cleanup temp input
+    try { fs.unlinkSync(tmpIn); } catch(e) {}
+
+    res.json({ success: true, analysis, converter: converterResult });
   } catch (err) {
+    console.error('DWG analyze error:', err);
     res.status(500).json({ error: err.message });
   }
 });
