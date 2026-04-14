@@ -731,17 +731,21 @@ OUTPUT FORMAT — Full PMC Analysis Report:
         contents: [{ role: 'user', parts }],
         generationConfig: { maxOutputTokens: 8192, temperature: 0.1 }
       })
-    });
     const data = await r.json();
+    // Debug: log Gemini response if no candidates
+    if (!data?.candidates?.[0]) {
+      console.error("DWG Gemini raw response:", JSON.stringify(data).slice(0,500));
+    }
     const analysis = data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-      `## DWG Analysis — ${filename}
-
-Extracted data:
-- Layers: ${layers}
-- Texts found: ${(converterResult.texts||[]).length}
-- Dimensions found: ${(converterResult.dimensions||[]).length}
-
-Gemini API did not return analysis. Check GEMINI_API_KEY.`;
+      (data?.error ? "Gemini API Error: " + JSON.stringify(data.error) : null) ||
+      `## DWG/DXF File: ${filename}\n\n` +
+      `**PNG rendered:** ${converterResult.png_path ? "Yes" : "No"}\n` +
+      `**Layers:** ${layers || "none"}\n` +
+      `**Texts found:** ${(converterResult.texts||[]).length}\n` +
+      `**Dimensions found:** ${(converterResult.dimensions||[]).length}\n\n` +
+      (textSummary ? `**Annotations:**\n${textSummary}\n` : "") +
+      (dimSummary ? `**Dimensions:**\n${dimSummary}\n` : "") +
+      "\n> Check Render logs: server should show DWG Gemini raw response above.";
 
     // Cleanup temp input
     try { fs.unlinkSync(tmpIn); } catch(e) {}
