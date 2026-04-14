@@ -416,26 +416,21 @@ function onFiles(e){
       };
       rd.readAsText(f);
     }
-    // ── DWG: binary — read as base64, tell Gemini it is AutoCAD DWG + extract any readable text
-    else if(name.match(/\.dwg$/)){
+    // ── DWG/DXF: read as base64 → server converts to PNG via ezdxf+matplotlib → Gemini sees actual drawing
+    else if(name.match(/\.dwg$/) || name.match(/\.dxf$/)){
       const rd=new FileReader();
       rd.onload=ev=>{
-        // DWG is binary — we read as text to extract any ASCII portions
-        const raw = ev.target.result;
-        // Extract readable ASCII chunks (dimension values, text annotations)
-        const ascii = raw.replace(/[^\x20-\x7E\n\r]/g,' ').replace(/\s+/g,' ');
-        const chunks = ascii.match(/[A-Za-z0-9_.\-+/: ]{4,}/g)||[];
-        const readable = chunks.filter(s=>s.trim().length>3).slice(0,300).join(' | ');
+        const b64 = ev.target.result.split(',')[1];
+        const isDXFfile = name.match(/\.dxf$/i);
         files.push({
           name:f.name,
-          type:'application/dwg',
+          type: isDXFfile ? 'application/dxf' : 'application/dwg',
           isDWG:true,
-          dwgText: readable,
-          hint:'AutoCAD DWG binary file — ASCII text extracted for analysis'
+          b64: b64
         });
         renderChips();
       };
-      rd.readAsBinaryString(f);
+      rd.readAsDataURL(f);
     }
     // ── Excel/CSV: read as text via FileReader (browser cannot run xlsx parser)
     else if(name.match(/\.csv$/)){
@@ -686,14 +681,14 @@ async function send(){
   }
 
   // DWG files → send to /analyze-dwg for server-side Gemini analysis
-  const hasDWG=sentFiles.some(f=>f.isDWG);
+  const hasDWG=sentFiles.some(f=>f.isDWG) && !sentFiles.some(f=>f.isDXF);
   if(hasDWG){
     files=[];renderChips();
     addLoad();
     try{
       const dwgFile=sentFiles.find(f=>f.isDWG);
       const res=await fetch('/analyze-dwg',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({dwgText:dwgFile.dwgText,filename:dwgFile.name})});
+        body:JSON.stringify({b64:dwgFile.b64,filename:dwgFile.name})});
       const data=await res.json();
       const aiText=data.analysis||'DWG analysis failed.';
       rmLoad();
