@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: pmc-civil-ai-agent
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false        # set this in the Render dashboard
+      - key: NODE_ENV
+        value: production
+    healthCheckPath: /health
