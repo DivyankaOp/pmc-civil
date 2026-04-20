@@ -617,7 +617,13 @@ async function dlFullEstimate(btn, uploadedFiles, userText){
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({files:payloadFiles, userText})
     });
-    if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||'Estimate failed');}
+    const ctype=res.headers.get('content-type')||'';
+    if(!res.ok || ctype.includes('text/html')){
+      let msg='Estimate failed';
+      if(ctype.includes('application/json')){ const e=await res.json().catch(()=>({})); msg=e.error||msg; }
+      else { const txt=await res.text(); msg=`HTTP ${res.status}. ${txt.slice(0,160).replace(/<[^>]+>/g,'').trim()||'Server timeout — try DXF/PDF instead of DWG.'}`; }
+      throw new Error(msg);
+    }
     const blob=await res.blob();
     const url=URL.createObjectURL(blob);
     const a=document.createElement('a');a.href=url;
@@ -735,7 +741,15 @@ async function send(){
       const dwgFile=sentFiles.find(f=>f.isDWG);
       const res=await fetch('/analyze-dwg',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({b64:dwgFile.b64,filename:dwgFile.name})});
-      const data=await res.json();
+      const ctype=res.headers.get('content-type')||'';
+      let data;
+      if(ctype.includes('application/json')){
+        data=await res.json();
+      }else{
+        const txt=await res.text();
+        throw new Error(`Server returned ${res.status} ${res.statusText}. ${txt.slice(0,200).replace(/<[^>]+>/g,'').trim()||'Likely timeout — DWG conversion took too long. Try uploading DXF or PDF instead.'}`);
+      }
+      if(!res.ok) throw new Error(data.error||('HTTP '+res.status));
       const aiText=data.analysis||'DWG analysis failed.';
       rmLoad();
       hist=hist.filter(m=>m.role!=='user_parts');
