@@ -724,9 +724,9 @@ app.post('/analyze-dwg', async (req, res) => {
       // Try python3 first, fall back to python (Render/Windows compatibility)
       let out;
       try {
-        out = execSync(`python3 "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 90000 });
+        out = execSync(`python3 "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 180000 });
       } catch (e1) {
-        out = execSync(`python "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 90000 });
+        out = execSync(`python "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 180000 });
       }
       converterResult = JSON.parse(out.toString());
     } catch (e) {
@@ -861,9 +861,9 @@ app.post('/full-estimate', async (req, res) => {
             const scriptPath = path.join(__dirname, 'dwg_converter.py');
             let out;
             try {
-              out = execSync(`python3 "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 90000 });
+              out = execSync(`python3 "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 180000 });
             } catch (e1) {
-              out = execSync(`python "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 90000 });
+              out = execSync(`python "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 180000 });
             }
             cvt = JSON.parse(out.toString());
           } catch (e) { cvt = { success: false, error: e.message, errors:[e.message] }; }
