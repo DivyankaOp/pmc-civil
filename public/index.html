@@ -522,6 +522,10 @@ br.appendChild(dxfB);
 // NEW: Estimate auto-update button
 const estB=mkBtn('auto','🏗️','Overall Estimate Update (Area Auto)',()=>updateEstimateFromDXF(estB,dxfFile));
 br.appendChild(estB);
+// Full MODESTAA-format PMC estimate from the DXF
+const fullB=mkBtn('auto','📑','Full PMC Estimate (MODESTAA)',()=>dlFullEstimate(fullB,[dxfFile],msgText||''));
+br.appendChild(fullB);
+bub.appendChild(br);
   } else if(role==='ai'&&msgFiles&&msgFiles.length>0){
     const br=document.createElement('div');br.className='btn-row';
     const isDwg=(mode==='drawing'||mode==='auto'||mode==='boq'||mode==='estimate'||mode==='study');
@@ -534,7 +538,12 @@ br.appendChild(estB);
     
     const xlB=mkBtn('xl','📊','Comparison Excel',()=>dlFile(xlB,'/export-excel',msgFiles,msgText||'',aiResponseText||text));
     const pdB=mkBtn('pdf','📄','Download PDF',()=>dlFile(pdB,'/export-pdf',msgFiles,msgText||'',aiResponseText||text));
-    br.appendChild(xlB);br.appendChild(pdB);bub.appendChild(br);
+    br.appendChild(xlB);br.appendChild(pdB);
+    if(isDwg){
+      const fullB=mkBtn('auto','📑','Full PMC Estimate (MODESTAA)',()=>dlFullEstimate(fullB,msgFiles,msgText||''));
+      br.appendChild(fullB);
+    }
+    bub.appendChild(br);
   }
   row.appendChild(av);row.appendChild(bub);chat.appendChild(row);chat.scrollTop=chat.scrollHeight;
 }
@@ -582,6 +591,39 @@ async function dlDrawingExcel(btn, uploadedFiles, userText, aiResponse){
     a.download=`PMC_Drawing_Estimate_${new Date().toISOString().slice(0,10)}.xlsx`;
     a.click();URL.revokeObjectURL(url);
     btn.innerHTML='<span class="ic">✅</span> Excel Downloaded!';btn.style.background='#059669';
+  }catch(err){
+    btn.innerHTML='<span class="ic">❌</span> '+err.message;
+    btn.style.background='#DC2626';btn.disabled=false;
+  }
+  btn.classList.remove('loading');
+}
+
+// Full MODESTAA-format PMC estimate: uploads raw files (img/pdf/dxf/dwg)
+// to /full-estimate; server runs Gemini Vision + writes annexure workbook.
+async function dlFullEstimate(btn, uploadedFiles, userText){
+  btn.disabled=true;btn.classList.add('loading');
+  btn.querySelector('span:last-child').textContent=' Analyzing drawings & building estimate...';
+  try{
+    // Normalize: for DXF chips we already have dxfContent (text). Convert to base64 so server can treat uniformly.
+    const payloadFiles = (uploadedFiles||[]).map(f=>{
+      if(f.isDXF && f.dxfContent && !f.b64){
+        const b64 = btoa(unescape(encodeURIComponent(f.dxfContent)));
+        return { name: f.name||'drawing.dxf', type: 'application/dxf', b64 };
+      }
+      return { name: f.name, type: f.type, b64: f.b64 };
+    }).filter(f=>f.b64);
+
+    const res=await fetch('/full-estimate',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({files:payloadFiles, userText})
+    });
+    if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||'Estimate failed');}
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;
+    a.download=`MODESTAA_PMC_Estimate_${new Date().toISOString().slice(0,10)}.xlsx`;
+    a.click();URL.revokeObjectURL(url);
+    btn.innerHTML='<span class="ic">✅</span> Estimate Downloaded!';btn.style.background='#059669';
   }catch(err){
     btn.innerHTML='<span class="ic">❌</span> '+err.message;
     btn.style.background='#DC2626';btn.disabled=false;
