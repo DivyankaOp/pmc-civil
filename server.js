@@ -721,10 +721,19 @@ app.post('/analyze-dwg', async (req, res) => {
     const scriptPath = path.join(__dirname, 'dwg_converter.py');
     let converterResult = {};
     try {
-      const out = execSync(`python3 "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 60000 });
+      // Try python3 first, fall back to python (Render/Windows compatibility)
+      let out;
+      try {
+        out = execSync(`python3 "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 90000 });
+      } catch (e1) {
+        out = execSync(`python "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 90000 });
+      }
       converterResult = JSON.parse(out.toString());
     } catch (e) {
-      converterResult = { success: false, error: e.message };
+      converterResult = { success: false, error: e.message, errors: [e.message] };
+    }
+    if ((converterResult.errors || []).length) {
+      console.warn('dwg_converter errors:', converterResult.errors);
     }
 
     // Build Gemini parts
@@ -849,9 +858,16 @@ app.post('/full-estimate', async (req, res) => {
           tmpPaths.push(tmpIn);
           let cvt = {};
           try {
-            const out = execSync(`python3 "${path.join(__dirname, 'dwg_converter.py')}" "${tmpIn}" "${tmpPng}"`, { timeout: 60000 });
+            const scriptPath = path.join(__dirname, 'dwg_converter.py');
+            let out;
+            try {
+              out = execSync(`python3 "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 90000 });
+            } catch (e1) {
+              out = execSync(`python "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 90000 });
+            }
             cvt = JSON.parse(out.toString());
-          } catch (e) { cvt = { success: false, error: e.message }; }
+          } catch (e) { cvt = { success: false, error: e.message, errors:[e.message] }; }
+          if ((cvt.errors || []).length) console.warn('dwg_converter', f.name, cvt.errors);
 
           if (cvt.png_path && fs.existsSync(cvt.png_path)) {
             const pngB64 = fs.readFileSync(cvt.png_path).toString('base64');
@@ -915,6 +931,16 @@ ${rateHints}
 ${extractedText.length ? `RAW EXTRACTED METADATA FROM DXF/DWG FILES:\n${extractedText.join('\n---\n')}\n` : ''}
 ${userText ? `USER NOTE: ${userText}\n` : ''}
 ${projectName ? `PROJECT NAME HINT: ${projectName}\n` : ''}`;
+
+    // If every file was a DWG/DXF and we got no image + no text, abort early
+    // with a helpful message — otherwise Gemini just sees an empty prompt.
+    const hasVisual = parts.some(p => p.inline_data);
+    const hasText = extractedText.some(t => /TEXTS: \S/.test(t) || /DIMENSIONS: \S/.test(t));
+    if (!hasVisual && !hasText) {
+      return res.status(400).json({
+        error: 'Could not read the uploaded drawing(s). For DWG files the server needs LibreOffice or ODA File Converter installed, which is not available on this host. Please export your drawing to DXF, PDF, PNG or JPG and upload that instead.',
+      });
+    }
 
     parts.push({ text: schemaPrompt });
 
