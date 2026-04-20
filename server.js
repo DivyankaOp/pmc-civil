@@ -8,6 +8,7 @@ const { geminiAnalyzeDrawing, runCVAnalysis, RATES } = require('./drawing_analyz
 const { parseDXF, extractCivilData, extractTotalAreaSqft } = require('./dxf_parser');
 const { buildExcelFromDrawing, getDrawingPrompt } = require('./drawing_to_excel');
 const { buildDXFExcel } = require('./dxf_to_excel');
+const { buildEstimateWorkbook, RATES: ESTIMATE_RATES, DEFAULT_CATEGORIES } = require('./estimate_builder');
 
 const app = express();
 app.use(cors());
@@ -810,6 +811,154 @@ OUTPUT FORMAT — Full PMC Analysis Report:
   } catch (err) {
     console.error('DWG analyze error:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── FULL ESTIMATE — universal upload → MODESTAA-format workbook ───
+// Accepts any mix of image / PDF / DXF / DWG files. Extracts structured
+// quantities via Gemini Vision using a schema that mirrors the reference
+// annexure layout, then writes a multi-sheet workbook with formulas
+// (no hard-coded rates — all rates come from Rates.json by default, and
+// Gemini may override per-item when it reads them off the drawing itself).
+app.post('/full-estimate', async (req, res) => {
+  try {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
+
+    const { files = [], userText = '', projectName = '' } = req.body;
+    if (!files.length) return res.status(400).json({ error: 'No files uploaded.' });
+
+    const fs = require('fs');
+    const os = require('os');
+    const { execSync } = require('child_process');
+
+    // Build Gemini content parts. For DXF/DWG, convert to PNG via dwg_converter.py first.
+    const parts = [];
+    const tmpPaths = [];
+    const extractedText = [];
+
+    for (const f of files) {
+      const name = (f.name || '').toLowerCase();
+      const mime = f.type || '';
+      try {
+        if (name.endsWith('.dxf') || name.endsWith('.dwg')) {
+          const ext = name.endsWith('.dwg') ? 'dwg' : 'dxf';
+          const tmpIn  = path.join(os.tmpdir(), `pmc_est_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`);
+          const tmpPng = path.join(os.tmpdir(), `pmc_est_${Date.now()}_${Math.random().toString(36).slice(2)}.png`);
+          fs.writeFileSync(tmpIn, Buffer.from(f.b64, 'base64'));
+          tmpPaths.push(tmpIn);
+          let cvt = {};
+          try {
+            const out = execSync(`python3 "${path.join(__dirname, 'dwg_converter.py')}" "${tmpIn}" "${tmpPng}"`, { timeout: 60000 });
+            cvt = JSON.parse(out.toString());
+          } catch (e) { cvt = { success: false, error: e.message }; }
+
+          if (cvt.png_path && fs.existsSync(cvt.png_path)) {
+            const pngB64 = fs.readFileSync(cvt.png_path).toString('base64');
+            parts.push({ inline_data: { mime_type: 'image/png', data: pngB64 } });
+            tmpPaths.push(cvt.png_path);
+          }
+          const txts = (cvt.texts || []).map(t => t.text).slice(0, 150).join(' | ');
+          const dims = (cvt.dimensions || []).filter(d => d.value)
+            .map(d => `${d.value}${d.text ? ' (' + d.text + ')' : ''}`).slice(0, 80).join(', ');
+          extractedText.push(
+            `FILE: ${f.name}\nTYPE: ${cvt.drawing_type || 'Unknown'}\nLAYERS: ${(cvt.layers||[]).join(', ')}\nTEXTS: ${txts}\nDIMENSIONS: ${dims}`
+          );
+        } else if (mime === 'application/pdf' || name.endsWith('.pdf')) {
+          parts.push({ inline_data: { mime_type: 'application/pdf', data: f.b64 } });
+        } else if (mime.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp)$/i.test(name)) {
+          parts.push({ inline_data: { mime_type: mime || 'image/png', data: f.b64 } });
+        }
+      } catch (e) { console.log('skip file', f.name, e.message); }
+    }
+
+    // Rates context (no hard-coded rates in the prompt — rely on Rates.json)
+    const rateHints = JSON.stringify(ESTIMATE_RATES, null, 0).slice(0, 6000);
+
+    const schemaPrompt = `You are a SENIOR PMC CIVIL ENGINEER preparing a project estimate from construction drawings.
+You have been given one or more drawings (images / PDF / rendered DXF-DWG). READ every dimension, title block, legend and annotation.
+
+Your job: RETURN JSON ONLY (no prose, no markdown) matching EXACTLY this schema:
+{
+  "project_name": "string — read from title block, else infer",
+  "drawing_type": "string — floor plan / site layout / section / foundation / structural / tiles / elevation / mixed",
+  "builtup_area_sqft": number,           // total BUA in SQFT. Compute from dimensions if not printed.
+  "sections": [
+    {
+      "title": "string — pick from: EXCAVATION, CIVIL WORK, TILES & STONE WORK, PLUMBING & WATERPROOFING, MISCELLANEOUS WORK, AMENITIES, CONSULTANT COST (you may add new sections if drawing needs them)",
+      "items": [
+        {
+          "particular": "string — specific item e.g. 'RCC M25 slab', 'Brickwork 230mm external', 'Vitrified flooring 800x1600'",
+          "qty": number,
+          "unit": "string — CUM / SQMT / SQFT / RMT / NOS / KG / L/S",
+          "rate": number,         // Rate without GST (₹). Use the RATES LIBRARY below as authoritative reference; only override if drawing specifies another rate.
+          "gstPct": number        // as fraction: 0.18 for 18%, 0 for exempt. Default 0.18 if unknown.
+        }
+      ]
+    }
+  ],
+  "observations": "string — 2-3 line PMC note about the drawing and any assumptions made."
+}
+
+RULES:
+- Only include sections that are actually implied by the drawings. Do NOT invent items.
+- For quantities: compute from dimensions using standard PMC formulas (L×W×H for volume, L×W for area, perimeter×height×thickness for wall volume, etc.).
+- Every item MUST have a qty > 0. If you cannot compute a qty, SKIP the item.
+- Use whole numbers or 2 decimals for qty. Units must be consistent within one item.
+- Rates MUST come from the RATES LIBRARY below when available. If an item has no match, estimate conservatively using Gujarat DSR 2025 averages.
+- DO NOT hard-code the builtup area — COMPUTE it from the drawing.
+- Return ONLY the JSON object. Start with { end with }.
+
+RATES LIBRARY (Gujarat DSR 2025, Rates.json):
+${rateHints}
+
+${extractedText.length ? `RAW EXTRACTED METADATA FROM DXF/DWG FILES:\n${extractedText.join('\n---\n')}\n` : ''}
+${userText ? `USER NOTE: ${userText}\n` : ''}
+${projectName ? `PROJECT NAME HINT: ${projectName}\n` : ''}`;
+
+    parts.push({ text: schemaPrompt });
+
+    const gem = await fetchGeminiWithRetry(key, {
+      contents: [{ role: 'user', parts }],
+      generationConfig: {
+        maxOutputTokens: 16384,
+        temperature: 0.1,
+        responseMimeType: 'application/json',
+      },
+    });
+
+    // Cleanup temp files
+    for (const p of tmpPaths) { try { fs.unlinkSync(p); } catch {} }
+
+    const raw = gem?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    let data = {};
+    try {
+      const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
+      data = JSON.parse(raw.slice(fb, lb + 1));
+    } catch (e) {
+      console.error('Estimate JSON parse fail:', e.message, raw.slice(0, 400));
+      return res.status(500).json({ error: 'AI returned invalid JSON. Try again with clearer drawings.' });
+    }
+
+    if (!data.sections || !data.sections.length) {
+      return res.status(400).json({ error: 'No estimable items found in drawings.', raw: data });
+    }
+
+    const wb = await buildEstimateWorkbook(data);
+    const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
+    const pname = (data.project_name || projectName || 'Drawing').replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 24);
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${pname}_MODESTAA_Estimate_${today}.xlsx"`);
+    res.setHeader('X-Estimate-Meta', encodeURIComponent(JSON.stringify({
+      project: data.project_name, bua: data.builtup_area_sqft,
+      sections: data.sections.map(s => ({ title: s.title, items: s.items.length })),
+    })));
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error('Full-estimate error:', err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
 
