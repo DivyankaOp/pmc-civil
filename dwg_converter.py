@@ -42,7 +42,7 @@ def libreoffice_to_png(input_path, output_png):
     lo_png  = os.path.join(out_dir, base + ".png")
     cmd = ["libreoffice", "--headless", "--convert-to", "png",
            "--outdir", out_dir, input_path]
-    subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    subprocess.run(cmd, capture_output=True, text=True, timeout=160)
     if os.path.exists(lo_png):
         if lo_png != output_png:
             shutil.move(lo_png, output_png)
