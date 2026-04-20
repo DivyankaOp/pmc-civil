@@ -1,5 +1,7 @@
 
-matplotlib==3.9.0
-pillow==10.4.0
 ezdxf>=1.4.0
 matplotlib>=3.8.0
+pillow>=10.0.0
+numpy>=1.26.0
+openpyxl>=3.1.0
+opencv-python-headless>=4.8.0
