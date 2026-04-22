@@ -5,7 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PMC Civil AI Agent</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700&family=Inter:wght@400;500&family=DM+Mono:wght@400&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <style>
 :root{--navy:#0B1F3A;--gem:#1A73E8;--sur:#F7F8FC;--bor:rgba(11,31,58,0.1);--bor2:rgba(11,31,58,0.16);--tx:#0B1F3A;--tx2:#4B5E7A;--tx3:#8A9BB0;--r:10px;--r2:16px}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -213,7 +212,7 @@ textarea.tin::placeholder{color:var(--tx3)}
     </div>
   </div>
 </div>
-<input type="file" id="fi" accept="image/*,.pdf,.dxf,.DXF,.dwg,.DWG,.xlsx,.xls,.csv,.doc,.docx,.txt" multiple onchange="onFiles(event)">
+<input type="file" id="fi" accept="image/*,.pdf,.dxf,.DXF,.dwg,.DWG,.dwf,.DWF,.xlsx,.xls,.csv,.doc,.docx,.txt" multiple onchange="onFiles(event)">
 
 <script>
 // ── MODES ──────────────────────────────────────────────
@@ -241,15 +240,13 @@ AUTO-DETECT input type and give FULL DETAILED professional response:
 
 ALWAYS: markdown tables | IS code references | INR rates Surat/Gujarat 2025 | end with PMC OBSERVATIONS & RECOMMENDATIONS`,
 
-  drawing:`You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience. You have FULL VISION — you directly see every pixel of the uploaded drawing like opening it in AutoCAD at MAXIMUM ZOOM.
+  drawing:`You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience. You have FULL VISION — you directly see every pixel of the uploaded drawing like opening it in AutoCAD.
 
-NEVER say you cannot see or access the file. NEVER say image is unclear or low quality. You CAN see — zoom in and read everything like a human engineer.
+NEVER say you cannot see or access the file. Read everything directly from the image/PDF in front of you.
 
-CRITICAL: For PDFs analyze EACH PAGE separately. Zoom into title block, every dimension, every bar mark.
-
-STEP 1 — SCALE: Find scale bar or text like "1:100", "1:500", "SCALE 1:1000", "NTS". State exact scale found.
-STEP 2 — TITLE BLOCK: Read project name, drawing number, revision, date, engineer/firm name. Read EVERY field.
-STEP 3 — DIMENSIONS: Zoom into and read EVERY dimension annotation. List each: "Column C1 = 300x600mm", "Footing F1 = 1200x1200x450mm"
+STEP 1 — SCALE: Look for scale bar or text "1:100", "1:500", "SCALE 1:1000". State exact scale found in this drawing.
+STEP 2 — TITLE BLOCK: Read project name, drawing number, revision, date, engineer/firm name, north arrow.
+STEP 3 — DIMENSIONS: Read EVERY dimension annotation visible in drawing. List each: "Road R1 = 129.12m × 24m wide"
 STEP 4 — QUANTITIES TABLE (calculate from actual dimensions you read):
 
 | Element | Length (m) | Width (m) | Area (sqmt) | GSB (Ton) | WMM (Ton) | PQC (CUM) | Cost (Rs.) |
@@ -419,16 +416,18 @@ function onFiles(e){
       };
       rd.readAsText(f);
     }
-    // ── DWG/DXF: read as base64 → server converts to PNG via ezdxf+matplotlib → Gemini sees actual drawing
-    else if(name.match(/\.dwg$/) || name.match(/\.dxf$/)){
+    // ── DWG/DXF/DWF: read as base64 → server converts to PNG via ezdxf+matplotlib → Gemini sees actual drawing
+    else if(name.match(/\.dwg$/) || name.match(/\.dxf$/) || name.match(/\.dwf$/)){
       const rd=new FileReader();
       rd.onload=ev=>{
         const b64 = ev.target.result.split(',')[1];
         const isDXFfile = name.match(/\.dxf$/i);
+        const isDWFfile = name.match(/\.dwf$/i);
         files.push({
           name:f.name,
-          type: isDXFfile ? 'application/dxf' : 'application/dwg',
+          type: isDXFfile ? 'application/dxf' : (isDWFfile ? 'application/dwf' : 'application/dwg'),
           isDWG:true,
+          isDWF:!!isDWFfile,
           b64: b64
         });
         renderChips();
@@ -525,10 +524,6 @@ br.appendChild(dxfB);
 // NEW: Estimate auto-update button
 const estB=mkBtn('auto','🏗️','Overall Estimate Update (Area Auto)',()=>updateEstimateFromDXF(estB,dxfFile));
 br.appendChild(estB);
-// Full MODESTAA-format PMC estimate from the DXF
-const fullB=mkBtn('auto','📑','Full PMC Estimate (MODESTAA)',()=>dlFullEstimate(fullB,[dxfFile],msgText||''));
-br.appendChild(fullB);
-bub.appendChild(br);
   } else if(role==='ai'&&msgFiles&&msgFiles.length>0){
     const br=document.createElement('div');br.className='btn-row';
     const isDwg=(mode==='drawing'||mode==='auto'||mode==='boq'||mode==='estimate'||mode==='study');
@@ -541,12 +536,7 @@ bub.appendChild(br);
     
     const xlB=mkBtn('xl','📊','Comparison Excel',()=>dlFile(xlB,'/export-excel',msgFiles,msgText||'',aiResponseText||text));
     const pdB=mkBtn('pdf','📄','Download PDF',()=>dlFile(pdB,'/export-pdf',msgFiles,msgText||'',aiResponseText||text));
-    br.appendChild(xlB);br.appendChild(pdB);
-    if(isDwg){
-      const fullB=mkBtn('auto','📑','Full PMC Estimate (MODESTAA)',()=>dlFullEstimate(fullB,msgFiles,msgText||''));
-      br.appendChild(fullB);
-    }
-    bub.appendChild(br);
+    br.appendChild(xlB);br.appendChild(pdB);bub.appendChild(br);
   }
   row.appendChild(av);row.appendChild(bub);chat.appendChild(row);chat.scrollTop=chat.scrollHeight;
 }
@@ -594,45 +584,6 @@ async function dlDrawingExcel(btn, uploadedFiles, userText, aiResponse){
     a.download=`PMC_Drawing_Estimate_${new Date().toISOString().slice(0,10)}.xlsx`;
     a.click();URL.revokeObjectURL(url);
     btn.innerHTML='<span class="ic">✅</span> Excel Downloaded!';btn.style.background='#059669';
-  }catch(err){
-    btn.innerHTML='<span class="ic">❌</span> '+err.message;
-    btn.style.background='#DC2626';btn.disabled=false;
-  }
-  btn.classList.remove('loading');
-}
-
-// Full MODESTAA-format PMC estimate: uploads raw files (img/pdf/dxf/dwg)
-// to /full-estimate; server runs Gemini Vision + writes annexure workbook.
-async function dlFullEstimate(btn, uploadedFiles, userText){
-  btn.disabled=true;btn.classList.add('loading');
-  btn.querySelector('span:last-child').textContent=' Analyzing drawings & building estimate...';
-  try{
-    // Normalize: for DXF chips we already have dxfContent (text). Convert to base64 so server can treat uniformly.
-    const payloadFiles = (uploadedFiles||[]).map(f=>{
-      if(f.isDXF && f.dxfContent && !f.b64){
-        const b64 = btoa(unescape(encodeURIComponent(f.dxfContent)));
-        return { name: f.name||'drawing.dxf', type: 'application/dxf', b64 };
-      }
-      return { name: f.name, type: f.type, b64: f.b64 };
-    }).filter(f=>f.b64);
-
-    const res=await fetch('/full-estimate',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({files:payloadFiles, userText})
-    });
-    const ctype=res.headers.get('content-type')||'';
-    if(!res.ok || ctype.includes('text/html')){
-      let msg='Estimate failed';
-      if(ctype.includes('application/json')){ const e=await res.json().catch(()=>({})); msg=e.error||msg; }
-      else { const txt=await res.text(); msg=`HTTP ${res.status}. ${txt.slice(0,160).replace(/<[^>]+>/g,'').trim()||'Server timeout — try DXF/PDF instead of DWG.'}`; }
-      throw new Error(msg);
-    }
-    const blob=await res.blob();
-    const url=URL.createObjectURL(blob);
-    const a=document.createElement('a');a.href=url;
-    a.download=`MODESTAA_PMC_Estimate_${new Date().toISOString().slice(0,10)}.xlsx`;
-    a.click();URL.revokeObjectURL(url);
-    btn.innerHTML='<span class="ic">✅</span> Estimate Downloaded!';btn.style.background='#059669';
   }catch(err){
     btn.innerHTML='<span class="ic">❌</span> '+err.message;
     btn.style.background='#DC2626';btn.disabled=false;
@@ -744,15 +695,7 @@ async function send(){
       const dwgFile=sentFiles.find(f=>f.isDWG);
       const res=await fetch('/analyze-dwg',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({b64:dwgFile.b64,filename:dwgFile.name})});
-      const ctype=res.headers.get('content-type')||'';
-      let data;
-      if(ctype.includes('application/json')){
-        data=await res.json();
-      }else{
-        const txt=await res.text();
-        throw new Error(`Server returned ${res.status} ${res.statusText}. ${txt.slice(0,200).replace(/<[^>]+>/g,'').trim()||'Likely timeout — DWG conversion took too long. Try uploading DXF or PDF instead.'}`);
-      }
-      if(!res.ok) throw new Error(data.error||('HTTP '+res.status));
+      const data=await res.json();
       const aiText=data.analysis||'DWG analysis failed.';
       rmLoad();
       hist=hist.filter(m=>m.role!=='user_parts');
@@ -762,111 +705,6 @@ async function send(){
     }catch(err){
       rmLoad();
       addMsgEl('ai',`**DWG Error:** ${err.message}`);
-    }
-    busy=false;document.getElementById('sbtn').disabled=false;
-    return;
-  }
-
-  // ── DRAWING MODE: PDF/Image → tile-based zoom via /analyze-drawing-pdf ──
-  const hasDrawingFiles = sentFiles.some(f =>
-    f.type?.startsWith('image/') || f.type==='application/pdf' || f.name?.match(/\.pdf$/i)
-  );
-  const isDrawingMode = (mode==='drawing'||mode==='auto'||mode==='boq'||mode==='estimate'||mode==='study');
-
-  if(hasDrawingFiles && isDrawingMode){
-    files=[];renderChips();
-    addLoad();
-
-    function initPdfJs(){
-      if(window.pdfjsLib)
-        window.pdfjsLib.GlobalWorkerOptions.workerSrc=
-          'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-    }
-
-    async function renderPageCanvas(pdfPage,scale){
-      const vp=pdfPage.getViewport({scale});
-      const c=document.createElement('canvas');
-      c.width=vp.width;c.height=vp.height;
-      await pdfPage.render({canvasContext:c.getContext('2d'),viewport:vp}).promise;
-      return c;
-    }
-
-    function sliceCanvas(canvas,gx,gy,ovr){
-      const tiles=[];
-      const W=canvas.width,H=canvas.height;
-      const tw=Math.floor(W/gx),th=Math.floor(H/gy);
-      const ox=Math.floor(tw*ovr),oy=Math.floor(th*ovr);
-      const zones=[['TOP-LEFT','TOP-CENTER','TOP-RIGHT'],['MID-LEFT','MID-CENTER','MID-RIGHT'],['BOT-LEFT','BOT-CENTER','BOT-RIGHT']];
-      for(let r=0;r<gy;r++){
-        for(let c=0;c<gx;c++){
-          const x=Math.max(0,c*tw-ox),y=Math.max(0,r*th-oy);
-          const w=Math.min(tw+ox*2,W-x),h=Math.min(th+oy*2,H-y);
-          const tc=document.createElement('canvas');
-          tc.width=w;tc.height=h;
-          tc.getContext('2d').drawImage(canvas,x,y,w,h,0,0,w,h);
-          tiles.push({b64:tc.toDataURL('image/png',1.0).split(',')[1],zone:(zones[r]||[])[c]||'ZONE-'+r+c});
-        }
-      }
-      const th2=document.createElement('canvas');
-      const s=Math.min(1200/W,1200/H,1);
-      th2.width=Math.floor(W*s);th2.height=Math.floor(H*s);
-      th2.getContext('2d').drawImage(canvas,0,0,th2.width,th2.height);
-      tiles.unshift({b64:th2.toDataURL('image/png',1.0).split(',')[1],zone:'FULL_PAGE'});
-      return tiles;
-    }
-
-    try{
-      initPdfJs();
-      const fname=sentFiles.find(f=>f.type==='application/pdf'||f.name?.match(/\.pdf$/i))?.name||sentFiles[0]?.name||'drawing';
-      const pagesData=[];
-
-      for(const f of sentFiles){
-        if(f.type==='application/pdf'||f.name?.match(/\.pdf$/i)){
-          if(!window.pdfjsLib) throw new Error('PDF.js not loaded. Refresh and try again.');
-          const bin=atob(f.b64);
-          const bytes=new Uint8Array(bin.length);
-          for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
-          const pdf=await window.pdfjsLib.getDocument({data:bytes}).promise;
-          for(let p=1;p<=pdf.numPages;p++){
-            const pg=await pdf.getPage(p);
-            const cv=await renderPageCanvas(pg,3.0);
-            const tiles=sliceCanvas(cv,2,2,0.15);
-            pagesData.push({pageNum:p,totalPages:pdf.numPages,tiles,fname});
-          }
-        } else if(f.type?.startsWith('image/')){
-          const cv=await new Promise((res,rej)=>{
-            const img=new Image();
-            img.onload=()=>{const c=document.createElement('canvas');c.width=img.width;c.height=img.height;c.getContext('2d').drawImage(img,0,0);res(c);};
-            img.onerror=rej;
-            img.src='data:'+f.type+';base64,'+f.b64;
-          });
-          const tiles=sliceCanvas(cv,2,2,0.15);
-          pagesData.push({pageNum:1,totalPages:1,tiles,fname:f.name});
-        }
-      }
-
-      if(!pagesData.length) throw new Error('No drawing pages could be processed.');
-      const res=await fetch('/analyze-drawing-pdf',{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({pagesData,userText:sentText,filename:fname})
-      });
-      const ctype=res.headers.get('content-type')||'';
-      let data;
-      if(ctype.includes('application/json')){data=await res.json();}
-      else{const tx=await res.text();throw new Error('Server error '+res.status+': '+tx.slice(0,200).replace(/<[^>]+>/g,'').trim());}
-      if(!res.ok) throw new Error(data.error||('HTTP '+res.status));
-      const aiText=data.analysis||'Drawing analysis failed.';
-      rmLoad();
-      hist=hist.filter(m=>m.role!=='user_parts');
-      hist.push({role:'assistant',content:aiText,userText:sentText});
-      addMsgEl('ai',aiText,[],true,sentFiles,sentText,aiText);
-      saveChatToHistory(fname.slice(0,40));
-    }catch(err){
-      rmLoad();
-      let msg=err.message;
-      if(msg.includes('429')||msg.includes('quota')||msg.includes('RESOURCE_EXHAUSTED'))
-        msg='Gemini rate limit. 1 minute baad dobara try karo. (Free: 20 req/day)';
-      addMsgEl('ai','Drawing Analysis Error: '+msg);
     }
     busy=false;document.getElementById('sbtn').disabled=false;
     return;
