@@ -997,6 +997,87 @@ ${projectName ? `PROJECT NAME HINT: ${projectName}\n` : ''}`;
   }
 });
 
+// ─── 8b. DRAWING PDF / IMAGE — deep zoom analysis ──────────────────
+// Called when user uploads PDF/image in Drawing mode.
+// Sends EACH file as a separate Gemini call so large multi-sheet PDFs
+// don't time-out and every drawing page gets individual attention.
+app.post('/analyze-drawing-pdf', async (req, res) => {
+  try {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
+
+    const { files = [], userText = '' } = req.body;
+    if (!files.length) return res.status(400).json({ error: 'No files provided.' });
+
+    const DRAWING_PROMPT = `You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience.
+You have been given a civil engineering drawing — treat it exactly like opening the file in AutoCAD at full zoom.
+
+MANDATORY READING STEPS:
+STEP 1 — ZOOM INTO TITLE BLOCK (bottom-right corner): Read project name, drawing number (e.g. STR001 R0), revision, date, engineer name, firm, north arrow. State each field exactly.
+STEP 2 — READ SCALE: Look for "SCALE 1:50", "1:100", "1:200", "NTS". If not found, estimate from drawing extents.
+STEP 3 — ZOOM INTO EVERY DIMENSION: Read ALL dimension annotations visible — every length, width, height, diameter, spacing. List each: "Column C1 = 300mm × 600mm", "Footing F1 = 1200mm × 1200mm × 450mm deep".
+STEP 4 — READ ALL TEXT ANNOTATIONS: Bar marks (T12@150, 16Φ@200), reinforcement schedules, concrete grades (M20, M25, M30), level marks (GL+0.00, FL+3.00), hatching legends.
+STEP 5 — QUANTITIES TABLE (calculate from actual dimensions you read):
+
+For STRUCTURAL drawings:
+| Element | Size | Concrete Grade | Length/Nos | Volume (CUM) | Steel (KG) | Formwork (SQMT) | Cost (₹) |
+
+For ROAD drawings:
+| Road | Length(m) | Width(m) | Area(sqmt) | GSB(Ton) | WMM(Ton) | PQC(CUM) | Cost(₹) |
+
+For FLOOR PLAN:
+| Room/Space | Length(m) | Width(m) | Area(sqmt) | Flooring Type | Cost(₹) |
+
+STEP 6 — STEEL BBS (if reinforcement visible):
+| Element | Bar Dia | Nos | Cutting Length(m) | Total Length(m) | Unit Wt(kg/m) | Weight(kg) |
+Unit weights: 8mm=0.395 | 10mm=0.617 | 12mm=0.888 | 16mm=1.58 | 20mm=2.47 | 25mm=3.86 kg/m
+
+STEP 7 — COST SUMMARY (Gujarat DSR 2025):
+PQC Road 250mm: ₹1800/sqmt | GSB 300mm: ₹655/sqmt | WMM 200mm: ₹515/sqmt
+RCC M25: ₹5500/cum | RCC M30: ₹5800/cum | Steel Fe500: ₹56/kg | Formwork: ₹180/sqmt
+Brickwork: ₹4500/cum | Excavation: ₹180/cum | Tiles: ₹850/sqmt | Plaster: ₹220/sqmt
+
+STEP 8 — PMC OBSERVATIONS (IS Code compliance):
+IS 456 (RCC) | IS 1786 (Steel) | IS 383 (Aggregate) | IRC 58 (PQC Roads) | IS 2185 (Blocks)
+
+⚠️ CRITICAL RULES:
+- NEVER say "I cannot see", "image unclear", "I cannot access". You CAN see — zoom in and read.
+- Use ONLY actual dimensions from THIS drawing. No assumed or placeholder values.
+- If a number is partially visible, state what you CAN read and mark it [partial].
+- If drawing has multiple sheets, analyze EACH sheet separately with its sheet number.
+
+${userText ? `USER NOTE: ${userText}` : ''}`;
+
+    const results = [];
+
+    for (const f of files) {
+      const parts = [];
+      const mime = f.type || (f.name?.match(/\.pdf$/i) ? 'application/pdf' : 'image/png');
+      parts.push({ inline_data: { mime_type: mime, data: f.b64 } });
+      parts.push({ text: DRAWING_PROMPT });
+
+      const gemData = await fetchGeminiWithRetry(key, {
+        contents: [{ role: 'user', parts }],
+        generationConfig: { maxOutputTokens: 8192, temperature: 0.05 }
+      });
+
+      const analysis = gemData?.candidates?.[0]?.content?.parts?.[0]?.text
+        || (gemData?.error ? `Gemini API Error: ${JSON.stringify(gemData.error)}` : 'No analysis returned.');
+      results.push({ filename: f.name, analysis });
+    }
+
+    // Merge results if multiple files
+    let combined = results.length === 1
+      ? results[0].analysis
+      : results.map(r => `## Drawing: ${r.filename}\n\n${r.analysis}`).join('\n\n---\n\n');
+
+    res.json({ success: true, analysis: combined });
+  } catch (err) {
+    console.error('analyze-drawing-pdf error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── 9. HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   const key = process.env.GEMINI_API_KEY;
