@@ -740,10 +740,17 @@ app.post('/analyze-dwg', async (req, res) => {
     const parts = [];
 
     // If PNG rendered successfully — send image to Gemini Vision
+    // FIX-8: Blank PNG guard — prevent Gemini hallucinating on empty/failed renders
     if (converterResult.png_path && fs.existsSync(converterResult.png_path)) {
-      const pngB64 = fs.readFileSync(converterResult.png_path).toString('base64');
-      parts.push({ inline_data: { mime_type: 'image/png', data: pngB64 } });
-      try { fs.unlinkSync(converterResult.png_path); } catch(e) {}
+      const pngBuf = fs.readFileSync(converterResult.png_path);
+      const pngSizeKB = pngBuf.length / 1024;
+      if (pngSizeKB < 30) {
+        console.warn('[analyze-dwg] PNG too small (' + pngSizeKB.toFixed(1) + 'KB) — likely blank render, skipping vision.');
+        converterResult.png_path = null;
+      } else {
+        parts.push({ inline_data: { mime_type: 'image/png', data: pngBuf.toString('base64') } });
+      }
+      try { if (converterResult.png_path) fs.unlinkSync(converterResult.png_path); } catch(e) {}
     }
 
     // Always include extracted text + dimension data
@@ -776,11 +783,8 @@ INSTRUCTIONS:
 3. Calculate ALL quantities using proper PMC formulas:
    Roads: Area=L×W | GSB=Area×1.15×0.3×1800kg/m³ | WMM=Area×1.15×0.2×2100 | PQC=Area×1.05×0.25
    Structure: Volume=L×W×H | Steel=Volume×120kg/m³(slab) or 160(beam)
-4. Apply Gujarat DSR 2025 rates:
-   PQC ₹1800/sqmt | GSB ₹655/sqmt | WMM ₹515/sqmt | Soil stab ₹82/sqmt
-   RCC M25 ₹5500/cum | RCC M30 ₹5800/cum | Steel Fe500 ₹56/kg
-   Brickwork ₹4500/cum | Formwork ₹180/sqmt | Excavation ₹180/cum
-   Compound wall ₹8600/rmt | Street light ₹35000/nos | Pipeline ₹4500/rmt
+4. Apply Gujarat DSR 2025 rates (from config — do NOT override unless drawing specifies a different rate):
+   ${Object.values(RATES).map(v => `${v.desc}: ₹${v.rate}/${v.unit}`).join(' | ')}
 
 OUTPUT FORMAT — Full PMC Analysis Report:
 ## Drawing Details (Title Block)
@@ -869,9 +873,14 @@ app.post('/full-estimate', async (req, res) => {
           } catch (e) { cvt = { success: false, error: e.message, errors:[e.message] }; }
           if ((cvt.errors || []).length) console.warn('dwg_converter', f.name, cvt.errors);
 
+          // FIX-8b: Blank PNG guard for /full-estimate too
           if (cvt.png_path && fs.existsSync(cvt.png_path)) {
-            const pngB64 = fs.readFileSync(cvt.png_path).toString('base64');
-            parts.push({ inline_data: { mime_type: 'image/png', data: pngB64 } });
+            const pngBuf2 = fs.readFileSync(cvt.png_path);
+            if (pngBuf2.length / 1024 >= 30) {
+              parts.push({ inline_data: { mime_type: 'image/png', data: pngBuf2.toString('base64') } });
+            } else {
+              console.warn('[full-estimate] PNG too small (' + (pngBuf2.length/1024).toFixed(1) + 'KB) — skipping vision for this file.');
+            }
             tmpPaths.push(cvt.png_path);
           }
           const txts = (cvt.texts || []).map(t => t.text).slice(0, 150).join(' | ');
