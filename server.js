@@ -41,9 +41,17 @@ async function fetchGeminiWithRetry(key, body, { maxRetries = 5, baseDelayMs = 2
     // Non-retryable error — return the data as-is so callers handle it normally
     if (!retryable || attempt === maxRetries) return data;
 
-    // Exponential backoff: 2s, 4s, 8s, 16s, 32s …
-    const delay = baseDelayMs * Math.pow(2, attempt);
-    console.warn(`Gemini ${code} on attempt ${attempt + 1}/${maxRetries + 1}. Retrying in ${delay}ms…`);
+    // For 429: use retryDelay from API response if available, otherwise exponential backoff
+    let delay = baseDelayMs * Math.pow(2, attempt);
+    try {
+      const retryInfo = data?.error?.details?.find(d => d['@type']?.includes('RetryInfo'));
+      if (retryInfo?.retryDelay) {
+        const secs = parseFloat(retryInfo.retryDelay.replace('s',''));
+        if (!isNaN(secs)) delay = Math.min((secs + 2) * 1000, 120000); // cap at 2 min
+      }
+    } catch(e) {}
+
+    console.warn(`Gemini ${code} on attempt ${attempt + 1}/${maxRetries + 1}. Retrying in ${Math.round(delay/1000)}s…`);
     await new Promise(resolve => setTimeout(resolve, delay));
   }
 }
@@ -997,81 +1005,108 @@ ${projectName ? `PROJECT NAME HINT: ${projectName}\n` : ''}`;
   }
 });
 
-// ─── 8b. DRAWING PDF / IMAGE — deep zoom analysis ──────────────────
-// Called when user uploads PDF/image in Drawing mode.
-// Sends EACH file as a separate Gemini call so large multi-sheet PDFs
-// don't time-out and every drawing page gets individual attention.
+// ─── 8b. DRAWING — tile-based deep zoom analysis ───────────────────
+// Frontend sends each PDF page as: 1 full-page thumbnail + 9 cropped tiles (3×3 grid).
+// Server receives 4 cropped tiles (2×2 grid) per page + full thumbnail.
+// All tiles sent in ONE Gemini call per page → free tier friendly (1 call/page).
 app.post('/analyze-drawing-pdf', async (req, res) => {
   try {
     const key = process.env.GEMINI_API_KEY;
     if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
 
-    const { files = [], userText = '' } = req.body;
-    if (!files.length) return res.status(400).json({ error: 'No files provided.' });
+    const { pagesData = [], userText = '', filename = 'drawing' } = req.body;
+    if (!pagesData.length) return res.status(400).json({ error: 'No pages provided.' });
 
-    const DRAWING_PROMPT = `You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience.
-You have been given a civil engineering drawing — treat it exactly like opening the file in AutoCAD at full zoom.
+    const pageResults = [];
 
-MANDATORY READING STEPS:
-STEP 1 — ZOOM INTO TITLE BLOCK (bottom-right corner): Read project name, drawing number (e.g. STR001 R0), revision, date, engineer name, firm, north arrow. State each field exactly.
-STEP 2 — READ SCALE: Look for "SCALE 1:50", "1:100", "1:200", "NTS". If not found, estimate from drawing extents.
-STEP 3 — ZOOM INTO EVERY DIMENSION: Read ALL dimension annotations visible — every length, width, height, diameter, spacing. List each: "Column C1 = 300mm × 600mm", "Footing F1 = 1200mm × 1200mm × 450mm deep".
-STEP 4 — READ ALL TEXT ANNOTATIONS: Bar marks (T12@150, 16Φ@200), reinforcement schedules, concrete grades (M20, M25, M30), level marks (GL+0.00, FL+3.00), hatching legends.
-STEP 5 — QUANTITIES TABLE (calculate from actual dimensions you read):
+    for (const pageInfo of pagesData) {
+      const { pageNum, totalPages, tiles = [] } = pageInfo;
+      if (!tiles.length) continue;
 
-For STRUCTURAL drawings:
-| Element | Size | Concrete Grade | Length/Nos | Volume (CUM) | Steel (KG) | Formwork (SQMT) | Cost (₹) |
+      const fullTile  = tiles.find(t => t.label === 'FULL_PAGE');
+      const zoneTiles = tiles.filter(t => t.label !== 'FULL_PAGE');
 
-For ROAD drawings:
-| Road | Length(m) | Width(m) | Area(sqmt) | GSB(Ton) | WMM(Ton) | PQC(CUM) | Cost(₹) |
-
-For FLOOR PLAN:
-| Room/Space | Length(m) | Width(m) | Area(sqmt) | Flooring Type | Cost(₹) |
-
-STEP 6 — STEEL BBS (if reinforcement visible):
-| Element | Bar Dia | Nos | Cutting Length(m) | Total Length(m) | Unit Wt(kg/m) | Weight(kg) |
-Unit weights: 8mm=0.395 | 10mm=0.617 | 12mm=0.888 | 16mm=1.58 | 20mm=2.47 | 25mm=3.86 kg/m
-
-STEP 7 — COST SUMMARY (Gujarat DSR 2025):
-PQC Road 250mm: ₹1800/sqmt | GSB 300mm: ₹655/sqmt | WMM 200mm: ₹515/sqmt
-RCC M25: ₹5500/cum | RCC M30: ₹5800/cum | Steel Fe500: ₹56/kg | Formwork: ₹180/sqmt
-Brickwork: ₹4500/cum | Excavation: ₹180/cum | Tiles: ₹850/sqmt | Plaster: ₹220/sqmt
-
-STEP 8 — PMC OBSERVATIONS (IS Code compliance):
-IS 456 (RCC) | IS 1786 (Steel) | IS 383 (Aggregate) | IRC 58 (PQC Roads) | IS 2185 (Blocks)
-
-⚠️ CRITICAL RULES:
-- NEVER say "I cannot see", "image unclear", "I cannot access". You CAN see — zoom in and read.
-- Use ONLY actual dimensions from THIS drawing. No assumed or placeholder values.
-- If a number is partially visible, state what you CAN read and mark it [partial].
-- If drawing has multiple sheets, analyze EACH sheet separately with its sheet number.
-
-${userText ? `USER NOTE: ${userText}` : ''}`;
-
-    const results = [];
-
-    for (const f of files) {
+      // Build ONE Gemini request with all images: full page + all zone tiles
+      // Gemini sees the full drawing AND each zoomed zone in the same context window
       const parts = [];
-      const mime = f.type || (f.name?.match(/\.pdf$/i) ? 'application/pdf' : 'image/png');
-      parts.push({ inline_data: { mime_type: mime, data: f.b64 } });
-      parts.push({ text: DRAWING_PROMPT });
+
+      // Image 1: Full page thumbnail for overall context
+      if (fullTile) {
+        parts.push({ inline_data: { mime_type: 'image/png', data: fullTile.b64 } });
+        parts.push({ text: `[IMAGE 1 — FULL PAGE OVERVIEW of "${filename}", Page ${pageNum}/${totalPages}]` });
+      }
+
+      // Images 2–5: Zoomed tiles (TOP-LEFT, TOP-RIGHT, BOTTOM-LEFT, BOTTOM-RIGHT)
+      zoneTiles.forEach((tile, i) => {
+        parts.push({ inline_data: { mime_type: 'image/png', data: tile.b64 } });
+        parts.push({ text: `[IMAGE ${i + 2} — ZOOMED ZONE: ${tile.zone}]` });
+      });
+
+      // Final instruction prompt
+      const prompt = `You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience.
+
+You have been given ${parts.filter(p=>p.inline_data).length} images of the SAME drawing page:
+- Image 1: Full page overview (to understand layout)
+- Images 2–5: Zoomed-in zones (TOP-LEFT, TOP-RIGHT, BOTTOM-LEFT, BOTTOM-RIGHT)
+
+Drawing file: "${filename}" | Page ${pageNum} of ${totalPages}
+
+YOUR JOB — Read EVERYTHING from ALL zones and produce a COMPLETE PMC report:
+
+**STEP 1 — TITLE BLOCK** (usually bottom-right zone):
+Read every field: Drawing No | Project Name | Revision | Date | Engineer/Firm | Scale | Client
+
+**STEP 2 — ALL ELEMENTS & DIMENSIONS**
+Zoom into each image and list EVERY element with exact measurements:
+- Footings: ID, plan size (L×W mm), depth, PCC below
+- Columns: ID, size (B×D mm), pedestal dimensions
+- Beams: ID, size, span
+- Slabs: thickness, extent
+- Roads: length, carriageway width, ROW width
+- Any other element visible
+
+**STEP 3 — REINFORCEMENT** (read bar marks from zoomed images):
+List every bar annotation: "F1 bottom: 10T16@150 + 10T16@150 EW | Top: T10@200 | Stirrups: 8Φ@150"
+
+**STEP 4 — QUANTITIES TABLE**
+| Element | ID | Size (mm) | Grade | Nos | Vol (CUM) | Steel (KG) | Fmwk (SQMT) | Cost (₹) |
+Formulas: Footing=L×W×D | Column=B×D×H | Steel/m³: Footing=80 | Col=160 | Slab=120 | Beam=200
+
+**STEP 5 — STEEL BAR BENDING SCHEDULE**
+| Element | Bar Mark | Dia(mm) | Nos | Cut Length(m) | Total(m) | kg/m | Wt(kg) |
+Weights: 8=0.395 | 10=0.617 | 12=0.888 | 16=1.58 | 20=2.47 | 25=3.86
+
+**STEP 6 — COST SUMMARY** (Gujarat DSR 2025)
+RCC M25=₹5500/cum | M30=₹5800/cum | Steel=₹56/kg | Formwork=₹180/sqmt | Excavation=₹180/cum | PCC=₹4200/cum | Tiles=₹850/sqmt
+
+**STEP 7 — PMC OBSERVATIONS**
+IS 456 | IS 1786 | IS 13920 compliance | Cover requirements | Any concerns
+
+RULES:
+✅ Use ONLY actual values visible in the images
+✅ If a value is in the zoomed tile, use the zoomed tile — it is more readable
+✅ NEVER say "I cannot see" — zoom into the relevant image and read it
+✅ No placeholder or assumed values
+${userText ? `\nENGINEER NOTE: ${userText}` : ''}`;
+
+      parts.push({ text: prompt });
 
       const gemData = await fetchGeminiWithRetry(key, {
         contents: [{ role: 'user', parts }],
-        generationConfig: { maxOutputTokens: 8192, temperature: 0.05 }
-      });
+        generationConfig: { maxOutputTokens: 8192, temperature: 0.0 }
+      }, { maxRetries: 6, baseDelayMs: 3000 });
 
-      const analysis = gemData?.candidates?.[0]?.content?.parts?.[0]?.text
-        || (gemData?.error ? `Gemini API Error: ${JSON.stringify(gemData.error)}` : 'No analysis returned.');
-      results.push({ filename: f.name, analysis });
+      const report = gemData?.candidates?.[0]?.content?.parts?.[0]?.text
+        || (gemData?.error ? `⚠️ Gemini Error (Page ${pageNum}): ${gemData.error.message || JSON.stringify(gemData.error)}` : 'No analysis returned.');
+
+      pageResults.push({ page: pageNum, report });
     }
 
-    // Merge results if multiple files
-    let combined = results.length === 1
-      ? results[0].analysis
-      : results.map(r => `## Drawing: ${r.filename}\n\n${r.analysis}`).join('\n\n---\n\n');
+    const combined = pageResults.length === 1
+      ? pageResults[0].report
+      : pageResults.map(p => `---\n# Page ${p.page} Analysis\n\n${p.report}`).join('\n\n');
 
-    res.json({ success: true, analysis: combined });
+    res.json({ success: true, analysis: combined, pages_analyzed: pageResults.length });
   } catch (err) {
     console.error('analyze-drawing-pdf error:', err);
     res.status(500).json({ error: err.message });
