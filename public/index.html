@@ -240,13 +240,15 @@ AUTO-DETECT input type and give FULL DETAILED professional response:
 
 ALWAYS: markdown tables | IS code references | INR rates Surat/Gujarat 2025 | end with PMC OBSERVATIONS & RECOMMENDATIONS`,
 
-  drawing:`You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience. You have FULL VISION — you directly see every pixel of the uploaded drawing like opening it in AutoCAD.
+  drawing:`You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience. You have FULL VISION — you directly see every pixel of the uploaded drawing like opening it in AutoCAD at MAXIMUM ZOOM.
 
-NEVER say you cannot see or access the file. Read everything directly from the image/PDF in front of you.
+NEVER say you cannot see or access the file. NEVER say image is unclear or low quality. You CAN see — zoom in and read everything like a human engineer in AutoCAD.
 
-STEP 1 — SCALE: Look for scale bar or text "1:100", "1:500", "SCALE 1:1000". State exact scale found in this drawing.
-STEP 2 — TITLE BLOCK: Read project name, drawing number, revision, date, engineer/firm name, north arrow.
-STEP 3 — DIMENSIONS: Read EVERY dimension annotation visible in drawing. List each: "Road R1 = 129.12m × 24m wide"
+CRITICAL: For PDFs — analyze EACH PAGE separately. Zoom into title block, every dimension, every bar mark, every annotation box.
+
+STEP 1 — SCALE: Find scale bar or text like "1:100", "1:500", "SCALE 1:1000", "NTS". State exact scale. If not found, estimate.
+STEP 2 — TITLE BLOCK: Read project name, drawing number, revision, date, engineer/firm name. Read EVERY field in the title block.
+STEP 3 — DIMENSIONS: Zoom into and read EVERY dimension annotation. List each one: "Column C1 = 300×600mm", "Footing F1 = 1200×1200×450mm"
 STEP 4 — QUANTITIES TABLE (calculate from actual dimensions you read):
 
 | Element | Length (m) | Width (m) | Area (sqmt) | GSB (Ton) | WMM (Ton) | PQC (CUM) | Cost (Rs.) |
@@ -759,6 +761,58 @@ async function send(){
     }catch(err){
       rmLoad();
       addMsgEl('ai',`**DWG Error:** ${err.message}`);
+    }
+    busy=false;document.getElementById('sbtn').disabled=false;
+    return;
+  }
+
+  // ── DRAWING MODE: PDF/Image → use dedicated /analyze-drawing-pdf endpoint ──
+  const hasDrawingFiles = sentFiles.some(f =>
+    f.type?.startsWith('image/') || f.type==='application/pdf' || f.name?.match(/\.pdf$/i)
+  );
+  const isDrawingMode = (mode==='drawing'||mode==='auto'||mode==='boq'||mode==='estimate'||mode==='study');
+
+  if(hasDrawingFiles && isDrawingMode){
+    files=[];renderChips();
+    addLoad();
+    try{
+      const drawingFiles = sentFiles.filter(f =>
+        f.type?.startsWith('image/') || f.type==='application/pdf' || f.name?.match(/\.pdf$/i)
+      ).map(f=>({name:f.name, type:f.type||'application/pdf', b64:f.b64}));
+
+      const controller = new AbortController();
+      const timeout = setTimeout(()=>controller.abort(), 120000); // 2 min timeout
+
+      const res = await fetch('/analyze-drawing-pdf',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({files: drawingFiles, userText: sentText}),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+
+      const ctype = res.headers.get('content-type')||'';
+      let data;
+      if(ctype.includes('application/json')){
+        data = await res.json();
+      } else {
+        const txt = await res.text();
+        throw new Error(`Server error ${res.status}. ${txt.slice(0,200).replace(/<[^>]+>/g,'').trim()}`);
+      }
+      if(!res.ok) throw new Error(data.error||('HTTP '+res.status));
+
+      const aiText = data.analysis || 'Drawing analysis failed.';
+      rmLoad();
+      hist=hist.filter(m=>m.role!=='user_parts');
+      hist.push({role:'assistant',content:aiText,userText:sentText});
+      addMsgEl('ai',aiText,[],true,sentFiles,sentText,aiText);
+      saveChatToHistory((sentFiles[0]?.name||'Drawing').slice(0,40));
+    }catch(err){
+      rmLoad();
+      let msg = err.name==='AbortError'
+        ? 'Drawing analysis timeout (2 min). Try uploading a smaller/clearer PDF or PNG image instead.'
+        : err.message;
+      addMsgEl('ai',`**Drawing Analysis Error:** ${msg}\n\n💡 **Tip:** Upload drawing as PNG/JPG image for best results. Large PDFs with many pages may timeout.`);
     }
     busy=false;document.getElementById('sbtn').disabled=false;
     return;
