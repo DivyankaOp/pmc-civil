@@ -115,16 +115,11 @@ function parseDXF(dxfContent) {
     const x1 = parseFloat(p[10]) || 0, y1 = parseFloat(p[20]) || 0;
     const x2 = parseFloat(p[13]) || 0, y2 = parseFloat(p[23]) || 0;
     const measured = parseFloat(p[42]);
-    // FIX bug#7: DXF code 70 = dimension type. 2=angular, 3=diameter, 4=radius — skip Euclidean fallback for these
-    const dimType = parseInt(p[70]) || 0;
-    const isAngularOrCurved = (dimType & 7) >= 2; // bits 0-2 encode type; 2=angular,3=diam,4=rad
-    const geom = (!isAngularOrCurved) ? Math.sqrt((x2-x1)**2 + (y2-y1)**2) : null;
+    const geom = Math.sqrt((x2-x1)**2 + (y2-y1)**2);
     updateExtents(x1, y1); updateExtents(x2, y2);
     return {
       dimtext: p[1] || '',
-      dim_type: dimType,
-      value_mm: (!isNaN(measured) && measured > 0) ? measured : (geom || 0),
-      is_estimated: isNaN(measured) || measured <= 0,
+      value_mm: (!isNaN(measured) && measured > 0) ? measured : geom,
       x1, y1, x2, y2,
       xt: parseFloat(p[11]) || 0, yt: parseFloat(p[21]) || 0,
       layer: p[8] || '0', dimstyle: p[3] || ''
@@ -319,33 +314,18 @@ function extractCivilData(parsed, filename) {
     ...Object.values(parsed.blocks).flatMap(b => b.inserts || [])
   ];
 
-  // 1. Scale — FIX-7: expanded regex handles 1:100, 1/100, 1=100, SCALE 1:100
+  // 1. Scale
   let scale = null, scaleFactor = 1;
-  const scaleRE = /(?:scale\s*)?1\s*[:/=]\s*(\d+(?:\.\d+)?)/i;
   for (const t of allTexts) {
-    const m = t.text.match(scaleRE);
+    const m = t.text.match(/1\s*[:/]\s*(\d+(?:\.\d+)?)/);
     if (m) { scale = `1:${m[1]}`; scaleFactor = parseFloat(m[1]); break; }
-    // Also catch "NTS" / "NOT TO SCALE"
-    if (/\b(NTS|NOT\s+TO\s+SCALE)\b/i.test(t.text)) { scale = 'NTS'; break; }
   }
+
   // 2. Unit factor → mm
   const u2m = parsed.units === 'm' ? 1000 : parsed.units === 'cm' ? 10 : parsed.units === 'ft' ? 304.8 : parsed.units === 'in' ? 25.4 : 1;
 
   // 3. Extents
   const ext = parsed.extents;
-
-  // Fallback scale inference from extents vs A1 paper (841×594mm)
-  if ((!scale || scale === 'NTS') && ext) {
-    const dwgW = Math.abs((ext.maxX || 0) - (ext.minX || 0)) * u2m; // drawing width in mm
-    const dwgH = Math.abs((ext.maxY || 0) - (ext.minY || 0)) * u2m;
-    if (dwgW > 0 && dwgH > 0) {
-      const inferredFactor = Math.round(Math.max(dwgW / 841, dwgH / 594) / 50) * 50; // round to nearest 50
-      if (inferredFactor >= 50 && inferredFactor <= 5000) {
-        scale = scale || `1:${inferredFactor} (inferred from extents)`;
-        scaleFactor = scaleFactor === 1 ? inferredFactor : scaleFactor;
-      }
-    }
-  }
   const extW = (ext.xmax - ext.xmin) * u2m;
   const extH = (ext.ymax - ext.ymin) * u2m;
 
@@ -396,23 +376,18 @@ function extractCivilData(parsed, filename) {
     .sort((a, b) => b.area_sqm - a.area_sqm);
 
   // 7. Room annotations from text
-  // FIX bug#5: Expanded space regex to catch custom names: OFFICE CABIN, GYM AREA, CLUB HOUSE, etc.
-  const spaceRE = /bed\s*room|bedroom|living|drawing\s*room|dining|kitchen|bath|toilet|wc|passage|corridor|lobby|hall|store|staircase|stair|lift|balcony|terrace|utility|servant|garage|office|cabin|gym|club|reception|conference|meeting|server\s*room|pantry|lounge|flat|unit|room|area|court|garden|parking|podium|ramp|duct|shaft/i;
+  const spaceRE = /bed\s*room|bedroom|living|drawing\s*room|dining|kitchen|bath|toilet|wc|passage|corridor|lobby|hall|store|staircase|stair|lift|balcony|terrace|utility|servant|garage|office|flat|unit|room/i;
   const roomAnnotations = allTexts
     .filter(t => spaceRE.test(t.text))
     .map(t => ({ text: t.text.trim(), x: t.x, y: t.y, layer: t.layer }));
 
-  // 8. Inline dimension text (e.g. "3000x4500", "3.0m × 4.5m", "3.0 x 4.5m")
+  // 8. Inline dimension text (e.g. "3000x4500")
   const inlineDims = [];
-  // FIX-6: Handle optional unit suffix (m/mm) and spaces around separator
-  const dimRE = /(\d+(?:\.\d+)?)\s*(m{1,2})?\s*[xX×]\s*(\d+(?:\.\d+)?)\s*(m{1,2})?/g;
+  const dimRE = /(\d+(?:\.\d+)?)\s*[xX×]\s*(\d+(?:\.\d+)?)/g;
   for (const t of allTexts) {
     let m;
     while ((m = dimRE.exec(t.text)) !== null) {
-      // Normalize to mm: if unit is 'm' multiply by 1000, else use as-is (assume mm)
-      const unit1 = (m[2] || '').toLowerCase(), unit2 = (m[4] || '').toLowerCase();
-      const toMm = (val, unit) => unit === 'm' ? parseFloat(val) * 1000 : parseFloat(val) * u2m;
-      const l = toMm(m[1], unit1), w = toMm(m[3], unit2);
+      const l = parseFloat(m[1]) * u2m, w = parseFloat(m[2]) * u2m;
       if (l > 50 && w > 50) inlineDims.push({ label: t.text, length_mm: Math.round(l), width_mm: Math.round(w), area_sqm: Math.round(l*w/1e6*100)/100, layer: t.layer });
     }
   }
@@ -440,15 +415,27 @@ function extractCivilData(parsed, filename) {
   // 12. Unique text list
   const uniqueTexts = [...new Set(allTexts.map(t => t.text.trim()))].filter(Boolean);
 
+  // 13. Counts from drawing — doors, windows, lifts, stairs, floors, rooms
+  const counts = countDrawingElements(allTexts, allInserts, blockCounts, Object.keys(layerGroups));
+
+  // 14. Wall length from LINE entities on wall layers (metres)
+  const wallLines = parsed.entities.filter(e => e.type === 'LINE' && /wall|brick|masonry/i.test(e.layer || ''));
+  const totalWallLenMm = wallLines.reduce((s, l) => s + Math.sqrt((l.x2-l.x1)**2 + (l.y2-l.y1)**2) * u2m, 0);
+
+  // 15. Project type — classify the drawing (high-rise / commercial / cafe / institute / road / generic)
+  const extAreaSqm = (extW / 1000) * (extH / 1000);
+  const projectType = detectProjectType(allTexts, filename || '', counts.floor_count, extAreaSqm);
+
   return {
     filename,
     drawing_type:    drawingType,
+    project_type:    projectType.type,
+    project_type_detail: projectType,
     scale, scale_factor: scaleFactor,
     units: parsed.units, unit_to_mm: u2m,
     drawing_extents: { width_mm: Math.round(extW), height_mm: Math.round(extH), width_m: Math.round(extW/1000*100)/100, height_m: Math.round(extH/1000*100)/100 },
     title_block:     titleBlock,
     all_texts:       uniqueTexts,
-    _raw_texts:      allTexts.map(t => ({ text: t.text, x: t.x, y: t.y, layer: t.layer })),  // FIX-4: expose positioned texts for ANNOTATIONS sheet
     room_annotations: roomAnnotations,
     layer_names:     Object.keys(layerGroups).filter(Boolean),
     layer_groups:    layerGroups,
@@ -456,6 +443,8 @@ function extractCivilData(parsed, filename) {
     inline_dims:     inlineDims,
     polyline_areas:  polylineAreas.slice(0, 300),
     block_counts:    blockCounts,
+    element_counts:  counts,               // doors/windows/lifts/stairs/rooms
+    wall_length_m:   Math.round(totalWallLenMm / 1000 * 100) / 100,
     stats: {
       total_texts:     allTexts.length,
       total_dims:      allDims.length,
@@ -468,6 +457,142 @@ function extractCivilData(parsed, filename) {
   };
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Count doors / windows / lifts / staircases / floors / rooms
+// by inspecting block names, insert references, text annotations,
+// and layer names. Everything comes FROM the drawing — no defaults.
+// ─────────────────────────────────────────────────────────────────
+function countDrawingElements(allTexts, allInserts, blockCounts, layerNames) {
+  const out = {
+    door_count:       0,
+    window_count:     0,
+    lift_count:       0,
+    staircase_count:  0,
+    column_count:     0,
+    beam_count:       0,
+    footing_count:    0,
+    toilet_count:     0,
+    kitchen_count:    0,
+    bedroom_count:    0,
+    floor_count:      0,
+    floor_labels:     [],
+    room_types:       {},
+    source_notes:     []
+  };
+
+  const matchers = {
+    door_count:      /^(?:.*[_-])?(dr|door|dwr)\d*$/i,
+    window_count:    /^(?:.*[_-])?(win|window|wnd)\d*$/i,
+    lift_count:      /^(?:.*[_-])?(lift|elevator|elev)\d*$/i,
+    staircase_count: /^(?:.*[_-])?(stair|staircase|step|stc)\d*$/i,
+    column_count:    /^(?:.*[_-])?(col|column|cl)\d*$/i,
+    beam_count:      /^(?:.*[_-])?(beam|bm)\d*$/i,
+    footing_count:   /^(?:.*[_-])?(footing|ftg|foot)\d*$/i
+  };
+
+  // 1. Count from BLOCK INSERTs — each insert is a physical instance
+  for (const [blockName, n] of Object.entries(blockCounts || {})) {
+    for (const [field, re] of Object.entries(matchers)) {
+      if (re.test(blockName)) {
+        out[field] += n;
+        out.source_notes.push(`${field.replace('_count','')}: +${n} from block "${blockName}"`);
+      }
+    }
+  }
+
+  // 2. Also count from layer names if any layer is explicitly for doors/windows/etc.
+  //    We count INSERTs on that layer (fallback when block name doesn't match).
+  const layerMatchers = {
+    door_count:      /door/i,
+    window_count:    /window|glazing/i,
+    lift_count:      /lift|elev/i,
+    staircase_count: /stair/i,
+    column_count:    /column/i,
+    beam_count:      /beam/i,
+    footing_count:   /footing/i
+  };
+  for (const ins of allInserts) {
+    const bn = ins.block || '';
+    const ly = ins.layer || '';
+    // Skip if we already matched this instance via block-name regex
+    let matchedByBlock = false;
+    for (const re of Object.values(matchers)) if (re.test(bn)) { matchedByBlock = true; break; }
+    if (matchedByBlock) continue;
+    for (const [field, re] of Object.entries(layerMatchers)) {
+      if (re.test(ly)) {
+        out[field] += 1;
+        out.source_notes.push(`${field.replace('_count','')}: +1 from insert on layer "${ly}"`);
+        break;
+      }
+    }
+  }
+
+  // 3. Room-type counts and floor labels — from text annotations
+  const roomRegexes = [
+    ['toilet_count',   /(toilet|w\.?c|bath(room)?)/i],
+    ['kitchen_count',  /(kitchen|pantry)/i],
+    ['bedroom_count',  /(bed\s*room|bedroom|m\.?\s*bed|master\s*bed)/i],
+    ['lift_count',     /^\s*(lift|elevator)\b/i],     // lift text label
+    ['staircase_count',/^\s*(stair|staircase)\b/i]
+  ];
+  const floorRE = /\b(ground\s*floor|g\.?\s*floor|gf|first\s*floor|1st\s*floor|second\s*floor|2nd\s*floor|third\s*floor|3rd\s*floor|fourth\s*floor|4th\s*floor|fifth\s*floor|5th\s*floor|\d+(?:st|nd|rd|th)\s*floor|basement|parking|podium|terrace|mezzanine)\b/i;
+  const floorSchemeRE = /\b(b?\+?g\+\d+)\b/i;   // e.g. "B+G+5", "G+7"
+
+  const seenFloors = new Set();
+  for (const t of allTexts) {
+    const txt = (t.text || '').trim();
+    if (!txt) continue;
+
+    for (const [field, re] of roomRegexes) {
+      if (re.test(txt)) {
+        // For bedroom/toilet/kitchen — count once per occurrence;
+        // for lift/staircase — only add if not already counted from blocks
+        if (field === 'lift_count' || field === 'staircase_count') {
+          if (out[field] === 0) {
+            out[field] += 1;
+            out.source_notes.push(`${field.replace('_count','')}: +1 from text "${txt.slice(0,30)}"`);
+          }
+        } else {
+          out[field] += 1;
+        }
+        const key = field.replace('_count','');
+        out.room_types[key] = (out.room_types[key] || 0) + 1;
+      }
+    }
+
+    // Floor labels
+    let m = txt.match(floorRE);
+    if (m) {
+      const label = m[0].toUpperCase().trim();
+      if (!seenFloors.has(label)) {
+        seenFloors.add(label);
+        out.floor_labels.push(label);
+      }
+    }
+    // Floor scheme "B+G+N" or "G+N"
+    m = txt.match(floorSchemeRE);
+    if (m) {
+      const scheme = m[1].toUpperCase();
+      const hasBasement = /^B/.test(scheme);
+      const topMatch = scheme.match(/\+(\d+)/);
+      const upper = topMatch ? parseInt(topMatch[1]) : 0;
+      const total = 1 /* ground */ + upper + (hasBasement ? 1 : 0);
+      if (total > out.floor_count) {
+        out.floor_count = total;
+        out.source_notes.push(`floor_count: ${total} from scheme "${scheme}"`);
+      }
+    }
+  }
+
+  // If no scheme found, fall back to distinct floor labels
+  if (out.floor_count === 0 && out.floor_labels.length > 0) {
+    out.floor_count = out.floor_labels.length;
+    out.source_notes.push(`floor_count: ${out.floor_count} from ${out.floor_labels.length} distinct floor labels`);
+  }
+
+  return out;
+}
+
 function inferDrawingType(layers, texts, filename) {
   const all = [...layers, ...texts, filename].join(' ').toLowerCase();
   if (/section|sectional/.test(all))                 return 'SECTION';
@@ -478,6 +603,87 @@ function inferDrawingType(layers, texts, filename) {
   if (/rcc|reinforcement|bbs/.test(all))             return 'STRUCTURAL';
   if (/detail/.test(all))                            return 'DETAIL';
   return 'GENERAL';
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Classify what KIND of building/site this drawing is of.
+// Used to pick the correct BOQ builder downstream.
+// Scored by keyword hits + structural signals (floor count, area).
+// ─────────────────────────────────────────────────────────────────
+function detectProjectType(allTexts, filename, floorCount, extAreaSqm) {
+  const hay = [
+    ...(allTexts || []).map(t => (t && t.text ? t.text : String(t || ''))),
+    filename || ''
+  ].join(' ').toLowerCase();
+
+  const score = {
+    high_rise_residential: 0,
+    commercial:            0,
+    institute:             0,
+    cafe:                  0,
+    road_site:             0,
+    industrial:            0
+  };
+  const notes = [];
+
+  const buckets = {
+    high_rise_residential: [
+      /\bapartment/i, /\bflat(s)?\b/i, /\btower\b/i, /\bresidential/i,
+      /\bbhk\b/i, /\bunit\s*(plan|type)/i, /\bpent\s*house/i, /\bpodium/i,
+      /\brefuge\s*area/i, /\bsociety\b/i, /\bmasterbed|master\s*bed/i
+    ],
+    commercial: [
+      /\bshop\b/i, /\bretail\b/i, /\bshowroom/i, /\bmall\b/i, /\boffice\b/i,
+      /\bcommercial/i, /\batrium/i, /\bfood\s*court/i, /\bfoyer\b/i
+    ],
+    institute: [
+      /\bclass\s*room/i, /\bclassroom/i, /\blab(oratory)?\b/i,
+      /\blibrary\b/i, /\bauditorium/i, /\bstaff\s*room/i, /\bprincipal/i,
+      /\bschool\b/i, /\bcollege\b/i, /\buniversity/i, /\bhostel\b/i,
+      /\binstitute/i, /\bacademy/i, /\blecture\s*hall/i
+    ],
+    cafe: [
+      /\bcafe\b/i, /\brestaurant/i, /\bkitchen\s*(area|counter)/i,
+      /\bseating\s*(area|plan)/i, /\bcounter\b/i, /\bdine\s*in/i,
+      /\bbar\s*(counter|area)/i, /\bmenu\b/i, /\bcoffee\b/i
+    ],
+    road_site: [
+      /\bchainage/i, /\bcarriageway/i, /\bshoulder/i, /\bculvert/i,
+      /\bhighway/i, /\bpavement/i, /\bgsb\b/i, /\bwmm\b/i, /\bpqc\b/i,
+      /\bcross\s*section/i, /\bl-?section/i, /\bmedian\b/i, /\bchain\s*age/i
+    ],
+    industrial: [
+      /\bwarehouse/i, /\bfactory/i, /\bgodown/i, /\bshed\b/i,
+      /\bmachine\s*room/i, /\bprocess\s*area/i, /\bpeb\b/i
+    ]
+  };
+
+  for (const [type, regs] of Object.entries(buckets)) {
+    for (const re of regs) {
+      const matches = hay.match(new RegExp(re.source, 'gi'));
+      if (matches && matches.length) {
+        score[type] += matches.length;
+      }
+    }
+  }
+
+  // Structural signals
+  const fc = Number(floorCount) || 0;
+  const area = Number(extAreaSqm) || 0;
+
+  if (fc >= 5) { score.high_rise_residential += 3; notes.push(`+3 high_rise: ${fc} floors`); }
+  if (fc >= 10) { score.high_rise_residential += 3; notes.push(`+3 high_rise: ${fc}≥10 floors`); }
+  if (fc === 1 && area > 0 && area < 500) { score.cafe += 2; notes.push('+2 cafe: single floor < 500 sqm'); }
+  if (fc <= 2 && /chainage|carriageway|pavement/i.test(hay)) { score.road_site += 3; notes.push('+3 road_site: road keywords'); }
+
+  // Pick winner
+  let winner = 'generic', top = 0;
+  for (const [type, s] of Object.entries(score)) {
+    if (s > top) { top = s; winner = type; }
+  }
+  if (top === 0) winner = 'generic';
+
+  return { type: winner, scores: score, notes };
 }
 
 function shoelaceArea(pts) {
@@ -510,4 +716,4 @@ function extractTotalAreaSqft(dxfContent) {
   return Math.round(total * 100) / 100;
 }
 
-module.exports = { parseDXF, extractCivilData, extractTotalAreaSqft, RATES };
+module.exports = { parseDXF, extractCivilData, extractTotalAreaSqft, detectProjectType, RATES };
