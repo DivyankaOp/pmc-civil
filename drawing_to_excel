@@ -4,42 +4,30 @@
  */
 
 const ExcelJS = require('exceljs');
+const fs   = require('fs');
+const path = require('path');
 
-// ── GUJARAT DSR 2025 RATES ──────────────────────────────────────
-const DSR = {
-  // Roads
-  soil_stabilization_sqmt:  82,
-  soil_filling_cum:         285,
-  gsb_300mm_sqmt:           655,
-  wmm_200mm_sqmt:           515,
-  pqc_250mm_sqmt:           1800,
-  asphalt_sqmt:             900,
-  paver_block_sqmt:         1040,
-  service_corridor_sqmt:    1790,
-  kerbing_rmt:              130,
-  plot_boundary_rmt:        5000,
-  street_light_nos:         45000,
-  // Structure
-  rcc_m20_cum:              5200,
-  rcc_m25_cum:              5500,
-  rcc_m30_cum:              5800,
-  pcc_m10_cum:              3800,
-  brickwork_230_cum:        4675,
-  brickwork_115_cum:        4675,
-  plaster_sqmt:             350,
-  steel_fe500_kg:           56,
-  // Civil
-  excavation_cum:           175,
-  cp_wall_rmt:              8600,
-  gabion_wall_rmt:          14100,
-  // Services
-  pipeline_rmt:             4500,
-  stp_per_mld:              25000000,
-  borewell_nos:             75000,
-  water_treatment:          20000000,
-  water_pipeline_rmt:       3500,
-  electrical_ls:            25000000,
-};
+// ── RATES from rates.json (single source of truth) ──────────────
+// No rates hardcoded here. Rates only loaded from rates.json.
+let DSR = {};
+try {
+  const raw = JSON.parse(fs.readFileSync(path.join(__dirname, 'rates.json'), 'utf8'));
+  for (const category of Object.values(raw)) {
+    if (typeof category === 'object' && !Array.isArray(category)) {
+      for (const [key, val] of Object.entries(category)) {
+        if (val && typeof val.rate === 'number') DSR[key] = val.rate;
+      }
+    }
+  }
+  // Aliases so existing references keep working (same rate, different key)
+  DSR.brickwork_230_cum  = DSR.brickwork_230_cum  || DSR.brickwork_230mm_cum;
+  DSR.brickwork_115_cum  = DSR.brickwork_115_cum  || DSR.brickwork_115mm_cum;
+  DSR.plaster_sqmt       = DSR.plaster_sqmt       || DSR.plaster_15mm_sqmt;
+  DSR.cp_wall_rmt        = DSR.cp_wall_rmt        || DSR.compound_wall_rmt;
+  DSR.plot_boundary_rmt  = DSR.plot_boundary_rmt  || DSR.compound_wall_rmt;
+} catch (e) {
+  console.warn('rates.json not loaded:', e.message);
+}
 
 // ── EXCEL STYLES (matching original template) ──────────────────
 const C = {
@@ -132,106 +120,69 @@ function mkGrandTotal(ws, row, label, lacs, cols) {
 // GEMINI DRAWING ANALYSIS PROMPT
 // ══════════════════════════════════════════════════════════════════
 function getDrawingPrompt() {
-  return `You are a SENIOR PMC CIVIL ENGINEER. Analyze this drawing with MAXIMUM PRECISION.
+  return `You are a SENIOR PMC CIVIL ENGINEER. Read THIS drawing and extract ONLY values that are visibly annotated in it.
 
-STEP 1 - IDENTIFY DRAWING TYPE:
-- ROAD_LAYOUT: roads, streets, carriageways
-- BUILDING: floor plans, sections, elevations  
-- COMPOUND_WALL: boundary walls, gates
-- DRAINAGE: storm water, sewage pipes
-- SITE_LAYOUT: master plan, plot layout
-- STRUCTURE: RCC, foundations, BBS
+CRITICAL RULES (NEVER BREAK):
+1. Do NOT invent, guess, estimate, or carry over numbers from other drawings.
+2. If a value is not clearly annotated or readable in THIS drawing, set it to 0 or null.
+3. The example structure below uses placeholder zeros — DO NOT copy those numbers; extract your own from the drawing.
+4. Every number you return must trace back to a specific dimension text, label, or scaled measurement visible in the drawing.
+5. If you are not certain, leave the field at 0/null rather than filling it in.
 
-STEP 2 - READ SCALE & TITLE BLOCK:
-Extract: project name, drawing number, scale, date, location
+STEP 1 — IDENTIFY DRAWING TYPE: ROAD_LAYOUT / BUILDING / COMPOUND_WALL / DRAINAGE / SITE_LAYOUT / STRUCTURE
 
-STEP 3 - EXTRACT ALL DIMENSIONS:
-For each element found, read EVERY dimension annotation.
+STEP 2 — READ TITLE BLOCK: project name, drawing no, scale, date, location (only if printed).
 
-STEP 4 - CALCULATE QUANTITIES:
-Use exact dimensions. Apply these formulas:
+STEP 3 — READ EVERY DIMENSION ANNOTATION, ROOM LABEL, CALL-OUT, LEVEL MARK.
+
+STEP 4 — COUNT ELEMENTS VISIBLE IN DRAWING (doors, windows, lifts, staircases, floors, rooms, columns, footings). Count what you can actually see — no assumptions.
+
+STEP 5 — COMPUTE QUANTITIES USING ONLY READ DIMENSIONS. Formulas:
 - Road area = length × carriage_width
-- GSB ton = area × 1.15 × 0.300 × 1800 kg/cum  (15% compaction)
-- WMM ton = area × 1.15 × 0.200 × 2100 kg/cum
-- PQC cum = area × 1.05 × 0.250               (5% wastage)
+- GSB ton = area × 1.15 × 0.300 × 1.800
+- WMM ton = area × 1.15 × 0.200 × 2.100
+- PQC cum = area × 1.05 × 0.250
 - Steel dowel kg = area × 3.87
-- Service corridor area = road_length × corridor_width
-- Soil filling cum = sub_base_area × filling_depth
-- Street lights = road_length / 20 (every 20m)
 - RCC volume = length × width × depth
-- Steel for RCC = volume × 120 kg/cum (slabs), 160 kg/cum (beams)
-- Brickwork cum = length × height × thickness
+- Steel for RCC = volume × 120 kg/cum (slab), 160 kg/cum (beam)
+- Brickwork cum = length × height × thickness  (all three must be read from drawing)
 
-RETURN ONLY THIS JSON (no markdown, no backticks):
+RETURN ONLY RAW JSON (no markdown, no backticks). All numeric fields default to 0 if not read from drawing. All string fields default to "" if not read. Arrays default to []:
 {
-  "drawing_type": "ROAD_LAYOUT",
-  "project_name": "from title block",
-  "location": "from drawing",
-  "scale": "1:500",
-  "date": "DD-MM-YYYY",
-  "total_area_sqmt": 264136.31,
-  "confidence": "HIGH",
-  
+  "drawing_type": "",
+  "project_name": "",
+  "location": "",
+  "scale": "",
+  "date": "",
+  "total_area_sqmt": 0,
+  "confidence": "LOW|MEDIUM|HIGH based on how much you could actually read",
+
   "roads": [
-    {
-      "id": "R1",
-      "road_no": "R1", 
-      "total_width_m": 24,
-      "carriage_width_m": 15,
-      "length_m": 129.12,
-      "sc_width_m": 9,
-      "road_top_level": 49.95,
-      "ngl": 48.796,
-      "remark": "4.5-4.5 MT B/S SERVICES"
-    }
+    { "id": "", "road_no": "", "total_width_m": 0, "carriage_width_m": 0, "length_m": 0, "sc_width_m": 0, "road_top_level": 0, "ngl": 0, "remark": "" }
   ],
-  
+
   "buildings": [
-    {
-      "id": "B1",
-      "name": "Admin Block",
-      "floors": 2,
-      "plinth_area_sqmt": 500,
-      "total_built_up_sqmt": 1000,
-      "wall_length_rmt": 120,
-      "wall_height_m": 3.0,
-      "slab_area_sqmt": 500,
-      "slab_thickness_m": 0.15
-    }
+    { "id": "", "name": "", "floors": 0, "plinth_area_sqmt": 0, "total_built_up_sqmt": 0, "wall_length_rmt": 0, "wall_height_m": 0, "wall_thickness_m": 0, "slab_area_sqmt": 0, "slab_thickness_m": 0 }
   ],
-  
-  "compound_wall": {
-    "total_length_rmt": 3164.73,
-    "gabion_length_rmt": 605,
-    "cp_wall_length_rmt": 3164.73,
-    "height_m": 2.5,
-    "section_type": "CP_WALL"
-  },
-  
-  "drainage": {
-    "pipe_length_rmt": 6530,
-    "pipe_dia_mm": 450,
-    "culvert_nos": 2,
-    "culvert_width_m": 11.25,
-    "culvert_span_m": 24
-  },
-  
-  "structure": {
-    "element_type": "SLAB/BEAM/FOOTING",
-    "dimensions": {},
-    "reinforcement": []
-  },
-  
-  "site_details": {
-    "total_area_sqmt": 264136.31,
-    "road_area_sqmt": 36429.32,
-    "green_area_sqmt": 17811.88,
-    "plot_boundary_rmt": 6530.9,
-    "service_corridor_area_sqmt": 16843.73
-  },
-  
-  "extracted_dimensions": ["R1=129.12m", "W=24m"],
-  "pmcnotes": ["observations from drawing"]
+
+  "compound_wall": { "total_length_rmt": 0, "gabion_length_rmt": 0, "cp_wall_length_rmt": 0, "height_m": 0, "section_type": "" },
+
+  "drainage": { "pipe_length_rmt": 0, "pipe_dia_mm": 0, "culvert_nos": 0, "culvert_width_m": 0, "culvert_span_m": 0 },
+
+  "structure": { "element_type": "", "dimensions": {}, "reinforcement": [] },
+
+  "site_details": { "total_area_sqmt": 0, "road_area_sqmt": 0, "green_area_sqmt": 0, "plot_boundary_rmt": 0, "service_corridor_area_sqmt": 0 },
+
+  "element_counts": { "door_count": 0, "window_count": 0, "lift_count": 0, "staircase_count": 0, "column_count": 0, "footing_count": 0, "toilet_count": 0, "kitchen_count": 0, "bedroom_count": 0, "floor_count": 0 },
+
+  "soil_filling_cum": 0,
+  "stp_mld": 0,
+  "electrical_ls_inr": 0,
+  "street_lights_nos": 0,
+  "contingency_pct": 0,
+
+  "extracted_dimensions": [],
+  "pmcnotes": []
 }`;
 }
 
@@ -264,18 +215,31 @@ function buildBlockCost(wb, data) {
   let grandTotal = 0;
   let srNo = 1;
 
-  // Roads section (if applicable)
+  // Roads section — values ONLY from drawing data, no guesses.
+  // Skip a row if required dimension is missing in the drawing.
   if(dtype==='ROAD_LAYOUT'||dtype==='SITE_LAYOUT'||roads.length>0) {
-    const totalArea = roads.reduce((s,r)=>s+((r.length_m||0)*(r.carriage_width_m||0)),0);
-    const soilFill = (data.soil_filling_cum||totalArea*0.65)*DSR.soil_filling_cum/100000;
-    const gsb = totalArea*DSR.gsb_300mm_sqmt/100000;
-    const wmm = totalArea*DSR.wmm_200mm_sqmt/100000;
-    const pqc = totalArea*DSR.pqc_250mm_sqmt/100000;
-    const steel = (totalArea*3.87*DSR.steel_fe500_kg)/100000;
-    const sc_area = site.service_corridor_area_sqmt||roads.reduce((s,r)=>s+(r.length_m||0)*(r.sc_width_m||5),0);
-    const sc_cost = sc_area*DSR.service_corridor_sqmt/100000;
-    const pb = (site.plot_boundary_rmt||0)*DSR.plot_boundary_rmt/100000;
-    const roadTotal = soilFill+gsb+wmm+pqc+steel+sc_cost+pb;
+    // Only include roads that have both length AND carriage width from drawing
+    const validRoads = roads.filter(r => (r.length_m||0) > 0 && (r.carriage_width_m||0) > 0);
+    const totalArea = validRoads.reduce((s,r)=>s+(r.length_m*r.carriage_width_m),0);
+
+    // soil filling: only if drawing-derived value is available
+    const soilFillCum = (typeof data.soil_filling_cum === 'number' && data.soil_filling_cum > 0) ? data.soil_filling_cum : null;
+    const soilFill = soilFillCum ? soilFillCum*DSR.soil_filling_cum/100000 : null;
+
+    const gsb   = totalArea>0 ? totalArea*DSR.gsb_300mm_sqmt/100000 : null;
+    const wmm   = totalArea>0 ? totalArea*DSR.wmm_200mm_sqmt/100000 : null;
+    const pqc   = totalArea>0 ? totalArea*DSR.pqc_250mm_sqmt/100000 : null;
+    const steel = totalArea>0 ? (totalArea*3.87*DSR.steel_fe500_kg)/100000 : null;
+
+    // Service corridor: only from explicit drawing values. No "default 5m width".
+    const scFromRoads = roads
+      .filter(r => (r.length_m||0)>0 && (r.sc_width_m||0)>0)
+      .reduce((s,r)=>s+r.length_m*r.sc_width_m,0);
+    const sc_area = site.service_corridor_area_sqmt || (scFromRoads>0 ? scFromRoads : 0);
+    const sc_cost = sc_area>0 ? sc_area*DSR.service_corridor_sqmt/100000 : null;
+
+    const pb = (site.plot_boundary_rmt||0)>0 ? site.plot_boundary_rmt*DSR.plot_boundary_rmt/100000 : null;
+    const roadTotal = (soilFill||0)+(gsb||0)+(wmm||0)+(pqc||0)+(steel||0)+(sc_cost||0)+(pb||0);
 
     const addRow = (sr,label,qty,unit,rate,lacs,rem='') => {
       ws.getCell(row,1).value=sr||''; sc(ws.getCell(row,1),sr?null:null,!!sr,C.BLACK,sr?12:11,'center'); ws.getCell(row,1).border=bdr;
@@ -290,35 +254,40 @@ function buildBlockCost(wb, data) {
     };
 
     addRow(srNo++,'ROADS','','','','');
-    addRow(null,'SOIL FILLING IN ROAD AREA', Math.round((data.soil_filling_cum||totalArea*0.65)*100)/100,'CUM',DSR.soil_filling_cum,soilFill);
-    addRow(null,'GSB FILLING (300 MM LAYER)',Math.round(totalArea*100)/100,'SQMT',DSR.gsb_300mm_sqmt,gsb);
-    addRow(null,'WMM FILLING (200 MM LAYER)',Math.round(totalArea*100)/100,'SQMT',DSR.wmm_200mm_sqmt,wmm);
-    addRow(null,'RCC ROAD WORK (250 MM PQC)',Math.round(totalArea*100)/100,'SQMT',DSR.pqc_250mm_sqmt,pqc,'250 MM PQC (M30)');
-    addRow(null,'STEEL FOR DOWEL BAR',Math.round(totalArea*3.87/1000*100)/100,'TON',56000,steel);
-    if(sc_area>0) addRow(null,'SERVICE CORRIDOR',Math.round(sc_area*100)/100,'SQMT',DSR.service_corridor_sqmt,sc_cost,'YELLOW SOIL+GSB+PAVER BLOCK');
-    if(pb>0) addRow(null,'PLOT BOUNDARY WITH ROAD BEAM',(site.plot_boundary_rmt||0),'RMT',DSR.plot_boundary_rmt,pb);
+    if(soilFillCum!==null) addRow(null,'SOIL FILLING IN ROAD AREA', Math.round(soilFillCum*100)/100,'CUM',DSR.soil_filling_cum,soilFill);
+    if(gsb!==null)         addRow(null,'GSB FILLING (300 MM LAYER)',Math.round(totalArea*100)/100,'SQMT',DSR.gsb_300mm_sqmt,gsb);
+    if(wmm!==null)         addRow(null,'WMM FILLING (200 MM LAYER)',Math.round(totalArea*100)/100,'SQMT',DSR.wmm_200mm_sqmt,wmm);
+    if(pqc!==null)         addRow(null,'RCC ROAD WORK (250 MM PQC)',Math.round(totalArea*100)/100,'SQMT',DSR.pqc_250mm_sqmt,pqc,'250 MM PQC (M30)');
+    if(steel!==null)       addRow(null,'STEEL FOR DOWEL BAR',Math.round(totalArea*3.87/1000*100)/100,'TON',DSR.steel_fe500_kg*1000,steel);
+    if(sc_area>0)          addRow(null,'SERVICE CORRIDOR',Math.round(sc_area*100)/100,'SQMT',DSR.service_corridor_sqmt,sc_cost,'YELLOW SOIL+GSB+PAVER BLOCK');
+    if(pb!==null)          addRow(null,'PLOT BOUNDARY WITH ROAD BEAM',site.plot_boundary_rmt,'RMT',DSR.plot_boundary_rmt,pb);
     row = mkSubtotal(ws, row, 'SUBTOTAL - ROADS', roadTotal, COLS);
     grandTotal += roadTotal;
   }
 
-  // Buildings section
+  // Buildings section — all dimensions MUST come from drawing.
+  // If slab thickness / wall height not in drawing, that line item is skipped.
   if(dtype==='BUILDING'||dtype==='SITE_LAYOUT') {
     const bldgs = data.buildings||[];
     const bldgTotal = bldgs.reduce((s,b)=>{
-      const rcc = (b.slab_area_sqmt||0)*(b.slab_thickness_m||0.15)*DSR.rcc_m25_cum/100000;
-      const brick = (b.wall_length_rmt||0)*(b.wall_height_m||3)*0.23*DSR.brickwork_230_cum/100000;
-      const plaster = (b.wall_length_rmt||0)*(b.wall_height_m||3)*2*DSR.plaster_sqmt/100000;
+      const slabThk = b.slab_thickness_m > 0 ? b.slab_thickness_m : null;
+      const wallH   = b.wall_height_m    > 0 ? b.wall_height_m    : null;
+      const wallThk = b.wall_thickness_m > 0 ? b.wall_thickness_m : null;  // must be in drawing
+      const rcc     = (b.slab_area_sqmt && slabThk) ? b.slab_area_sqmt*slabThk*DSR.rcc_m25_cum/100000 : 0;
+      const brick   = (b.wall_length_rmt && wallH && wallThk) ? b.wall_length_rmt*wallH*wallThk*DSR.brickwork_230_cum/100000 : 0;
+      const plaster = (b.wall_length_rmt && wallH) ? b.wall_length_rmt*wallH*2*DSR.plaster_sqmt/100000 : 0;
       return s+rcc+brick+plaster;
     },0);
     if(bldgs.length>0) {
       ws.getCell(row,1).value=srNo++; sc(ws.getCell(row,1),null,true,C.BLACK,12,'center'); ws.getCell(row,1).border=bdr;
       ws.mergeCells(row,2,row,COLS); ws.getCell(row,2).value='BUILDINGS'; sc(ws.getCell(row,2),null,true,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getRow(row).height=18; row++;
       bldgs.forEach(b=>{
-        const rcc=(b.slab_area_sqmt||0)*(b.slab_thickness_m||0.15)*DSR.rcc_m25_cum/100000;
+        const slabThk = b.slab_thickness_m > 0 ? b.slab_thickness_m : 0;
+        const rcc=(b.slab_area_sqmt||0)*slabThk*DSR.rcc_m25_cum/100000;
         ws.getCell(row,2).value=b.name||'BUILDING'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr;
         ws.getCell(row,3).value=b.total_built_up_sqmt||0; ws.getCell(row,3).numFmt='#,##0.00'; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr;
         ws.getCell(row,4).value='SQMT'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr;
-        ws.getCell(row,6).value=rcc; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr;
+        if(rcc>0){ ws.getCell(row,6).value=rcc; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr; }
         ws.getRow(row).height=15; row++;
       });
       row = mkSubtotal(ws, row, 'SUBTOTAL - BUILDINGS', bldgTotal, COLS);
@@ -339,28 +308,34 @@ function buildBlockCost(wb, data) {
     grandTotal += (cp_cost+gab_cost);
   }
 
-  // Services
-  const stp_cost = (data.stp_mld||3)*DSR.stp_per_mld/100000;
-  const elec_cost = DSR.electrical_ls/100000;
-  const sl_nos = data.street_lights_nos||roads.reduce((s,r)=>s+Math.ceil((r.length_m||0)/20),0)||0;
-  const sl_cost = sl_nos*DSR.street_light_nos/100000;
-  const totalServices = stp_cost+elec_cost+sl_cost;
+  // Services — ONLY include if drawing provides the number. No default STP 3 MLD, no ₹25 Cr electrical L/S.
+  const stp_mld  = (typeof data.stp_mld === 'number' && data.stp_mld > 0) ? data.stp_mld : null;
+  const elec_ls  = (typeof data.electrical_ls_inr === 'number' && data.electrical_ls_inr > 0) ? data.electrical_ls_inr : null;
+  const sl_nos   = (typeof data.street_lights_nos === 'number' && data.street_lights_nos > 0) ? data.street_lights_nos : null;
 
-  ws.getCell(row,1).value=srNo++; sc(ws.getCell(row,1),null,true,C.BLACK,12,'center'); ws.getCell(row,1).border=bdr;
-  ws.mergeCells(row,2,row,COLS); ws.getCell(row,2).value='SERVICES (DRAINAGE / UTILITIES)'; sc(ws.getCell(row,2),null,true,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getRow(row).height=18; row++;
-  ws.getCell(row,2).value='SEWAGE TREATMENT PLANT'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getCell(row,3).value=data.stp_mld||3; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr; ws.getCell(row,4).value='MLD'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr; ws.getCell(row,5).value=DSR.stp_per_mld; ws.getCell(row,5).numFmt='#,##0'; sc(ws.getCell(row,5),null,false,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr; ws.getCell(row,6).value=stp_cost; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr; ws.getRow(row).height=15; row++;
-  ws.getCell(row,2).value='ELECTRICAL INFRASTRUCTURE'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getCell(row,3).value=1; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr; ws.getCell(row,4).value='L/S'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr; ws.getCell(row,5).value=DSR.electrical_ls; ws.getCell(row,5).numFmt='#,##0'; sc(ws.getCell(row,5),null,false,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr; ws.getCell(row,6).value=elec_cost; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr; ws.getRow(row).height=15; row++;
-  if(sl_nos>0) { ws.getCell(row,2).value='STREET LIGHTING'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getCell(row,3).value=sl_nos; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr; ws.getCell(row,4).value='NOS'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr; ws.getCell(row,5).value=DSR.street_light_nos; ws.getCell(row,5).numFmt='#,##0'; sc(ws.getCell(row,5),null,false,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr; ws.getCell(row,6).value=sl_cost; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr; ws.getRow(row).height=15; row++; }
-  row = mkSubtotal(ws, row, 'SUBTOTAL - SERVICES', totalServices, COLS);
-  grandTotal += totalServices;
+  const stp_cost  = stp_mld ? stp_mld * DSR.stp_per_mld / 100000 : 0;
+  const elec_cost = elec_ls ? elec_ls / 100000 : 0;
+  const sl_cost   = sl_nos  ? sl_nos * DSR.street_light_nos / 100000 : 0;
+  const totalServices = stp_cost + elec_cost + sl_cost;
 
-  // Grand Total
-  const contingency = grandTotal * 0.10;
-  const finalTotal = grandTotal + contingency;
+  if(totalServices > 0) {
+    ws.getCell(row,1).value=srNo++; sc(ws.getCell(row,1),null,true,C.BLACK,12,'center'); ws.getCell(row,1).border=bdr;
+    ws.mergeCells(row,2,row,COLS); ws.getCell(row,2).value='SERVICES (DRAINAGE / UTILITIES)'; sc(ws.getCell(row,2),null,true,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getRow(row).height=18; row++;
+    if(stp_mld) { ws.getCell(row,2).value='SEWAGE TREATMENT PLANT'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getCell(row,3).value=stp_mld; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr; ws.getCell(row,4).value='MLD'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr; ws.getCell(row,5).value=DSR.stp_per_mld; ws.getCell(row,5).numFmt='#,##0'; sc(ws.getCell(row,5),null,false,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr; ws.getCell(row,6).value=stp_cost; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr; ws.getRow(row).height=15; row++; }
+    if(elec_ls)  { ws.getCell(row,2).value='ELECTRICAL INFRASTRUCTURE'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getCell(row,3).value=1; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr; ws.getCell(row,4).value='L/S'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr; ws.getCell(row,5).value=elec_ls; ws.getCell(row,5).numFmt='#,##0'; sc(ws.getCell(row,5),null,false,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr; ws.getCell(row,6).value=elec_cost; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr; ws.getRow(row).height=15; row++; }
+    if(sl_nos)   { ws.getCell(row,2).value='STREET LIGHTING'; sc(ws.getCell(row,2),null,false,C.BLACK,11,'left'); ws.getCell(row,2).border=bdr; ws.getCell(row,3).value=sl_nos; sc(ws.getCell(row,3),null,false,C.BLACK,11,'right'); ws.getCell(row,3).border=bdr; ws.getCell(row,4).value='NOS'; sc(ws.getCell(row,4),null,false,C.BLACK,11,'center'); ws.getCell(row,4).border=bdr; ws.getCell(row,5).value=DSR.street_light_nos; ws.getCell(row,5).numFmt='#,##0'; sc(ws.getCell(row,5),null,false,C.BLACK,11,'right'); ws.getCell(row,5).border=bdr; ws.getCell(row,6).value=sl_cost; ws.getCell(row,6).numFmt='#,##0.00'; sc(ws.getCell(row,6),null,false,C.BLACK,11,'right'); ws.getCell(row,6).border=bdr; ws.getRow(row).height=15; row++; }
+    row = mkSubtotal(ws, row, 'SUBTOTAL - SERVICES', totalServices, COLS);
+    grandTotal += totalServices;
+  }
+
+  // Grand Total — contingency % ONLY if specified in data (no hardcoded 10%)
+  const contingencyPct = (typeof data.contingency_pct === 'number' && data.contingency_pct > 0) ? data.contingency_pct : 0;
+  const contingency = grandTotal * contingencyPct / 100;
+  const finalTotal  = grandTotal + contingency;
   row++;
   row = mkGrandTotal(ws, row, 'TOTAL COST (PART-A)', grandTotal, COLS);
-  row = mkGrandTotal(ws, row, '10% CONTINGENCY', contingency, COLS);
-  row = mkGrandTotal(ws, row, 'GRAND TOTAL (WITH CONTINGENCY)', finalTotal, COLS);
+  if(contingency > 0) row = mkGrandTotal(ws, row, `${contingencyPct}% CONTINGENCY`, contingency, COLS);
+  if(finalTotal > grandTotal) row = mkGrandTotal(ws, row, 'GRAND TOTAL (WITH CONTINGENCY)', finalTotal, COLS);
   row++;
   ws.mergeCells(row,1,row,4); ws.getCell(row,1).value='LACS'; sc(ws.getCell(row,1),null,true,C.BLACK,11,'right'); ws.getCell(row,1).border=bdr;
   ws.mergeCells(row,5,row,COLS); ws.getCell(row,5).value='CR'; sc(ws.getCell(row,5),null,true,C.BLACK,11,'center'); ws.getCell(row,5).border=bdr;
@@ -397,7 +372,8 @@ function buildRoadEstimate(wb, data) {
 
   roads.forEach((rd,i)=>{
     const L = rd.length_m||0;
-    const CW = rd.carriage_width_m||rd.total_width_m*0.65||0;
+    // Only use carriage_width_m from drawing — no "0.65 of total width" guess
+    const CW = rd.carriage_width_m > 0 ? rd.carriage_width_m : 0;
     const area = L*CW;
     const boxcut = area*1.05;
     const gsb = area*1.15*0.300*1.800;  // ton
@@ -487,16 +463,17 @@ function buildSoilFilling(wb, data) {
 
   roads.forEach((rd,i)=>{
     const bg=i%2===0?C.WHITE:C.ALT_ROW;
-    const CW = rd.carriage_width_m||rd.total_width_m*0.65||0;
-    const subW = CW+0.6;
+    const CW = rd.carriage_width_m > 0 ? rd.carriage_width_m : 0;  // from drawing only
+    const subW = CW > 0 ? CW + 0.6 : 0;
     const L = rd.length_m||0;
     const area = subW*L;
     const A = rd.road_top_level||0;
     const B = rd.ngl||0;
-    const C_depth = 0.75; // GSB+WMM+PQC
+    const C_depth = 0.75; // GSB+WMM+PQC physical layer stack (design constant, not a guess)
     const fillDepth = A>0&&B>0 ? Math.max(0, A-B-C_depth+0.15) : 0;
     const extraFill = fillDepth<0.5 ? Math.max(0,0.5-fillDepth) : 0;
-    const totFillingCum = fillDepth>0 ? area*fillDepth : area*(data.avg_fill_depth||0.65);
+    // Only compute filling if we have real fillDepth from A/B; otherwise skip (no 0.65 default).
+    const totFillingCum = fillDepth>0 ? area*fillDepth : 0;
     const hywas = totFillingCum/14;
     totFill+=totFillingCum; totHywas+=hywas;
 
@@ -554,7 +531,7 @@ function buildServiceCorridor(wb, data) {
   let totLen=0,totArea=0,totSoil=0,totGSB=0,totPaver=0;
   roads.forEach((rd,i)=>{
     const bg=i%2===0?C.WHITE:C.ALT_ROW;
-    const SC_W = rd.sc_width_m||5;
+    const SC_W = rd.sc_width_m > 0 ? rd.sc_width_m : 0;  // only if drawing specifies
     const L=rd.length_m||0;
     const area=L*SC_W;
     const excav=area*1.05;
@@ -677,23 +654,41 @@ function buildBOQ(wb, data) {
 }
 
 function generateBOQFromData(data) {
+  // BOQ rows are generated ONLY when the required dimensions were read from drawing.
+  // No default thickness / height / soil factor is applied.
   const items = [];
   const roads = data.roads||[];
-  const totalArea = roads.reduce((s,r)=>s+(r.length_m||0)*(r.carriage_width_m||0),0);
+  const validRoads = roads.filter(r => (r.length_m||0)>0 && (r.carriage_width_m||0)>0);
+  const totalArea = validRoads.reduce((s,r)=>s+r.length_m*r.carriage_width_m,0);
+
   if(totalArea>0) {
-    items.push({description:'SOIL FILLING IN ROAD AREA', unit:'CUM', qty:Math.round(totalArea*0.65*100)/100, rate:DSR.soil_filling_cum});
+    if(typeof data.soil_filling_cum === 'number' && data.soil_filling_cum > 0) {
+      items.push({description:'SOIL FILLING IN ROAD AREA', unit:'CUM', qty:Math.round(data.soil_filling_cum*100)/100, rate:DSR.soil_filling_cum});
+    }
     items.push({description:'GSB FILLING (300 MM THK)', unit:'SQMT', qty:Math.round(totalArea*100)/100, rate:DSR.gsb_300mm_sqmt});
     items.push({description:'WMM FILLING (200 MM THK)', unit:'SQMT', qty:Math.round(totalArea*100)/100, rate:DSR.wmm_200mm_sqmt});
     items.push({description:'PQC ROAD WORK M30 (250 MM THK)', unit:'SQMT', qty:Math.round(totalArea*100)/100, rate:DSR.pqc_250mm_sqmt});
-    items.push({description:'STEEL DOWEL BAR', unit:'TON', qty:Math.round(totalArea*3.87/1000*100)/100, rate:56000});
+    items.push({description:'STEEL DOWEL BAR', unit:'TON', qty:Math.round(totalArea*3.87/1000*100)/100, rate:DSR.steel_fe500_kg*1000});
   }
+
   const bldgs = data.buildings||[];
   bldgs.forEach(b=>{
-    items.push({description:`RCC WORK - ${b.name}`, unit:'CUM', qty:Math.round((b.slab_area_sqmt||0)*(b.slab_thickness_m||0.15)*100)/100, rate:DSR.rcc_m25_cum});
-    items.push({description:`BRICKWORK - ${b.name}`, unit:'CUM', qty:Math.round((b.wall_length_rmt||0)*(b.wall_height_m||3)*0.23*100)/100, rate:DSR.brickwork_230_cum});
-    items.push({description:`PLASTER - ${b.name}`, unit:'SQMT', qty:Math.round((b.wall_length_rmt||0)*(b.wall_height_m||3)*2*100)/100, rate:DSR.plaster_sqmt});
-    items.push({description:`STEEL - ${b.name}`, unit:'KG', qty:Math.round((b.slab_area_sqmt||0)*(b.slab_thickness_m||0.15)*120*100)/100, rate:DSR.steel_fe500_kg});
+    const slabThk = b.slab_thickness_m > 0 ? b.slab_thickness_m : null;
+    const wallH   = b.wall_height_m    > 0 ? b.wall_height_m    : null;
+    const wallThk = b.wall_thickness_m > 0 ? b.wall_thickness_m : null;
+
+    if(b.slab_area_sqmt && slabThk) {
+      items.push({description:`RCC WORK - ${b.name}`, unit:'CUM', qty:Math.round(b.slab_area_sqmt*slabThk*100)/100, rate:DSR.rcc_m25_cum});
+      items.push({description:`STEEL - ${b.name}`,    unit:'KG',  qty:Math.round(b.slab_area_sqmt*slabThk*120*100)/100, rate:DSR.steel_fe500_kg});
+    }
+    if(b.wall_length_rmt && wallH && wallThk) {
+      items.push({description:`BRICKWORK - ${b.name}`, unit:'CUM', qty:Math.round(b.wall_length_rmt*wallH*wallThk*100)/100, rate:DSR.brickwork_230_cum});
+    }
+    if(b.wall_length_rmt && wallH) {
+      items.push({description:`PLASTER - ${b.name}`, unit:'SQMT', qty:Math.round(b.wall_length_rmt*wallH*2*100)/100, rate:DSR.plaster_sqmt});
+    }
   });
+
   if(data.compound_wall?.cp_wall_length_rmt>0) {
     items.push({description:'COMPOUND WALL (CP WALL)', unit:'RMT', qty:data.compound_wall.cp_wall_length_rmt, rate:DSR.cp_wall_rmt});
   }
@@ -744,17 +739,301 @@ function buildObservations(wb, data) {
 // ══════════════════════════════════════════════════════════════════
 // MAIN BUILD FUNCTION - DECIDES WHICH SHEETS TO CREATE
 // ══════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════
+// PROJECT-TYPE AWARE BOQ BUILDERS
+// Each builder emits sheets appropriate to that project type,
+// reading ONLY from data (no hardcoded fallbacks).
+// ══════════════════════════════════════════════════════════════════
+
+function pickCount(data, key) {
+  if (data?.element_counts && typeof data.element_counts[key] === 'number') return data.element_counts[key];
+  if (typeof data?.[key] === 'number') return data[key];
+  return 0;
+}
+
+function buildCafeBOQ(wb, data) {
+  const ws = wb.addWorksheet('CAFE ESTIMATE');
+  const cols = 8;
+  let r = mkTitle(ws, 1, 'CAFE / RESTAURANT — DRAWING-BASED BOQ', cols);
+  r = mkHeaders(ws, r, ['Sr','Item','Basis (from drawing)','Qty','Unit','Rate','Amount','Source'],
+                       [5, 45, 35, 12, 8, 12, 15, 25]);
+  let total = 0, sr = 1;
+
+  const totalArea  = Number(data.total_area_sqm) || 0;
+  const kitchenN   = pickCount(data, 'kitchen_count');
+  const toiletN    = pickCount(data, 'toilet_count');
+  const doorN      = pickCount(data, 'door_count');
+  const windowN    = pickCount(data, 'window_count');
+  const tileRate   = DSR.floor_tiles_sqmt || DSR.tiles_sqmt || 0;
+  const plasterR   = DSR.plaster_sqmt     || 0;
+  const paintR     = DSR.paint_sqmt       || 0;
+
+  if (totalArea > 0 && tileRate > 0) {
+    const amt = totalArea * tileRate;
+    r = mkDataRow(ws, r, [sr++, 'Floor tiling — seating + counter area', `${totalArea} sqm × ₹${tileRate}`, totalArea, 'sqm', tileRate, amt, 'drawing area'], [3,5,6]);
+    total += amt;
+  }
+  if (totalArea > 0 && plasterR > 0) {
+    const wallSqm = totalArea * 2.5;
+    const amt = wallSqm * plasterR;
+    r = mkDataRow(ws, r, [sr++, 'Internal plaster — walls', `${wallSqm.toFixed(1)} sqm × ₹${plasterR}`, Math.round(wallSqm*100)/100, 'sqm', plasterR, amt, 'area × 2.5 factor'], [3,5,6]);
+    total += amt;
+  }
+  if (totalArea > 0 && paintR > 0) {
+    const wallSqm = totalArea * 2.5;
+    const amt = wallSqm * paintR;
+    r = mkDataRow(ws, r, [sr++, 'Internal paint', `${wallSqm.toFixed(1)} sqm × ₹${paintR}`, Math.round(wallSqm*100)/100, 'sqm', paintR, amt, 'area × 2.5 factor'], [3,5,6]);
+    total += amt;
+  }
+  if (kitchenN > 0) {
+    const rate = DSR.kitchen_platform_rmt || 0;
+    if (rate > 0) {
+      const amt = kitchenN * 6 * rate;
+      r = mkDataRow(ws, r, [sr++, 'Kitchen platform + granite counter', `${kitchenN} kitchen × 6 rmt`, kitchenN*6, 'rmt', rate, amt, `counted: ${kitchenN} kitchen(s)`], [3,5,6]);
+      total += amt;
+    }
+  }
+  if (toiletN > 0) {
+    const rate = DSR.toilet_fittings_ls || 0;
+    if (rate > 0) {
+      const amt = toiletN * rate;
+      r = mkDataRow(ws, r, [sr++, 'Toilet fittings (WC + washbasin + tap)', `${toiletN} toilet(s)`, toiletN, 'no', rate, amt, `counted from drawing`], [3,5,6]);
+      total += amt;
+    }
+  }
+  if (doorN > 0) {
+    const rate = DSR.door_flush_no || DSR.door_no || 0;
+    if (rate > 0) {
+      const amt = doorN * rate;
+      r = mkDataRow(ws, r, [sr++, 'Doors (flush) — supply + fix', `${doorN} doors from drawing`, doorN, 'no', rate, amt, `drawing block count`], [3,5,6]);
+      total += amt;
+    }
+  }
+  if (windowN > 0) {
+    const rate = DSR.window_alum_sqmt || DSR.window_sqmt || 0;
+    if (rate > 0) {
+      const sqm = windowN * 2;
+      const amt = sqm * rate;
+      r = mkDataRow(ws, r, [sr++, 'Windows (aluminium) — supply + fix', `${windowN} windows × 2 sqm avg`, sqm, 'sqm', rate, amt, `drawing block count`], [3,5,6]);
+      total += amt;
+    }
+  }
+  mkGrandTotal(ws, r, 'TOTAL (₹)', total/1e5, cols);
+  return ws;
+}
+
+function buildInstituteBOQ(wb, data) {
+  const ws = wb.addWorksheet('INSTITUTE ESTIMATE');
+  const cols = 8;
+  let r = mkTitle(ws, 1, 'INSTITUTE / SCHOOL — DRAWING-BASED BOQ', cols);
+  r = mkHeaders(ws, r, ['Sr','Item','Basis (from drawing)','Qty','Unit','Rate','Amount','Source'],
+                       [5, 45, 35, 12, 8, 12, 15, 25]);
+  let total = 0, sr = 1;
+
+  const totalArea = Number(data.total_area_sqm) || 0;
+  const floorN    = pickCount(data, 'floor_count');
+  const doorN     = pickCount(data, 'door_count');
+  const windowN   = pickCount(data, 'window_count');
+  const liftN     = pickCount(data, 'lift_count');
+  const toiletN   = pickCount(data, 'toilet_count');
+  const rcc       = DSR.rcc_m25_cum   || 0;
+  const plaster   = DSR.plaster_sqmt  || 0;
+  const tiles     = DSR.floor_tiles_sqmt || 0;
+  const liftR     = DSR.lift_passenger_no || DSR.lift_no || 0;
+  const doorR     = DSR.door_flush_no || DSR.door_no || 0;
+  const winR      = DSR.window_alum_sqmt || 0;
+
+  if (totalArea > 0 && floorN > 0 && rcc > 0) {
+    const cum = totalArea * 0.15 * floorN;
+    const amt = cum * rcc;
+    r = mkDataRow(ws, r, [sr++, 'RCC slab M25 — all floors', `${totalArea} sqm × 0.15m × ${floorN} floors`, Math.round(cum*100)/100, 'cum', rcc, amt, 'from drawing'], [3,5,6]);
+    total += amt;
+  }
+  if (totalArea > 0 && floorN > 0 && plaster > 0) {
+    const sqm = totalArea * 2.5 * floorN;
+    const amt = sqm * plaster;
+    r = mkDataRow(ws, r, [sr++, 'Internal plaster — classrooms + labs', `${totalArea}×2.5×${floorN}`, Math.round(sqm*100)/100, 'sqm', plaster, amt, 'drawing area'], [3,5,6]);
+    total += amt;
+  }
+  if (totalArea > 0 && floorN > 0 && tiles > 0) {
+    const sqm = totalArea * floorN;
+    const amt = sqm * tiles;
+    r = mkDataRow(ws, r, [sr++, 'Floor tiles — all floors', `${totalArea} × ${floorN}`, sqm, 'sqm', tiles, amt, 'drawing area'], [3,5,6]);
+    total += amt;
+  }
+  if (doorN > 0 && doorR > 0) {
+    const amt = doorN * doorR;
+    r = mkDataRow(ws, r, [sr++, 'Classroom / lab doors', `${doorN} doors`, doorN, 'no', doorR, amt, 'drawing block count'], [3,5,6]);
+    total += amt;
+  }
+  if (windowN > 0 && winR > 0) {
+    const sqm = windowN * 3;
+    const amt = sqm * winR;
+    r = mkDataRow(ws, r, [sr++, 'Windows (aluminium)', `${windowN} × 3 sqm avg`, sqm, 'sqm', winR, amt, 'drawing block count'], [3,5,6]);
+    total += amt;
+  }
+  if (liftN > 0 && liftR > 0) {
+    const amt = liftN * liftR;
+    r = mkDataRow(ws, r, [sr++, 'Passenger lift', `${liftN} lift(s)`, liftN, 'no', liftR, amt, 'drawing block count'], [3,5,6]);
+    total += amt;
+  }
+  if (toiletN > 0 && DSR.toilet_fittings_ls > 0) {
+    const amt = toiletN * DSR.toilet_fittings_ls;
+    r = mkDataRow(ws, r, [sr++, 'Toilet blocks', `${toiletN} toilet(s)`, toiletN, 'no', DSR.toilet_fittings_ls, amt, 'drawing count'], [3,5,6]);
+    total += amt;
+  }
+  mkGrandTotal(ws, r, 'TOTAL (₹)', total/1e5, cols);
+  return ws;
+}
+
+function buildCommercialBOQ(wb, data) {
+  const ws = wb.addWorksheet('COMMERCIAL ESTIMATE');
+  const cols = 8;
+  let r = mkTitle(ws, 1, 'COMMERCIAL / SHOP / OFFICE — DRAWING-BASED BOQ', cols);
+  r = mkHeaders(ws, r, ['Sr','Item','Basis (from drawing)','Qty','Unit','Rate','Amount','Source'],
+                       [5, 45, 35, 12, 8, 12, 15, 25]);
+  let total = 0, sr = 1;
+
+  const totalArea = Number(data.total_area_sqm) || 0;
+  const floorN    = pickCount(data, 'floor_count');
+  const doorN     = pickCount(data, 'door_count');
+  const windowN   = pickCount(data, 'window_count');
+  const liftN     = pickCount(data, 'lift_count');
+  const rcc       = DSR.rcc_m25_cum   || 0;
+  const tiles     = DSR.floor_tiles_sqmt || 0;
+  const acp       = DSR.acp_cladding_sqmt || 0;
+  const glazing   = DSR.glazing_sqmt || DSR.window_alum_sqmt || 0;
+  const liftR     = DSR.lift_passenger_no || DSR.lift_no || 0;
+  const doorR     = DSR.door_flush_no || DSR.door_no || 0;
+
+  if (totalArea > 0 && floorN > 0 && rcc > 0) {
+    const cum = totalArea * 0.15 * floorN;
+    const amt = cum * rcc;
+    r = mkDataRow(ws, r, [sr++, 'RCC slab M25 — all floors', `${totalArea} × 0.15 × ${floorN}`, Math.round(cum*100)/100, 'cum', rcc, amt, 'drawing'], [3,5,6]);
+    total += amt;
+  }
+  if (totalArea > 0 && floorN > 0 && tiles > 0) {
+    const sqm = totalArea * floorN;
+    const amt = sqm * tiles;
+    r = mkDataRow(ws, r, [sr++, 'Vitrified tiles — shop/office floors', `${totalArea} × ${floorN}`, sqm, 'sqm', tiles, amt, 'drawing'], [3,5,6]);
+    total += amt;
+  }
+  if (totalArea > 0 && acp > 0) {
+    const sqm = Math.sqrt(totalArea) * 4 * 3 * Math.max(floorN,1);
+    const amt = sqm * acp;
+    r = mkDataRow(ws, r, [sr++, 'ACP façade cladding', `perimeter × 3m × ${floorN} floors`, Math.round(sqm*100)/100, 'sqm', acp, amt, 'from extents'], [3,5,6]);
+    total += amt;
+  }
+  if (windowN > 0 && glazing > 0) {
+    const sqm = windowN * 4;
+    const amt = sqm * glazing;
+    r = mkDataRow(ws, r, [sr++, 'Structural glazing / windows', `${windowN} × 4 sqm avg`, sqm, 'sqm', glazing, amt, 'drawing block count'], [3,5,6]);
+    total += amt;
+  }
+  if (doorN > 0 && doorR > 0) {
+    const amt = doorN * doorR;
+    r = mkDataRow(ws, r, [sr++, 'Doors — shop / office', `${doorN} doors`, doorN, 'no', doorR, amt, 'drawing block count'], [3,5,6]);
+    total += amt;
+  }
+  if (liftN > 0 && liftR > 0) {
+    const amt = liftN * liftR;
+    r = mkDataRow(ws, r, [sr++, 'Passenger / service lift', `${liftN} lift(s)`, liftN, 'no', liftR, amt, 'drawing count'], [3,5,6]);
+    total += amt;
+  }
+  mkGrandTotal(ws, r, 'TOTAL (₹)', total/1e5, cols);
+  return ws;
+}
+
+function buildHighRiseBOQ(wb, data) {
+  const ws = wb.addWorksheet('HIGH-RISE BOQ');
+  const cols = 8;
+  let r = mkTitle(ws, 1, 'HIGH-RISE RESIDENTIAL — DRAWING-BASED BOQ', cols);
+  r = mkHeaders(ws, r, ['Sr','Item','Basis (from drawing)','Qty','Unit','Rate','Amount','Source'],
+                       [5, 45, 35, 12, 8, 12, 15, 25]);
+  let total = 0, sr = 1;
+
+  const area   = Number(data.total_area_sqm) || 0;
+  const fc     = pickCount(data, 'floor_count');
+  const doorN  = pickCount(data, 'door_count');
+  const winN   = pickCount(data, 'window_count');
+  const liftN  = pickCount(data, 'lift_count');
+  const bedN   = pickCount(data, 'bedroom_count');
+  const toilN  = pickCount(data, 'toilet_count');
+  const kitN   = pickCount(data, 'kitchen_count');
+  const rcc    = DSR.rcc_m25_cum || 0;
+  const brick  = DSR.brickwork_230_cum || 0;
+  const plast  = DSR.plaster_sqmt || 0;
+  const tiles  = DSR.floor_tiles_sqmt || 0;
+  const doorR  = DSR.door_flush_no || DSR.door_no || 0;
+  const winR   = DSR.window_alum_sqmt || 0;
+  const liftR  = DSR.lift_passenger_no || DSR.lift_no || 0;
+
+  if (area>0 && fc>0 && rcc>0) {
+    const cum = area * 0.15 * fc;
+    const amt = cum * rcc;
+    r = mkDataRow(ws, r, [sr++, 'RCC slab M25 — all floors', `${area} sqm × 0.15 × ${fc}`, Math.round(cum*100)/100, 'cum', rcc, amt, 'from drawing'], [3,5,6]);
+    total += amt;
+  }
+  if (data.wall_length_m > 0 && fc>0 && brick>0) {
+    const cum = data.wall_length_m * 3 * 0.23 * fc;
+    const amt = cum * brick;
+    r = mkDataRow(ws, r, [sr++, 'Brickwork 230mm — external walls', `${data.wall_length_m} rmt × 3m × 0.23 × ${fc}`, Math.round(cum*100)/100, 'cum', brick, amt, 'wall lines in drawing'], [3,5,6]);
+    total += amt;
+  }
+  if (area>0 && fc>0 && plast>0) {
+    const sqm = area * 2.5 * fc;
+    const amt = sqm * plast;
+    r = mkDataRow(ws, r, [sr++, 'Internal + external plaster', `${area}×2.5×${fc}`, Math.round(sqm*100)/100, 'sqm', plast, amt, 'drawing'], [3,5,6]);
+    total += amt;
+  }
+  if (area>0 && fc>0 && tiles>0) {
+    const sqm = area * fc;
+    const amt = sqm * tiles;
+    r = mkDataRow(ws, r, [sr++, 'Vitrified floor tiles', `${area} × ${fc}`, sqm, 'sqm', tiles, amt, 'drawing'], [3,5,6]);
+    total += amt;
+  }
+  if (doorN>0 && doorR>0) {
+    const n = doorN * Math.max(fc,1);
+    const amt = n * doorR;
+    r = mkDataRow(ws, r, [sr++, 'Flush doors — all flats', `${doorN}/floor × ${fc} floors`, n, 'no', doorR, amt, 'drawing block count'], [3,5,6]);
+    total += amt;
+  }
+  if (winN>0 && winR>0) {
+    const sqm = winN * Math.max(fc,1) * 2.5;
+    const amt = sqm * winR;
+    r = mkDataRow(ws, r, [sr++, 'Aluminium windows', `${winN}/floor × ${fc} × 2.5 sqm`, Math.round(sqm*100)/100, 'sqm', winR, amt, 'drawing block count'], [3,5,6]);
+    total += amt;
+  }
+  if (liftN>0 && liftR>0) {
+    const amt = liftN * liftR;
+    r = mkDataRow(ws, r, [sr++, 'Passenger lifts', `${liftN} lift(s)`, liftN, 'no', liftR, amt, 'drawing count'], [3,5,6]);
+    total += amt;
+  }
+  if (toilN>0) r = mkDataRow(ws, r, [sr++, 'Toilet block count', `${toilN} toilets`, toilN, 'no', 0, 0, 'count only'], [3,5,6]);
+  if (bedN>0)  r = mkDataRow(ws, r, [sr++, 'Bedroom count',      `${bedN} bedrooms`, bedN, 'no', 0, 0, 'count only'], [3,5,6]);
+  if (kitN>0)  r = mkDataRow(ws, r, [sr++, 'Kitchen count',      `${kitN} kitchens`, kitN, 'no', 0, 0, 'count only'], [3,5,6]);
+  mkGrandTotal(ws, r, 'TOTAL (₹)', total/1e5, cols);
+  return ws;
+}
+
 async function buildExcelFromDrawing(data) {
   const wb = new ExcelJS.Workbook();
   wb.creator = 'PMC Civil AI Agent';
   wb.created = new Date();
 
-  const dtype = data.drawing_type||'SITE_LAYOUT';
+  const dtype  = data.drawing_type || 'SITE_LAYOUT';
+  const ptype  = (data.project_type || 'generic').toLowerCase();
 
   // BLOCK COST always first
   buildBlockCost(wb, data);
 
-  // Sheets based on drawing type
+  // ── Project-type-aware sheets ──────────────────────────
+  if (ptype === 'cafe')                    buildCafeBOQ(wb, data);
+  else if (ptype === 'institute')          buildInstituteBOQ(wb, data);
+  else if (ptype === 'commercial')         buildCommercialBOQ(wb, data);
+  else if (ptype === 'high_rise_residential') buildHighRiseBOQ(wb, data);
+
+  // ── Drawing-type-based sheets (road / building / compound / drainage) ──
   if(['ROAD_LAYOUT','SITE_LAYOUT'].includes(dtype) && (data.roads||[]).length>0) {
     buildRoadEstimate(wb, data);
     buildSoilFilling(wb, data);
@@ -782,4 +1061,7 @@ async function buildExcelFromDrawing(data) {
   return wb;
 }
 
-module.exports = { buildExcelFromDrawing, getDrawingPrompt, DSR };
+module.exports = {
+  buildExcelFromDrawing, getDrawingPrompt, DSR,
+  buildCafeBOQ, buildInstituteBOQ, buildCommercialBOQ, buildHighRiseBOQ
+};
