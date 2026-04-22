@@ -7,21 +7,39 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// ── GUJARAT DSR RATES 2025 — loaded dynamically from Rates.json ────
-// FIX-1: No hardcoded values. Edit Rates.json to update any rate.
-const _ratesRaw = JSON.parse(fs.readFileSync(path.join(__dirname, 'Rates.json'), 'utf8'));
-const RATES = {};
-for (const grp of Object.values(_ratesRaw)) {
-  if (typeof grp === 'object' && !Array.isArray(grp)) {
-    for (const [k, v] of Object.entries(grp)) {
-      if (v && typeof v.rate === 'number') {
-        RATES[k] = { rate: v.rate, unit: v.unit || '', desc: v.description || k };
-      }
-    }
-  }
-}
-// Flat accessor for backward-compat: RATES['gsb_300mm_sqmt'] → number
-// Use RATES[key].rate for numeric value, RATES[key].desc for label
+// ── GUJARAT DSR RATES 2025 ──────────────────────────────────────────
+const RATES = {
+  // ROADS
+  pqc_road_250mm_sqmt:     1800,
+  gsb_300mm_sqmt:           655,
+  wmm_200mm_sqmt:           515,
+  soil_stabilization_sqmt:   82,
+  soil_filling_cum:          285,
+  asphalt_60mm_sqmt:         750,
+  paver_block_80mm_sqmt:     750,
+  service_corridor_sqmt:    1790,
+  kerbing_rmt:               350,
+  // STRUCTURE  
+  rcc_m20_cum:              5200,
+  rcc_m25_cum:              5500,
+  rcc_m30_cum:              5800,
+  pcc_m10_cum:              3800,
+  brickwork_230mm_cum:      4500,
+  brickwork_115mm_cum:      4200,
+  plaster_15mm_sqmt:         120,
+  steel_fe500_kg:             56,
+  steel_fe415_kg:             54,
+  formwork_sqmt:             180,
+  // CIVIL
+  excavation_cum:            180,
+  backfilling_cum:           120,
+  compound_wall_rmt:        8600,
+  gabion_wall_rmt:         14100,
+  // MEP
+  streetlight_nos:         35000,
+  pipeline_rmt:             4500,
+  borewell_nos:            75000,
+};
 
 // ── QUANTITY FORMULAS ──────────────────────────────────────────────
 function calcRoadQuantities(length_m, width_m, layers = {}) {
@@ -37,10 +55,10 @@ function calcRoadQuantities(length_m, width_m, layers = {}) {
     pqc_250mm_cum:    Math.round(area * 1.05 * 0.250 * 100) / 100,       // 5% wastage
     steel_dowel_ton:  Math.round(area * 0.00387 * 100) / 100,            // ~3.87 kg/sqmt
     cost_estimate: {
-      gsb:           Math.round(area * (RATES.gsb_300mm_sqmt?.rate || 0)),
-      wmm:           Math.round(area * (RATES.wmm_200mm_sqmt?.rate || 0)),
-      pqc:           Math.round(area * (RATES.pqc_road_250mm_sqmt?.rate || 0)),
-      total_sqmt:    Math.round(area * ((RATES.gsb_300mm_sqmt?.rate || 0) + (RATES.wmm_200mm_sqmt?.rate || 0) + (RATES.pqc_road_250mm_sqmt?.rate || 0))),
+      gsb:           Math.round(area * RATES.gsb_300mm_sqmt),
+      wmm:           Math.round(area * RATES.wmm_200mm_sqmt),
+      pqc:           Math.round(area * RATES.pqc_road_250mm_sqmt),
+      total_sqmt:    Math.round(area * (RATES.gsb_300mm_sqmt + RATES.wmm_200mm_sqmt + RATES.pqc_road_250mm_sqmt)),
     }
   };
 }
@@ -97,122 +115,63 @@ COMPUTER VISION PRE-ANALYSIS:
 Use these pixel measurements to verify/cross-check your dimension reading.
 ` : '';
 
-// FIX-5: Build rate hint string dynamically from Rates.json (never hardcode ₹ values in prompt)
-const rateHint = Object.values(RATES).map(v => `${v.desc}: ₹${v.rate}/${v.unit}`).join(' | ');
-
-  const prompt = `You are a SENIOR PMC CIVIL ENGINEER with 20 years experience in India. Analyze this civil drawing with MAXIMUM PRECISION.
+  const prompt = `You are a SENIOR PMC CIVIL ENGINEER with 20 years experience in India. Read THIS drawing only.
 
 ${cvHints}
 
-EXTRACTION RULES:
-1. READ THE SCALE first — look for "1:100", "1:500", "Scale 1:1000", or graphical scale bar
-2. READ ALL DIMENSION ANNOTATIONS — every number with arrows/lines
-3. READ ALL TEXT — road names, room labels, material callouts, IS codes
-4. READ TITLE BLOCK — project name, drawing no., date, north direction
-5. IDENTIFY drawing type: ROAD LAYOUT / FLOOR PLAN / SECTION / FOUNDATION / BBS / ESTIMATE
+CRITICAL RULES (NEVER BREAK):
+1. Do NOT invent, guess, estimate, or copy numbers from prior drawings or examples.
+2. If a value is not visibly annotated or directly derivable from THIS drawing, set it to 0 / "" / [].
+3. The JSON schema below uses placeholder zeros — DO NOT copy them; fill with values YOU read from this drawing.
+4. Every dimension you report must trace back to a specific annotation or scaled line measurement in the drawing.
+5. Set confidence to LOW if you could not read the title block / scale / key dimensions.
 
-CALCULATE QUANTITIES (using exact dimensions from drawing):
-For ROAD drawings:
-- Each road: length × carriage width = area SQMT
-- GSB 300mm = area × 1.15 × 0.3 × 1800 kg/cum = TONS  
-- WMM 200mm = area × 1.15 × 0.2 × 2100 kg/cum = TONS
-- PQC M30 250mm = area × 1.05 × 0.25 = CUM
-- Dowel steel = area × 3.87 = KG
+EXTRACTION CHECKLIST:
+1. SCALE — look for "1:100", "1:500", scale bar. If nothing readable, leave empty.
+2. DIMENSIONS — every number with arrows/extension lines.
+3. TEXT — road names, room labels, material callouts.
+4. TITLE BLOCK — project name, drawing no, date, north arrow.
+5. ELEMENT COUNTS — count doors, windows, lifts, staircases, columns, footings visible on drawing.
 
-For BUILDING drawings:
-- Each room: length × width = SQFT/SQMT
-- Each wall: length × height × thickness = CUM brickwork
-- Each slab: area × thickness = CUM concrete
-- Steel = CUM × 120 kg/CUM (slabs), × 160 kg/CUM (beams)
+FORMULAS (only use dimensions actually read from drawing):
+ROAD: area=L×Wcarriage | GSB(t)=area×1.15×0.3×1.8 | WMM(t)=area×1.15×0.2×2.1 | PQC(cum)=area×1.05×0.25 | DowelSteel(kg)=area×3.87
+BUILDING: wall=L×H×T (cum brick) | slab=A×T (cum RCC) | steel=RCC×120 (slab) / ×160 (beam)
+FOOTING: L×B×D (cum). Column: S×S×H (cum). Steel from BBS only if BBS shown.
 
-For FOUNDATION drawings:
-- Each footing: L × B × D = CUM
-- Column: size × size × height = CUM
-- Steel from BBS if given
-
-APPLY CURRENT SURAT/GUJARAT RATES (from config — do NOT override unless drawing specifies):
-${rateHint}
-
-Return ONLY this raw JSON (no markdown, no backticks):
+Return ONLY raw JSON (no markdown):
 {
-  "project_name": "exact from title block",
-  "drawing_no": "exact drawing number",
-  "drawing_type": "ROAD_LAYOUT|FLOOR_PLAN|SECTION|FOUNDATION|BBS|ESTIMATE",
-  "scale": "1:100 or 1:500 etc",
-  "date": "from title block",
-  "north_direction": "noted if compass shown",
-  
+  "project_name": "",
+  "drawing_no": "",
+  "drawing_type": "",
+  "scale": "",
+  "date": "",
+  "north_direction": "",
+
   "elements": [
     {
-      "id": "R1",
-      "type": "ROAD|ROOM|WALL|COLUMN|BEAM|SLAB|FOOTING|STAIRCASE|etc",
-      "name": "Road R1 or Room 101 etc",
-      "dimensions": {
-        "length_m": 129.12,
-        "width_m": 24,
-        "height_m": 0,
-        "thickness_m": 0,
-        "nos": 1,
-        "note": "dimension source: from annotation / estimated from scale"
-      },
-      "quantities": {
-        "area_sqmt": 1936.8,
-        "volume_cum": 0,
-        "gsb_ton": 1459.34,
-        "wmm_ton": 1033.12,
-        "pqc_cum": 457.57,
-        "steel_kg": 0,
-        "brickwork_cum": 0
-      },
-      "cost_inr": {
-        "material": 0,
-        "labour": 0,
-        "total": 3487440
-      },
-      "confidence": "HIGH|MEDIUM|LOW",
-      "annotation_found": "exact text read from drawing"
+      "id": "",
+      "type": "",
+      "name": "",
+      "dimensions": { "length_m": 0, "width_m": 0, "height_m": 0, "thickness_m": 0, "nos": 0, "note": "" },
+      "quantities":  { "area_sqmt": 0, "volume_cum": 0, "gsb_ton": 0, "wmm_ton": 0, "pqc_cum": 0, "steel_kg": 0, "brickwork_cum": 0 },
+      "cost_inr":    { "material": 0, "labour": 0, "total": 0 },
+      "confidence": "",
+      "annotation_found": ""
     }
   ],
-  
-  "total_quantities": {
-    "total_area_sqmt": 36429.32,
-    "total_road_rmt": 3265.45,
-    "gsb_total_ton": 27812.53,
-    "wmm_total_ton": 19689.51,
-    "pqc_total_cum": 9511.86,
-    "rcc_total_cum": 0,
-    "steel_total_kg": 45000,
-    "brickwork_total_cum": 0
-  },
-  
-  "cost_summary": {
-    "civil_total_inr": 280000000,
-    "civil_total_lacs": 2800,
-    "civil_total_crores": 28,
-    "item_wise": [
-      {"item": "PQC ROAD 250MM", "qty": 9511.86, "unit": "CUM", "rate": 5800, "amount_inr": 55168788}
-    ]
-  },
-  
-  "bbs_data": [
-    {
-      "element": "Road Panel R1",
-      "bars": [
-        {"description": "Dowel 25mm dia 450mm c/c", "dia_mm": 25, "nos": 287, "cutting_length_m": 0.6, "total_length_m": 172.2, "weight_kg": 664.7}
-      ],
-      "total_steel_kg": 664.7
-    }
-  ],
-  
-  "observations": [
-    "Scale read as 1:500 from title block",
-    "Drawing shows 17 road segments",
-    "Missing: storm water drainage details"
-  ],
-  
-  "pmc_recommendation": "Detailed PMC recommendation",
-  "extraction_confidence": "HIGH|MEDIUM|LOW",
-  "missing_info": ["list of missing data"]
+
+  "element_counts": { "door_count": 0, "window_count": 0, "lift_count": 0, "staircase_count": 0, "column_count": 0, "footing_count": 0, "bedroom_count": 0, "toilet_count": 0, "kitchen_count": 0, "floor_count": 0 },
+
+  "total_quantities": { "total_area_sqmt": 0, "total_road_rmt": 0, "gsb_total_ton": 0, "wmm_total_ton": 0, "pqc_total_cum": 0, "rcc_total_cum": 0, "steel_total_kg": 0, "brickwork_total_cum": 0 },
+
+  "cost_summary": { "civil_total_inr": 0, "civil_total_lacs": 0, "civil_total_crores": 0, "item_wise": [] },
+
+  "bbs_data": [],
+
+  "observations": [],
+  "pmc_recommendation": "",
+  "extraction_confidence": "LOW|MEDIUM|HIGH",
+  "missing_info": []
 }`;
 
   parts.push({ text: prompt });
