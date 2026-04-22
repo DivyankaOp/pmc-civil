@@ -115,11 +115,16 @@ function parseDXF(dxfContent) {
     const x1 = parseFloat(p[10]) || 0, y1 = parseFloat(p[20]) || 0;
     const x2 = parseFloat(p[13]) || 0, y2 = parseFloat(p[23]) || 0;
     const measured = parseFloat(p[42]);
-    const geom = Math.sqrt((x2-x1)**2 + (y2-y1)**2);
+    // FIX bug#7: DXF code 70 = dimension type. 2=angular, 3=diameter, 4=radius — skip Euclidean fallback for these
+    const dimType = parseInt(p[70]) || 0;
+    const isAngularOrCurved = (dimType & 7) >= 2; // bits 0-2 encode type; 2=angular,3=diam,4=rad
+    const geom = (!isAngularOrCurved) ? Math.sqrt((x2-x1)**2 + (y2-y1)**2) : null;
     updateExtents(x1, y1); updateExtents(x2, y2);
     return {
       dimtext: p[1] || '',
-      value_mm: (!isNaN(measured) && measured > 0) ? measured : geom,
+      dim_type: dimType,
+      value_mm: (!isNaN(measured) && measured > 0) ? measured : (geom || 0),
+      is_estimated: isNaN(measured) || measured <= 0,
       x1, y1, x2, y2,
       xt: parseFloat(p[11]) || 0, yt: parseFloat(p[21]) || 0,
       layer: p[8] || '0', dimstyle: p[3] || ''
@@ -314,18 +319,33 @@ function extractCivilData(parsed, filename) {
     ...Object.values(parsed.blocks).flatMap(b => b.inserts || [])
   ];
 
-  // 1. Scale
+  // 1. Scale — FIX-7: expanded regex handles 1:100, 1/100, 1=100, SCALE 1:100
   let scale = null, scaleFactor = 1;
+  const scaleRE = /(?:scale\s*)?1\s*[:/=]\s*(\d+(?:\.\d+)?)/i;
   for (const t of allTexts) {
-    const m = t.text.match(/1\s*[:/]\s*(\d+(?:\.\d+)?)/);
+    const m = t.text.match(scaleRE);
     if (m) { scale = `1:${m[1]}`; scaleFactor = parseFloat(m[1]); break; }
+    // Also catch "NTS" / "NOT TO SCALE"
+    if (/\b(NTS|NOT\s+TO\s+SCALE)\b/i.test(t.text)) { scale = 'NTS'; break; }
   }
-
   // 2. Unit factor → mm
   const u2m = parsed.units === 'm' ? 1000 : parsed.units === 'cm' ? 10 : parsed.units === 'ft' ? 304.8 : parsed.units === 'in' ? 25.4 : 1;
 
   // 3. Extents
   const ext = parsed.extents;
+
+  // Fallback scale inference from extents vs A1 paper (841×594mm)
+  if ((!scale || scale === 'NTS') && ext) {
+    const dwgW = Math.abs((ext.maxX || 0) - (ext.minX || 0)) * u2m; // drawing width in mm
+    const dwgH = Math.abs((ext.maxY || 0) - (ext.minY || 0)) * u2m;
+    if (dwgW > 0 && dwgH > 0) {
+      const inferredFactor = Math.round(Math.max(dwgW / 841, dwgH / 594) / 50) * 50; // round to nearest 50
+      if (inferredFactor >= 50 && inferredFactor <= 5000) {
+        scale = scale || `1:${inferredFactor} (inferred from extents)`;
+        scaleFactor = scaleFactor === 1 ? inferredFactor : scaleFactor;
+      }
+    }
+  }
   const extW = (ext.xmax - ext.xmin) * u2m;
   const extH = (ext.ymax - ext.ymin) * u2m;
 
@@ -376,18 +396,23 @@ function extractCivilData(parsed, filename) {
     .sort((a, b) => b.area_sqm - a.area_sqm);
 
   // 7. Room annotations from text
-  const spaceRE = /bed\s*room|bedroom|living|drawing\s*room|dining|kitchen|bath|toilet|wc|passage|corridor|lobby|hall|store|staircase|stair|lift|balcony|terrace|utility|servant|garage|office|flat|unit|room/i;
+  // FIX bug#5: Expanded space regex to catch custom names: OFFICE CABIN, GYM AREA, CLUB HOUSE, etc.
+  const spaceRE = /bed\s*room|bedroom|living|drawing\s*room|dining|kitchen|bath|toilet|wc|passage|corridor|lobby|hall|store|staircase|stair|lift|balcony|terrace|utility|servant|garage|office|cabin|gym|club|reception|conference|meeting|server\s*room|pantry|lounge|flat|unit|room|area|court|garden|parking|podium|ramp|duct|shaft/i;
   const roomAnnotations = allTexts
     .filter(t => spaceRE.test(t.text))
     .map(t => ({ text: t.text.trim(), x: t.x, y: t.y, layer: t.layer }));
 
-  // 8. Inline dimension text (e.g. "3000x4500")
+  // 8. Inline dimension text (e.g. "3000x4500", "3.0m × 4.5m", "3.0 x 4.5m")
   const inlineDims = [];
-  const dimRE = /(\d+(?:\.\d+)?)\s*[xX×]\s*(\d+(?:\.\d+)?)/g;
+  // FIX-6: Handle optional unit suffix (m/mm) and spaces around separator
+  const dimRE = /(\d+(?:\.\d+)?)\s*(m{1,2})?\s*[xX×]\s*(\d+(?:\.\d+)?)\s*(m{1,2})?/g;
   for (const t of allTexts) {
     let m;
     while ((m = dimRE.exec(t.text)) !== null) {
-      const l = parseFloat(m[1]) * u2m, w = parseFloat(m[2]) * u2m;
+      // Normalize to mm: if unit is 'm' multiply by 1000, else use as-is (assume mm)
+      const unit1 = (m[2] || '').toLowerCase(), unit2 = (m[4] || '').toLowerCase();
+      const toMm = (val, unit) => unit === 'm' ? parseFloat(val) * 1000 : parseFloat(val) * u2m;
+      const l = toMm(m[1], unit1), w = toMm(m[3], unit2);
       if (l > 50 && w > 50) inlineDims.push({ label: t.text, length_mm: Math.round(l), width_mm: Math.round(w), area_sqm: Math.round(l*w/1e6*100)/100, layer: t.layer });
     }
   }
@@ -423,6 +448,7 @@ function extractCivilData(parsed, filename) {
     drawing_extents: { width_mm: Math.round(extW), height_mm: Math.round(extH), width_m: Math.round(extW/1000*100)/100, height_m: Math.round(extH/1000*100)/100 },
     title_block:     titleBlock,
     all_texts:       uniqueTexts,
+    _raw_texts:      allTexts.map(t => ({ text: t.text, x: t.x, y: t.y, layer: t.layer })),  // FIX-4: expose positioned texts for ANNOTATIONS sheet
     room_annotations: roomAnnotations,
     layer_names:     Object.keys(layerGroups).filter(Boolean),
     layer_groups:    layerGroups,
