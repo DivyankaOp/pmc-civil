@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PMC Civil AI Agent</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700&family=Inter:wght@400;500&family=DM+Mono:wght@400&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <style>
 :root{--navy:#0B1F3A;--gem:#1A73E8;--sur:#F7F8FC;--bor:rgba(11,31,58,0.1);--bor2:rgba(11,31,58,0.16);--tx:#0B1F3A;--tx2:#4B5E7A;--tx3:#8A9BB0;--r:10px;--r2:16px}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -766,11 +767,251 @@ async function send(){
     return;
   }
 
-  // ── DRAWING MODE: PDF/Image → use dedicated /analyze-drawing-pdf endpoint ──
+  // ── DRAWING MODE: PDF → high-res tiles per page → Gemini reads every zone ──
   const hasDrawingFiles = sentFiles.some(f =>
     f.type?.startsWith('image/') || f.type==='application/pdf' || f.name?.match(/\.pdf$/i)
   );
   const isDrawingMode = (mode==='drawing'||mode==='auto'||mode==='boq'||mode==='estimate'||mode==='study');
+
+  if(hasDrawingFiles && isDrawingMode){
+    files=[];renderChips();
+    addLoad();
+
+    // PDF.js setup
+    function initPdfJs(){
+      if(window.pdfjsLib){
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+          'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      }
+    }
+
+    // Render one PDF page to a full canvas at high scale
+    async function renderPageToCanvas(pdfPage, scale=3.0){
+      const vp = pdfPage.getViewport({scale});
+      const canvas = document.createElement('canvas');
+      canvas.width = vp.width; canvas.height = vp.height;
+      await pdfPage.render({canvasContext: canvas.getContext('2d'), viewport: vp}).promise;
+      return canvas;
+    }
+
+    // Cut canvas into overlapping tiles for deep zoom
+    // Grid: 2x2 = 4 tiles, each with 15% overlap so edges not missed
+    function canvasToTiles(canvas, gridX=3, gridY=3, overlapPct=0.15){
+      const tiles = [];
+      const W = canvas.width, H = canvas.height;
+      const tW = Math.floor(W / gridX);
+      const tH = Math.floor(H / gridY);
+      const ox = Math.floor(tW * overlapPct);
+      const oy = Math.floor(tH * overlapPct);
+
+      for(let row=0; row<gridY; row++){
+        for(let col=0; col<gridX; col++){
+          const x = Math.max(0, col * tW - ox);
+          const y = Math.max(0, row * tH - oy);
+          const w = Math.min(tW + ox*2, W - x);
+          const h = Math.min(tH + oy*2, H - y);
+
+          const tc = document.createElement('canvas');
+          tc.width = w; tc.height = h;
+          tc.getContext('2d').drawImage(canvas, x, y, w, h, 0, 0, w, h);
+          tiles.push({
+            b64: tc.toDataURL('image/png',1.0).split(',')[1],
+            label: `Row${row+1}-Col${col+1}`,
+            zone: zoneLabel(row, col, gridY, gridX)
+          });
+        }
+      }
+      // Also add full-page thumbnail for context
+      const thumb = document.createElement('canvas');
+      const maxThumb = 1200;
+      const ratio = Math.min(maxThumb/W, maxThumb/H, 1);
+      thumb.width = Math.floor(W*ratio); thumb.height = Math.floor(H*ratio);
+      thumb.getContext('2d').drawImage(canvas, 0, 0, thumb.width, thumb.height);
+      tiles.unshift({ b64: thumb.toDataURL('image/png',1.0).split(',')[1], label:'FULL_PAGE', zone:'Full Page Overview' });
+      return tiles;
+    }
+
+    function zoneLabel(row, col, rows, cols){
+      const v = row===0?'TOP': row===rows-1?'BOTTOM':'MIDDLE';
+      const h = col===0?'LEFT': col===cols-1?'RIGHT':'CENTER';
+      return `${v}-${h}`;
+    }
+
+    // Convert b64 image → tiles directly
+    async function imageTiles(b64, type){
+      return new Promise((res,rej)=>{
+        const img = new Image();
+        img.onload = ()=>{
+          const canvas = document.createElement('canvas');
+          canvas.width=img.width; canvas.height=img.height;
+          canvas.getContext('2d').drawImage(img,0,0);
+          res(canvasToTiles(canvas));
+        };
+        img.onerror = rej;
+        img.src = `data:${type};base64,${b64}`;
+      });
+    }
+
+    try{
+      initPdfJs();
+      const fname = sentFiles.find(f=>f.type==='application/pdf'||f.name?.match(/\.pdf$/i))?.name
+                 || sentFiles[0]?.name || 'drawing';
+
+      // Build list of {pageNum, tiles[]} to send
+      const pagesData = []; // [{pageNum, tiles:[{b64,label,zone}]}]
+
+      for(const f of sentFiles){
+        if(f.type==='application/pdf' || f.name?.match(/\.pdf$/i)){
+          if(!window.pdfjsLib){ throw new Error('PDF.js library not loaded. Refresh page and try again.'); }
+          const binary = atob(f.b64);
+          const bytes = new Uint8Array(binary.length);
+          for(let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+          const pdf = await window.pdfjsLib.getDocument({data:bytes}).promise;
+          for(let p=1; p<=pdf.numPages; p++){
+            const page = await pdf.getPage(p);
+            const canvas = await renderPageToCanvas(page, 3.0); // 3x scale = very high res
+            const tiles = canvasToTiles(canvas, 2, 2, 0.15);   // 2×2 grid + overlap = 4 tiles (free tier friendly)
+            pagesData.push({pageNum: p, totalPages: pdf.numPages, tiles, fname});
+          }
+        } else if(f.type?.startsWith('image/')){
+          const tiles = await imageTiles(f.b64, f.type);
+          pagesData.push({pageNum:1, totalPages:1, tiles, fname: f.name});
+        }
+      }
+
+      if(!pagesData.length) throw new Error('No drawing pages could be processed.');
+
+      // Send to server page by page
+      const res = await fetch('/analyze-drawing-pdf',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          pagesData: pagesData.map(p=>({
+            pageNum: p.pageNum,
+            totalPages: p.totalPages,
+            tiles: p.tiles,
+            fname: p.fname
+          })),
+          userText: sentText,
+          filename: fname
+        })
+      });
+
+      const ctype = res.headers.get('content-type')||'';
+      let data;
+      if(ctype.includes('application/json')){
+        data = await res.json();
+      } else {
+        const txt = await res.text();
+        throw new Error(`Server error ${res.status}: ${txt.slice(0,300).replace(/<[^>]+>/g,'').trim()}`);
+      }
+      if(!res.ok) throw new Error(data.error||('HTTP '+res.status));
+
+      const aiText = data.analysis || 'Drawing analysis failed.';
+      rmLoad();
+      hist=hist.filter(m=>m.role!=='user_parts');
+      hist.push({role:'assistant',content:aiText,userText:sentText});
+      addMsgEl('ai',aiText,[],true,sentFiles,sentText,aiText);
+      saveChatToHistory(fname.slice(0,40));
+    }catch(err){
+      rmLoad();
+      let msg = err.message;
+      if(msg.includes('429')||msg.includes('quota')||msg.includes('RESOURCE_EXHAUSTED')){
+        msg = '⏳ Gemini API rate limit. Server auto-retry karega — 1 minute baad dobara bhejo. (Free tier limit: 20 req/day. Paid plan ke liye Gemini billing enable karo.)';
+      }
+      addMsgEl('ai',`**Drawing Analysis Error:** ${msg}`);
+    }
+    busy=false;document.getElementById('sbtn').disabled=false;
+    return;
+
+
+  if(hasDrawingFiles && isDrawingMode){
+    files=[];renderChips();
+    addLoad();
+
+    // Helper: convert PDF b64 → array of PNG b64 pages using PDF.js
+    async function pdfToPages(b64, scale=2.5){
+      try{
+        if(!window.pdfjsLib) throw new Error('PDF.js not loaded');
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+          'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for(let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+        const pdf = await window.pdfjsLib.getDocument({data:bytes}).promise;
+        const pages = [];
+        for(let p=1; p<=pdf.numPages; p++){
+          const page = await pdf.getPage(p);
+          const vp = page.getViewport({scale});
+          const canvas = document.createElement('canvas');
+          canvas.width = vp.width; canvas.height = vp.height;
+          await page.render({canvasContext:canvas.getContext('2d'), viewport:vp}).promise;
+          const dataUrl = canvas.toDataURL('image/png', 1.0);
+          pages.push(dataUrl.split(',')[1]); // b64 only
+        }
+        return pages;
+      }catch(e){
+        console.error('PDF.js error:',e);
+        return null;
+      }
+    }
+
+    try{
+      const allPages = []; // {pageB64, filename}
+      const fname = sentFiles.find(f=>f.type==='application/pdf'||f.name?.match(/\.pdf$/i))?.name || 'drawing';
+
+      for(const f of sentFiles){
+        if(f.type==='application/pdf' || f.name?.match(/\.pdf$/i)){
+          // Convert PDF → PNG pages in browser
+          const pages = await pdfToPages(f.b64, 2.5);
+          if(pages && pages.length){
+            pages.forEach(p => allPages.push(p));
+          } else {
+            // Fallback: send PDF directly as single item
+            allPages.push(f.b64);
+          }
+        } else if(f.type?.startsWith('image/')){
+          allPages.push(f.b64);
+        }
+      }
+
+      if(!allPages.length) throw new Error('No pages could be extracted from drawing.');
+
+      // Send pages to server — no timeout needed since pages are small PNGs
+      const res = await fetch('/analyze-drawing-pdf',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({pages: allPages, userText: sentText, filename: fname})
+      });
+
+      const ctype = res.headers.get('content-type')||'';
+      let data;
+      if(ctype.includes('application/json')){
+        data = await res.json();
+      } else {
+        const txt = await res.text();
+        throw new Error(`Server error ${res.status}: ${txt.slice(0,200).replace(/<[^>]+>/g,'').trim()}`);
+      }
+      if(!res.ok) throw new Error(data.error||('HTTP '+res.status));
+
+      const aiText = data.analysis || 'Drawing analysis failed.';
+      rmLoad();
+      hist=hist.filter(m=>m.role!=='user_parts');
+      hist.push({role:'assistant',content:aiText,userText:sentText});
+      addMsgEl('ai',aiText,[],true,sentFiles,sentText,aiText);
+      saveChatToHistory(fname.slice(0,40));
+    }catch(err){
+      rmLoad();
+      let msg = err.message;
+      if(msg.includes('429') || msg.includes('quota') || msg.includes('RESOURCE_EXHAUSTED')){
+        msg = '⏳ Gemini API rate limit reached. Wait 1 minute and try again. (Free tier: 20 requests/day — upgrade to Gemini paid plan for unlimited.)';
+      }
+      addMsgEl('ai',`**Drawing Analysis Error:** ${msg}`);
+    }
+    busy=false;document.getElementById('sbtn').disabled=false;
+    return;
+  }
+
 
   if(hasDrawingFiles && isDrawingMode){
     files=[];renderChips();
