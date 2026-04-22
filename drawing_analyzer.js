@@ -7,39 +7,21 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// ── GUJARAT DSR RATES 2025 ──────────────────────────────────────────
-const RATES = {
-  // ROADS
-  pqc_road_250mm_sqmt:     1800,
-  gsb_300mm_sqmt:           655,
-  wmm_200mm_sqmt:           515,
-  soil_stabilization_sqmt:   82,
-  soil_filling_cum:          285,
-  asphalt_60mm_sqmt:         750,
-  paver_block_80mm_sqmt:     750,
-  service_corridor_sqmt:    1790,
-  kerbing_rmt:               350,
-  // STRUCTURE  
-  rcc_m20_cum:              5200,
-  rcc_m25_cum:              5500,
-  rcc_m30_cum:              5800,
-  pcc_m10_cum:              3800,
-  brickwork_230mm_cum:      4500,
-  brickwork_115mm_cum:      4200,
-  plaster_15mm_sqmt:         120,
-  steel_fe500_kg:             56,
-  steel_fe415_kg:             54,
-  formwork_sqmt:             180,
-  // CIVIL
-  excavation_cum:            180,
-  backfilling_cum:           120,
-  compound_wall_rmt:        8600,
-  gabion_wall_rmt:         14100,
-  // MEP
-  streetlight_nos:         35000,
-  pipeline_rmt:             4500,
-  borewell_nos:            75000,
-};
+// ── GUJARAT DSR RATES 2025 — loaded dynamically from Rates.json ────
+// FIX-1: No hardcoded values. Edit Rates.json to update any rate.
+const _ratesRaw = JSON.parse(fs.readFileSync(path.join(__dirname, 'Rates.json'), 'utf8'));
+const RATES = {};
+for (const grp of Object.values(_ratesRaw)) {
+  if (typeof grp === 'object' && !Array.isArray(grp)) {
+    for (const [k, v] of Object.entries(grp)) {
+      if (v && typeof v.rate === 'number') {
+        RATES[k] = { rate: v.rate, unit: v.unit || '', desc: v.description || k };
+      }
+    }
+  }
+}
+// Flat accessor for backward-compat: RATES['gsb_300mm_sqmt'] → number
+// Use RATES[key].rate for numeric value, RATES[key].desc for label
 
 // ── QUANTITY FORMULAS ──────────────────────────────────────────────
 function calcRoadQuantities(length_m, width_m, layers = {}) {
@@ -55,10 +37,10 @@ function calcRoadQuantities(length_m, width_m, layers = {}) {
     pqc_250mm_cum:    Math.round(area * 1.05 * 0.250 * 100) / 100,       // 5% wastage
     steel_dowel_ton:  Math.round(area * 0.00387 * 100) / 100,            // ~3.87 kg/sqmt
     cost_estimate: {
-      gsb:           Math.round(area * RATES.gsb_300mm_sqmt),
-      wmm:           Math.round(area * RATES.wmm_200mm_sqmt),
-      pqc:           Math.round(area * RATES.pqc_road_250mm_sqmt),
-      total_sqmt:    Math.round(area * (RATES.gsb_300mm_sqmt + RATES.wmm_200mm_sqmt + RATES.pqc_road_250mm_sqmt)),
+      gsb:           Math.round(area * (RATES.gsb_300mm_sqmt?.rate || 0)),
+      wmm:           Math.round(area * (RATES.wmm_200mm_sqmt?.rate || 0)),
+      pqc:           Math.round(area * (RATES.pqc_road_250mm_sqmt?.rate || 0)),
+      total_sqmt:    Math.round(area * ((RATES.gsb_300mm_sqmt?.rate || 0) + (RATES.wmm_200mm_sqmt?.rate || 0) + (RATES.pqc_road_250mm_sqmt?.rate || 0))),
     }
   };
 }
@@ -115,6 +97,9 @@ COMPUTER VISION PRE-ANALYSIS:
 Use these pixel measurements to verify/cross-check your dimension reading.
 ` : '';
 
+// FIX-5: Build rate hint string dynamically from Rates.json (never hardcode ₹ values in prompt)
+const rateHint = Object.values(RATES).map(v => `${v.desc}: ₹${v.rate}/${v.unit}`).join(' | ');
+
   const prompt = `You are a SENIOR PMC CIVIL ENGINEER with 20 years experience in India. Analyze this civil drawing with MAXIMUM PRECISION.
 
 ${cvHints}
@@ -145,10 +130,8 @@ For FOUNDATION drawings:
 - Column: size × size × height = CUM
 - Steel from BBS if given
 
-APPLY CURRENT SURAT/GUJARAT RATES (2025):
-Road: PQC ₹1800/sqmt | GSB ₹655/sqmt | WMM ₹515/sqmt
-Structure: RCC M25 ₹5500/cum | Steel ₹56/kg | Brickwork ₹4500/cum
-Services: Streetlight ₹35000/nos | Pipeline ₹4500/rmt
+APPLY CURRENT SURAT/GUJARAT RATES (from config — do NOT override unless drawing specifies):
+${rateHint}
 
 Return ONLY this raw JSON (no markdown, no backticks):
 {
