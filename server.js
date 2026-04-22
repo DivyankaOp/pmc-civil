@@ -8,7 +8,6 @@ const { geminiAnalyzeDrawing, runCVAnalysis, RATES } = require('./drawing_analyz
 const { parseDXF, extractCivilData, extractTotalAreaSqft } = require('./dxf_parser');
 const { buildExcelFromDrawing, getDrawingPrompt } = require('./drawing_to_excel');
 const { buildDXFExcel } = require('./dxf_to_excel');
-const { buildEstimateWorkbook, RATES: ESTIMATE_RATES, DEFAULT_CATEGORIES } = require('./estimate_builder');
 
 const app = express();
 app.use(cors());
@@ -41,17 +40,9 @@ async function fetchGeminiWithRetry(key, body, { maxRetries = 5, baseDelayMs = 2
     // Non-retryable error — return the data as-is so callers handle it normally
     if (!retryable || attempt === maxRetries) return data;
 
-    // For 429: use retryDelay from API response if available, otherwise exponential backoff
-    let delay = baseDelayMs * Math.pow(2, attempt);
-    try {
-      const retryInfo = data?.error?.details?.find(d => d['@type']?.includes('RetryInfo'));
-      if (retryInfo?.retryDelay) {
-        const secs = parseFloat(retryInfo.retryDelay.replace('s',''));
-        if (!isNaN(secs)) delay = Math.min((secs + 2) * 1000, 120000); // cap at 2 min
-      }
-    } catch(e) {}
-
-    console.warn(`Gemini ${code} on attempt ${attempt + 1}/${maxRetries + 1}. Retrying in ${Math.round(delay/1000)}s…`);
+    // Exponential backoff: 2s, 4s, 8s, 16s, 32s …
+    const delay = baseDelayMs * Math.pow(2, attempt);
+    console.warn(`Gemini ${code} on attempt ${attempt + 1}/${maxRetries + 1}. Retrying in ${delay}ms…`);
     await new Promise(resolve => setTimeout(resolve, delay));
   }
 }
@@ -508,13 +499,19 @@ app.post('/analyze-dxf', async (req, res) => {
     const ratesSummary = Object.entries(ratesMap).slice(0, 30).map(([k,v]) => `${k}:${v}`).join(', ');
 
     const prompt = `You are a senior PMC civil engineer analyzing a DXF drawing.
-ALL DATA BELOW IS EXTRACTED DIRECTLY FROM THE DXF FILE. DO NOT INVENT VALUES.
+ALL DATA BELOW IS EXTRACTED DIRECTLY FROM THIS DXF FILE. DO NOT INVENT VALUES. Do NOT copy values from other drawings or examples.
+If a value is not present in the data below, leave it 0 / "" / [] in the JSON.
 
 FILE: ${filename}
 TYPE: ${civilData.drawing_type}
 SCALE: ${civilData.scale || 'not detected'}
 UNITS: ${civilData.units}
 SIZE: ${civilData.drawing_extents.width_m}m x ${civilData.drawing_extents.height_m}m
+
+ELEMENT COUNTS (pre-counted from blocks + text):
+${JSON.stringify(civilData.element_counts || {}, null, 2)}
+
+WALL LENGTH FROM LINES: ${civilData.wall_length_m || 0} m
 
 TEXT ANNOTATIONS (${civilData.stats.total_texts}):
 ${civilData.all_texts.slice(0,150).join('\n')}
@@ -529,8 +526,8 @@ LAYERS: ${civilData.layer_names.join(', ')}
 BLOCKS: ${Object.entries(civilData.block_counts||{}).slice(0,20).map(([k,v])=>`${k}x${v}`).join(', ')||'none'}
 RATES AVAILABLE: ${ratesSummary}
 
-Return ONLY raw JSON (no markdown):
-{"project_name":"from texts above","drawing_type":"FLOOR_PLAN|SECTION|ELEVATION|SITE_PLAN|ROAD_PLAN|STRUCTURAL|GENERAL","scale":"detected or not","date":"from texts","spaces":[{"name":"room name from text","area_sqm":0}],"boq":[{"description":"from drawing data only","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0}],"total_bua_sqm":0,"observations":["based on actual data"],"pmc_recommendation":"based on actual extracted data"}`;
+Return ONLY raw JSON (no markdown). Every numeric field you fill must be traceable to the data above:
+{"project_name":"","drawing_type":"FLOOR_PLAN|SECTION|ELEVATION|SITE_PLAN|ROAD_PLAN|STRUCTURAL|GENERAL","scale":"","date":"","spaces":[{"name":"","area_sqm":0}],"boq":[{"description":"","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0}],"total_bua_sqm":0,"element_counts":{"door_count":0,"window_count":0,"lift_count":0,"staircase_count":0,"floor_count":0},"observations":[],"pmc_recommendation":""}`;
 
     const geminiData3 = await fetchGeminiWithRetry(key, {
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
@@ -703,6 +700,106 @@ app.post('/update-area-from-dxf', async (req, res) => {
   }
 });
 
+// ── NEW: Fill MODESTAA template from drawing (type-aware) ──
+// Detects project type from DXF content. If high-rise residential,
+// opens the MODESTAA template and fills drawing-derived cells only.
+// Otherwise, builds a fresh workbook via buildExcelFromDrawing with
+// the right BOQ sheet for the detected project type (cafe / institute
+// / commercial / road / generic).
+app.post('/fill-template-from-drawing', async (req, res) => {
+  try {
+    const { dxfContent, filename } = req.body;
+    if (!dxfContent) return res.status(400).json({ error: 'No DXF content provided.' });
+
+    const parsed = parseDXF(dxfContent);
+    const civil  = extractCivilData(parsed, filename || 'drawing.dxf');
+    const ptype  = (civil.project_type || 'generic').toLowerCase();
+    const ec     = civil.element_counts || {};
+    const totalAreaSqft = extractTotalAreaSqft(dxfContent) || 0;
+    const totalAreaSqm  = totalAreaSqft > 0 ? Math.round((totalAreaSqft / 10.764) * 100) / 100 : 0;
+
+    // ── HIGH-RISE: use MODESTAA template, fill only drawing-derived cells ──
+    if (ptype === 'high_rise_residential') {
+      const estimatePath = path.join(__dirname, 'UPDATED-OVERALL-ESTIMATE-MODESTAA-10.04.2026.xlsx');
+      const wb = new ExcelJS.Workbook();
+      await wb.xlsx.readFile(estimatePath);
+
+      // AREA STATEMENT C73 — total area
+      if (totalAreaSqft > 0) {
+        const wsArea = wb.getWorksheet('AREA STATEMENT');
+        if (wsArea) wsArea.getCell('C73').value = totalAreaSqft;
+      }
+
+      // OVERALL SUMMARY B6 / J6
+      const wsOS = wb.getWorksheet('OVERALL SUMMARY');
+      if (wsOS && totalAreaSqft > 0) {
+        wsOS.getCell('B6').value = `TOTAL AREA: ${totalAreaSqft.toLocaleString('en-IN',{maximumFractionDigits:2})} SQFT`;
+        wsOS.getCell('J6').value = totalAreaSqft;
+        wsOS.eachRow(row => {
+          row.eachCell({ includeEmpty: false }, cell => {
+            if (typeof cell.value === 'string' && cell.value.includes('273613.53')) {
+              cell.value = cell.value.split('273613.53').join("'OVERALL SUMMARY'!$J$6");
+            }
+          });
+        });
+      }
+
+      // DRAWING-DERIVED COUNTS sheet (new) — record what the parser read
+      let wsCounts = wb.getWorksheet('DRAWING COUNTS');
+      if (!wsCounts) wsCounts = wb.addWorksheet('DRAWING COUNTS');
+      wsCounts.getCell('A1').value = 'ELEMENT';
+      wsCounts.getCell('B1').value = 'COUNT FROM DRAWING';
+      wsCounts.getCell('C1').value = 'SOURCE';
+      [['Floors', ec.floor_count || 0, (ec.floor_labels || []).join(', ')],
+       ['Doors',  ec.door_count  || 0, 'block / layer match'],
+       ['Windows',ec.window_count|| 0, 'block / layer match'],
+       ['Lifts',  ec.lift_count  || 0, 'block / layer / text'],
+       ['Staircases', ec.staircase_count || 0, 'block / layer / text'],
+       ['Columns', ec.column_count || 0, 'block / layer match'],
+       ['Beams',   ec.beam_count   || 0, 'block / layer match'],
+       ['Footings',ec.footing_count|| 0, 'block / layer match'],
+       ['Toilets', ec.toilet_count || 0, 'text annotations'],
+       ['Kitchens',ec.kitchen_count|| 0, 'text annotations'],
+       ['Bedrooms',ec.bedroom_count|| 0, 'text annotations'],
+       ['Wall length (m)', civil.wall_length_m || 0, 'LINE entities on wall layers'],
+       ['Total area (sqft)', totalAreaSqft, 'closed polylines (shoelace)'],
+       ['Project type detected', civil.project_type || 'generic', 'dxf_parser.detectProjectType']
+      ].forEach((row, i) => {
+        row.forEach((v, j) => { wsCounts.getCell(i+2, j+1).value = v; });
+      });
+
+      const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename=MODESTAA-FILLED-${today}.xlsx`);
+      await wb.xlsx.write(res);
+      return res.end();
+    }
+
+    // ── OTHER TYPES: build fresh type-aware workbook ──
+    const data = {
+      drawing_type:    civil.drawing_type === 'FLOOR_PLAN' ? 'BUILDING' : 'SITE_LAYOUT',
+      project_type:    ptype,
+      total_area_sqm:  totalAreaSqm,
+      total_area_sqft: totalAreaSqft,
+      element_counts:  ec,
+      wall_length_m:   civil.wall_length_m || 0,
+      buildings: totalAreaSqm > 0 ? [{ name: 'Building', area_sqm: totalAreaSqm, floors: ec.floor_count || 0 }] : [],
+      roads: [],
+      project_name: civil.title_block?.project_name || filename || 'Project',
+      source: `DXF parser — project type: ${ptype}`
+    };
+    const wb = await buildExcelFromDrawing(data);
+    const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=${ptype.toUpperCase()}-ESTIMATE-${today}.xlsx`);
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error('Fill template error:', err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── DWG/DXF ANALYSIS — Convert to PNG + Gemini Vision ───────────
 // Strategy: dwg_converter.py renders DXF/DWG to PNG using ezdxf+matplotlib
 // Then Gemini SEES the actual drawing like a human engineer
@@ -719,46 +816,51 @@ app.post('/analyze-dwg', async (req, res) => {
     const os = require('os');
 
     // Write uploaded file to temp
-    const ext = filename?.match(/\.(dxf|dwg)$/i)?.[1]?.toLowerCase() || 'dxf';
+    const ext = filename?.match(/\.(dxf|dwg|dwf)$/i)?.[1]?.toLowerCase() || 'dxf';
     const tmpIn  = path.join(os.tmpdir(), `pmc_dwg_${Date.now()}.${ext}`);
     const tmpPng = path.join(os.tmpdir(), `pmc_dwg_${Date.now()}.png`);
 
     fs.writeFileSync(tmpIn, Buffer.from(b64, 'base64'));
 
-    // Run Python converter
+    // Run converter. DXF/DWG → ezdxf Python script. DWF → LibreOffice fallback.
     const scriptPath = path.join(__dirname, 'dwg_converter.py');
     let converterResult = {};
-    try {
-      // Try python3 first, fall back to python (Render/Windows compatibility)
-      let out;
+
+    if (ext === 'dwf') {
+      // DWF is a compressed vector/image bundle. Try LibreOffice → PNG.
       try {
-        out = execSync(`python3 "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 180000 });
-      } catch (e1) {
-        out = execSync(`python "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 180000 });
+        const soffice = process.platform === 'win32'
+          ? '"C:\\Program Files\\LibreOffice\\program\\soffice.exe"'
+          : 'libreoffice';
+        execSync(`${soffice} --headless --convert-to png --outdir "${os.tmpdir()}" "${tmpIn}"`,
+                 { timeout: 90000 });
+        const base = path.basename(tmpIn, '.dwf');
+        const libreOut = path.join(os.tmpdir(), `${base}.png`);
+        if (fs.existsSync(libreOut)) {
+          converterResult = { success: true, png_path: libreOut, texts: [], dimensions: [], layers: [], drawing_type: 'DWF_RENDER' };
+        } else {
+          converterResult = { success: false, error: 'LibreOffice did not produce PNG from DWF' };
+        }
+      } catch (e) {
+        converterResult = { success: false, error: `DWF conversion failed: ${e.message}. Gemini Vision will still attempt analysis if a PNG thumbnail is embedded.` };
       }
-      converterResult = JSON.parse(out.toString());
-    } catch (e) {
-      converterResult = { success: false, error: e.message, errors: [e.message] };
-    }
-    if ((converterResult.errors || []).length) {
-      console.warn('dwg_converter errors:', converterResult.errors);
+    } else {
+      try {
+        const out = execSync(`python3 "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 60000 });
+        converterResult = JSON.parse(out.toString());
+      } catch (e) {
+        converterResult = { success: false, error: e.message };
+      }
     }
 
     // Build Gemini parts
     const parts = [];
 
     // If PNG rendered successfully — send image to Gemini Vision
-    // FIX-8: Blank PNG guard — prevent Gemini hallucinating on empty/failed renders
     if (converterResult.png_path && fs.existsSync(converterResult.png_path)) {
-      const pngBuf = fs.readFileSync(converterResult.png_path);
-      const pngSizeKB = pngBuf.length / 1024;
-      if (pngSizeKB < 30) {
-        console.warn('[analyze-dwg] PNG too small (' + pngSizeKB.toFixed(1) + 'KB) — likely blank render, skipping vision.');
-        converterResult.png_path = null;
-      } else {
-        parts.push({ inline_data: { mime_type: 'image/png', data: pngBuf.toString('base64') } });
-      }
-      try { if (converterResult.png_path) fs.unlinkSync(converterResult.png_path); } catch(e) {}
+      const pngB64 = fs.readFileSync(converterResult.png_path).toString('base64');
+      parts.push({ inline_data: { mime_type: 'image/png', data: pngB64 } });
+      try { fs.unlinkSync(converterResult.png_path); } catch(e) {}
     }
 
     // Always include extracted text + dimension data
@@ -791,8 +893,11 @@ INSTRUCTIONS:
 3. Calculate ALL quantities using proper PMC formulas:
    Roads: Area=L×W | GSB=Area×1.15×0.3×1800kg/m³ | WMM=Area×1.15×0.2×2100 | PQC=Area×1.05×0.25
    Structure: Volume=L×W×H | Steel=Volume×120kg/m³(slab) or 160(beam)
-4. Apply Gujarat DSR 2025 rates (from config — do NOT override unless drawing specifies a different rate):
-   ${Object.values(RATES).map(v => `${v.desc}: ₹${v.rate}/${v.unit}`).join(' | ')}
+4. Apply Gujarat DSR 2025 rates:
+   PQC ₹1800/sqmt | GSB ₹655/sqmt | WMM ₹515/sqmt | Soil stab ₹82/sqmt
+   RCC M25 ₹5500/cum | RCC M30 ₹5800/cum | Steel Fe500 ₹56/kg
+   Brickwork ₹4500/cum | Formwork ₹180/sqmt | Excavation ₹180/cum
+   Compound wall ₹8600/rmt | Street light ₹35000/nos | Pipeline ₹4500/rmt
 
 OUTPUT FORMAT — Full PMC Analysis Report:
 ## Drawing Details (Title Block)
@@ -831,284 +936,6 @@ OUTPUT FORMAT — Full PMC Analysis Report:
     res.json({ success: true, analysis, converter: converterResult });
   } catch (err) {
     console.error('DWG analyze error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── FULL ESTIMATE — universal upload → MODESTAA-format workbook ───
-// Accepts any mix of image / PDF / DXF / DWG files. Extracts structured
-// quantities via Gemini Vision using a schema that mirrors the reference
-// annexure layout, then writes a multi-sheet workbook with formulas
-// (no hard-coded rates — all rates come from Rates.json by default, and
-// Gemini may override per-item when it reads them off the drawing itself).
-app.post('/full-estimate', async (req, res) => {
-  try {
-    const key = process.env.GEMINI_API_KEY;
-    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
-
-    const { files = [], userText = '', projectName = '' } = req.body;
-    if (!files.length) return res.status(400).json({ error: 'No files uploaded.' });
-
-    const fs = require('fs');
-    const os = require('os');
-    const { execSync } = require('child_process');
-
-    // Build Gemini content parts. For DXF/DWG, convert to PNG via dwg_converter.py first.
-    const parts = [];
-    const tmpPaths = [];
-    const extractedText = [];
-
-    for (const f of files) {
-      const name = (f.name || '').toLowerCase();
-      const mime = f.type || '';
-      try {
-        if (name.endsWith('.dxf') || name.endsWith('.dwg')) {
-          const ext = name.endsWith('.dwg') ? 'dwg' : 'dxf';
-          const tmpIn  = path.join(os.tmpdir(), `pmc_est_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`);
-          const tmpPng = path.join(os.tmpdir(), `pmc_est_${Date.now()}_${Math.random().toString(36).slice(2)}.png`);
-          fs.writeFileSync(tmpIn, Buffer.from(f.b64, 'base64'));
-          tmpPaths.push(tmpIn);
-          let cvt = {};
-          try {
-            const scriptPath = path.join(__dirname, 'dwg_converter.py');
-            let out;
-            try {
-              out = execSync(`python3 "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 180000 });
-            } catch (e1) {
-              out = execSync(`python "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 180000 });
-            }
-            cvt = JSON.parse(out.toString());
-          } catch (e) { cvt = { success: false, error: e.message, errors:[e.message] }; }
-          if ((cvt.errors || []).length) console.warn('dwg_converter', f.name, cvt.errors);
-
-          // FIX-8b: Blank PNG guard for /full-estimate too
-          if (cvt.png_path && fs.existsSync(cvt.png_path)) {
-            const pngBuf2 = fs.readFileSync(cvt.png_path);
-            if (pngBuf2.length / 1024 >= 30) {
-              parts.push({ inline_data: { mime_type: 'image/png', data: pngBuf2.toString('base64') } });
-            } else {
-              console.warn('[full-estimate] PNG too small (' + (pngBuf2.length/1024).toFixed(1) + 'KB) — skipping vision for this file.');
-            }
-            tmpPaths.push(cvt.png_path);
-          }
-          const txts = (cvt.texts || []).map(t => t.text).slice(0, 150).join(' | ');
-          const dims = (cvt.dimensions || []).filter(d => d.value)
-            .map(d => `${d.value}${d.text ? ' (' + d.text + ')' : ''}`).slice(0, 80).join(', ');
-          extractedText.push(
-            `FILE: ${f.name}\nTYPE: ${cvt.drawing_type || 'Unknown'}\nLAYERS: ${(cvt.layers||[]).join(', ')}\nTEXTS: ${txts}\nDIMENSIONS: ${dims}`
-          );
-        } else if (mime === 'application/pdf' || name.endsWith('.pdf')) {
-          parts.push({ inline_data: { mime_type: 'application/pdf', data: f.b64 } });
-        } else if (mime.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp)$/i.test(name)) {
-          parts.push({ inline_data: { mime_type: mime || 'image/png', data: f.b64 } });
-        }
-      } catch (e) { console.log('skip file', f.name, e.message); }
-    }
-
-    // Rates context (no hard-coded rates in the prompt — rely on Rates.json)
-    const rateHints = JSON.stringify(ESTIMATE_RATES, null, 0).slice(0, 6000);
-
-    const schemaPrompt = `You are a SENIOR PMC CIVIL ENGINEER preparing a project estimate from construction drawings.
-You have been given one or more drawings (images / PDF / rendered DXF-DWG). READ every dimension, title block, legend and annotation.
-
-Your job: RETURN JSON ONLY (no prose, no markdown) matching EXACTLY this schema:
-{
-  "project_name": "string — read from title block, else infer",
-  "drawing_type": "string — floor plan / site layout / section / foundation / structural / tiles / elevation / mixed",
-  "builtup_area_sqft": number,           // total BUA in SQFT. Compute from dimensions if not printed.
-  "sections": [
-    {
-      "title": "string — pick from: EXCAVATION, CIVIL WORK, TILES & STONE WORK, PLUMBING & WATERPROOFING, MISCELLANEOUS WORK, AMENITIES, CONSULTANT COST (you may add new sections if drawing needs them)",
-      "items": [
-        {
-          "particular": "string — specific item e.g. 'RCC M25 slab', 'Brickwork 230mm external', 'Vitrified flooring 800x1600'",
-          "qty": number,
-          "unit": "string — CUM / SQMT / SQFT / RMT / NOS / KG / L/S",
-          "rate": number,         // Rate without GST (₹). Use the RATES LIBRARY below as authoritative reference; only override if drawing specifies another rate.
-          "gstPct": number        // as fraction: 0.18 for 18%, 0 for exempt. Default 0.18 if unknown.
-        }
-      ]
-    }
-  ],
-  "observations": "string — 2-3 line PMC note about the drawing and any assumptions made."
-}
-
-RULES:
-- Only include sections that are actually implied by the drawings. Do NOT invent items.
-- For quantities: compute from dimensions using standard PMC formulas (L×W×H for volume, L×W for area, perimeter×height×thickness for wall volume, etc.).
-- Every item MUST have a qty > 0. If you cannot compute a qty, SKIP the item.
-- Use whole numbers or 2 decimals for qty. Units must be consistent within one item.
-- Rates MUST come from the RATES LIBRARY below when available. If an item has no match, estimate conservatively using Gujarat DSR 2025 averages.
-- DO NOT hard-code the builtup area — COMPUTE it from the drawing.
-- Return ONLY the JSON object. Start with { end with }.
-
-RATES LIBRARY (Gujarat DSR 2025, Rates.json):
-${rateHints}
-
-${extractedText.length ? `RAW EXTRACTED METADATA FROM DXF/DWG FILES:\n${extractedText.join('\n---\n')}\n` : ''}
-${userText ? `USER NOTE: ${userText}\n` : ''}
-${projectName ? `PROJECT NAME HINT: ${projectName}\n` : ''}`;
-
-    // If every file was a DWG/DXF and we got no image + no text, abort early
-    // with a helpful message — otherwise Gemini just sees an empty prompt.
-    const hasVisual = parts.some(p => p.inline_data);
-    const hasText = extractedText.some(t => /TEXTS: \S/.test(t) || /DIMENSIONS: \S/.test(t));
-    if (!hasVisual && !hasText) {
-      return res.status(400).json({
-        error: 'Could not read the uploaded drawing(s). For DWG files the server needs LibreOffice or ODA File Converter installed, which is not available on this host. Please export your drawing to DXF, PDF, PNG or JPG and upload that instead.',
-      });
-    }
-
-    parts.push({ text: schemaPrompt });
-
-    const gem = await fetchGeminiWithRetry(key, {
-      contents: [{ role: 'user', parts }],
-      generationConfig: {
-        maxOutputTokens: 16384,
-        temperature: 0.1,
-        responseMimeType: 'application/json',
-      },
-    });
-
-    // Cleanup temp files
-    for (const p of tmpPaths) { try { fs.unlinkSync(p); } catch {} }
-
-    const raw = gem?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-    let data = {};
-    try {
-      const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
-      data = JSON.parse(raw.slice(fb, lb + 1));
-    } catch (e) {
-      console.error('Estimate JSON parse fail:', e.message, raw.slice(0, 400));
-      return res.status(500).json({ error: 'AI returned invalid JSON. Try again with clearer drawings.' });
-    }
-
-    if (!data.sections || !data.sections.length) {
-      return res.status(400).json({ error: 'No estimable items found in drawings.', raw: data });
-    }
-
-    const wb = await buildEstimateWorkbook(data);
-    const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
-    const pname = (data.project_name || projectName || 'Drawing').replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 24);
-
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${pname}_MODESTAA_Estimate_${today}.xlsx"`);
-    res.setHeader('X-Estimate-Meta', encodeURIComponent(JSON.stringify({
-      project: data.project_name, bua: data.builtup_area_sqft,
-      sections: data.sections.map(s => ({ title: s.title, items: s.items.length })),
-    })));
-    await wb.xlsx.write(res);
-    res.end();
-  } catch (err) {
-    console.error('Full-estimate error:', err);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── 8b. DRAWING — tile-based deep zoom analysis ───────────────────
-// Frontend sends each PDF page as: 1 full-page thumbnail + 9 cropped tiles (3×3 grid).
-// Server receives 4 cropped tiles (2×2 grid) per page + full thumbnail.
-// All tiles sent in ONE Gemini call per page → free tier friendly (1 call/page).
-app.post('/analyze-drawing-pdf', async (req, res) => {
-  try {
-    const key = process.env.GEMINI_API_KEY;
-    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
-
-    const { pagesData = [], userText = '', filename = 'drawing' } = req.body;
-    if (!pagesData.length) return res.status(400).json({ error: 'No pages provided.' });
-
-    const pageResults = [];
-
-    for (const pageInfo of pagesData) {
-      const { pageNum, totalPages, tiles = [] } = pageInfo;
-      if (!tiles.length) continue;
-
-      const fullTile  = tiles.find(t => t.label === 'FULL_PAGE');
-      const zoneTiles = tiles.filter(t => t.label !== 'FULL_PAGE');
-
-      // Build ONE Gemini request with all images: full page + all zone tiles
-      // Gemini sees the full drawing AND each zoomed zone in the same context window
-      const parts = [];
-
-      // Image 1: Full page thumbnail for overall context
-      if (fullTile) {
-        parts.push({ inline_data: { mime_type: 'image/png', data: fullTile.b64 } });
-        parts.push({ text: `[IMAGE 1 — FULL PAGE OVERVIEW of "${filename}", Page ${pageNum}/${totalPages}]` });
-      }
-
-      // Images 2–5: Zoomed tiles (TOP-LEFT, TOP-RIGHT, BOTTOM-LEFT, BOTTOM-RIGHT)
-      zoneTiles.forEach((tile, i) => {
-        parts.push({ inline_data: { mime_type: 'image/png', data: tile.b64 } });
-        parts.push({ text: `[IMAGE ${i + 2} — ZOOMED ZONE: ${tile.zone}]` });
-      });
-
-      // Final instruction prompt
-      const prompt = `You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience.
-
-You have been given ${parts.filter(p=>p.inline_data).length} images of the SAME drawing page:
-- Image 1: Full page overview (to understand layout)
-- Images 2–5: Zoomed-in zones (TOP-LEFT, TOP-RIGHT, BOTTOM-LEFT, BOTTOM-RIGHT)
-
-Drawing file: "${filename}" | Page ${pageNum} of ${totalPages}
-
-YOUR JOB — Read EVERYTHING from ALL zones and produce a COMPLETE PMC report:
-
-**STEP 1 — TITLE BLOCK** (usually bottom-right zone):
-Read every field: Drawing No | Project Name | Revision | Date | Engineer/Firm | Scale | Client
-
-**STEP 2 — ALL ELEMENTS & DIMENSIONS**
-Zoom into each image and list EVERY element with exact measurements:
-- Footings: ID, plan size (L×W mm), depth, PCC below
-- Columns: ID, size (B×D mm), pedestal dimensions
-- Beams: ID, size, span
-- Slabs: thickness, extent
-- Roads: length, carriageway width, ROW width
-- Any other element visible
-
-**STEP 3 — REINFORCEMENT** (read bar marks from zoomed images):
-List every bar annotation: "F1 bottom: 10T16@150 + 10T16@150 EW | Top: T10@200 | Stirrups: 8Φ@150"
-
-**STEP 4 — QUANTITIES TABLE**
-| Element | ID | Size (mm) | Grade | Nos | Vol (CUM) | Steel (KG) | Fmwk (SQMT) | Cost (₹) |
-Formulas: Footing=L×W×D | Column=B×D×H | Steel/m³: Footing=80 | Col=160 | Slab=120 | Beam=200
-
-**STEP 5 — STEEL BAR BENDING SCHEDULE**
-| Element | Bar Mark | Dia(mm) | Nos | Cut Length(m) | Total(m) | kg/m | Wt(kg) |
-Weights: 8=0.395 | 10=0.617 | 12=0.888 | 16=1.58 | 20=2.47 | 25=3.86
-
-**STEP 6 — COST SUMMARY** (Gujarat DSR 2025)
-RCC M25=₹5500/cum | M30=₹5800/cum | Steel=₹56/kg | Formwork=₹180/sqmt | Excavation=₹180/cum | PCC=₹4200/cum | Tiles=₹850/sqmt
-
-**STEP 7 — PMC OBSERVATIONS**
-IS 456 | IS 1786 | IS 13920 compliance | Cover requirements | Any concerns
-
-RULES:
-✅ Use ONLY actual values visible in the images
-✅ If a value is in the zoomed tile, use the zoomed tile — it is more readable
-✅ NEVER say "I cannot see" — zoom into the relevant image and read it
-✅ No placeholder or assumed values
-${userText ? `\nENGINEER NOTE: ${userText}` : ''}`;
-
-      parts.push({ text: prompt });
-
-      const gemData = await fetchGeminiWithRetry(key, {
-        contents: [{ role: 'user', parts }],
-        generationConfig: { maxOutputTokens: 8192, temperature: 0.0 }
-      }, { maxRetries: 6, baseDelayMs: 3000 });
-
-      const report = gemData?.candidates?.[0]?.content?.parts?.[0]?.text
-        || (gemData?.error ? `⚠️ Gemini Error (Page ${pageNum}): ${gemData.error.message || JSON.stringify(gemData.error)}` : 'No analysis returned.');
-
-      pageResults.push({ page: pageNum, report });
-    }
-
-    const combined = pageResults.length === 1
-      ? pageResults[0].report
-      : pageResults.map(p => `---\n# Page ${p.page} Analysis\n\n${p.report}`).join('\n\n');
-
-    res.json({ success: true, analysis: combined, pages_analyzed: pageResults.length });
-  } catch (err) {
-    console.error('analyze-drawing-pdf error:', err);
     res.status(500).json({ error: err.message });
   }
 });
