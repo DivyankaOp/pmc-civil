@@ -441,6 +441,21 @@ function autoGenerateBOQ(ws, row, dd, today) {
   sc(nc, C.ORANGE, true, 'FFFFFFFF', 9, 'center');
   ws.getRow(row++).height = 16;
 
+  // FIX-3: Disclaimer — quantities are thumb-rule estimates, not from drawing dims
+  ws.mergeCells(row, 1, row, 6);
+  const disc = ws.getCell(row, 1);
+  disc.value = '⚠️ ESTIMATES ONLY — Quantities use engineering thumb-rule conversion factors (e.g. Area×0.15 for RCC volume). NOT extracted from drawing dimensions. Verify all quantities against actual drawing before use.';
+  sc(disc, 'FFFFC000', true, 'FF7F0000', 8, 'left');
+  ws.getRow(row++).height = 22;
+
+  // BASIS column header
+  const hdr = ws.getRow(row);
+  ['SR', 'DESCRIPTION (ESTIMATED)', 'UNIT', 'QTY (THUMB RULE)', 'RATE (₹)', 'AMOUNT (₹)'].forEach((h, i) => {
+    const c = hdr.getCell(i + 1); c.value = h;
+    sc(c, C.BLUE, true, 'FFFFFFFF', 9, 'center');
+  });
+  ws.getRow(row++).height = 16;
+
   const totalArea = areas.reduce((s, a) => s + (a.area_sqm || 0), 0);
   let grandTotal = 0;
   let sr = 1;
