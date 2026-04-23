@@ -518,12 +518,16 @@ function addMsgEl(role,text,fnames,badge,msgFiles,msgText,aiResponseText,dxfFile
   // DXF file → show DXF Excel button
   if(role==='ai'&&dxfFile){
     const br=document.createElement('div');br.className='btn-row';
-    const dxfB=mkBtn('dwg','📐','Download DXF Excel (7 Sheets)',()=>dlDXFExcel(dxfB,dxfFile));
-br.appendChild(dxfB);
-
-// NEW: Estimate auto-update button
-const estB=mkBtn('auto','🏗️','Overall Estimate Update (Area Auto)',()=>updateEstimateFromDXF(estB,dxfFile));
-br.appendChild(estB);
+    // ── Button 1: DXF Full Excel (8 Sheets)
+    const dxfB=mkBtn('dwg','📐','DXF Full Excel (8 Sheets)',()=>dlDXFExcel(dxfB,dxfFile));
+    br.appendChild(dxfB);
+    // ── Button 2: Section-wise BOQ Excel
+    const boqB=mkBtn('auto','📋','Section-wise BOQ Excel',()=>dlDXFExcel(boqB,dxfFile));
+    br.appendChild(boqB);
+    // ── Button 3: Floor Level Report
+    const lvlB=mkBtn('xl','🏢','Floor Level Report',()=>dlDXFExcel(lvlB,dxfFile));
+    br.appendChild(lvlB);
+    bub.appendChild(br);
   } else if(role==='ai'&&msgFiles&&msgFiles.length>0){
     const br=document.createElement('div');br.className='btn-row';
     const isDwg=(mode==='drawing'||mode==='auto'||mode==='boq'||mode==='estimate'||mode==='study');
@@ -648,30 +652,50 @@ async function send(){
       const data=await res.json();
       const gi=data.interpretation||{};
       const dd=data.dxf_data||{};
-      const summary=`## DXF Drawing Analysis: ${gi.project_name||dxfFile.name}
+      const summary=`## 📐 DXF Drawing Analysis: ${gi.project_name||dxfFile.name}
 
-**Scale:** ${dd.scale||gi.scale||'Not detected'} | **Drawing Type:** ${gi.drawing_type||'Site Layout'} | **Date:** ${gi.date||'—'}
+**Scale:** ${dd.scale||gi.scale||'Not detected'} | **Type:** ${gi.drawing_type||dd.drawing_type||'Section/Plan'} | **Units:** ${(dd.units||'mm').toUpperCase()}
 
-**Drawing Statistics:**
+---
+### 🏢 Building Overview
+| Parameter | Value |
+|-----------|-------|
+| Total Floors | ${dd.element_counts?.floor_count||gi.element_counts?.floor_count||'—'} |
+| Building Height | ${dd.drawing_extents?.height_m||0} m |
+| Drawing Size | ${dd.drawing_extents?.width_m||0}m × ${dd.drawing_extents?.height_m||0}m |
+| Doors | ${dd.element_counts?.door_count||0} nos |
+| Windows | ${dd.element_counts?.window_count||0} nos |
+| Lifts | ${dd.element_counts?.lift_count||0} nos |
+| Staircases | ${dd.element_counts?.staircase_count||0} nos |
+
+---
+### 📊 Drawing Statistics
 | Metric | Count |
 |--------|-------|
 | Layers | ${dd.stats?.total_layers||0} |
 | Text annotations | ${dd.stats?.total_texts||0} |
 | Dimension entities | ${dd.stats?.total_dims||0} |
-| Closed regions (polylines) | ${dd.polyline_areas?.length||0} |
-| Line entities | ${dd.stats?.total_lines||0} |
+| Closed regions | ${dd.polyline_areas?.length||0} |
+| Block instances | ${dd.stats?.total_inserts||0} |
 
-**Drawing Extents:** ${dd.drawing_extents?.estimated_width_m||0}m × ${dd.drawing_extents?.estimated_height_m||0}m
+---
+### 📏 Floor Levels Found
+${(dd.all_texts||[]).filter(t=>/LEVEL|FLOOR/i.test(t)).slice(0,20).map(t=>`- ${t}`).join('\n')||'— Levels not detected'}
 
-**Layers Found:** ${dd.layer_names?.join(', ')||'—'}
+---
+### 🏠 Spaces & Rooms
+${(dd.room_annotations||[]).map(r=>r.text).filter((v,i,a)=>a.indexOf(v)===i).slice(0,20).join(' | ')||'— See annotations sheet in Excel'}
 
-**Roads Detected:** ${(gi.roads||[]).map(r=>`${r.id}: ${r.dimensions?.length_m||0}m × ${r.dimensions?.width_m||0}m wide`).join(' | ')||'See extracted texts below'}
+---
+### 📐 Key Dimensions
+${dd.dimension_values?.slice(0,15).map(d=>`\`${d.value_m}m\``).join(' · ')||'—'}
 
-**All Text in Drawing:** ${dd.all_texts?.slice(0,30).join(' | ')||'—'}
+---
+### 🏗️ Layers in Drawing
+${dd.layer_names?.slice(0,20).join(', ')||'—'}
 
-**Dimension Values Found:** ${dd.dimension_values?.slice(0,20).map(d=>d.value_m+'m').join(', ')||'—'}
-
-**PMC Observation:** ${gi.pmc_recommendation||'DXF parsed. Click 🏗️ DXF Excel button to generate full multi-sheet Excel with quantities.'}`;
+---
+**PMC Note:** ${gi.pmc_recommendation||'DXF successfully parsed. Download Excel for full 8-sheet detailed report.'}`;
 
       rmLoad();
       hist=hist.filter(m=>m.role!=='user_parts');
