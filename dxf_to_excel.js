@@ -129,7 +129,71 @@ async function buildDXFExcel(dxfData, geminiResult, ExcelJS) {
   }
 
   // ══════════════════════════════════════════════════════════════
-  // SHEET 2 — ALL TEXT ANNOTATIONS (extracted directly from DXF)
+  // SHEET 2 — FLOOR LEVELS (extracted from DXF level annotations)
+  // ══════════════════════════════════════════════════════════════
+  {
+    const ws = wb.addWorksheet('FLOOR LEVELS');
+    ws.getColumn(1).width = 6;
+    ws.getColumn(2).width = 40;
+    ws.getColumn(3).width = 18;
+    ws.getColumn(4).width = 18;
+    ws.getColumn(5).width = 20;
+
+    let row = 1;
+    mergeRow(ws, row++, 5, 'FLOOR LEVEL SCHEDULE — AUTO-EXTRACTED FROM DXF', C.NAVY, 'FFFFFFFF', 11, 22);
+    mergeRow(ws, row++, 5, 'All level annotations found in drawing (e.g. +7590 MM LEVEL)', C.MIDBLUE, 'FFFFFFFF', 9, 16);
+    hdrRow(ws, row++, ['SR', 'LEVEL LABEL', 'LEVEL (mm)', 'LEVEL (m)', 'REMARKS']);
+
+    const levels = dd.floor_levels || gi.floor_levels || [];
+    // Also pull from gemini interpreted floor_levels
+    const geminiLevels = gi.floor_levels || [];
+    const allLevels = levels.length > 0 ? levels : geminiLevels;
+
+    if (allLevels.length > 0) {
+      allLevels.forEach((l, idx) => {
+        const bg = idx % 2 === 0 ? C.WHITE : C.GREY;
+        const isBasement = (l.level_mm || l.level_m * 1000 || 0) < 0;
+        const isTerrace  = /terrace|cabin|roof/i.test(l.label || '');
+        const remark = isBasement ? 'Basement level' : isTerrace ? 'Top level' : idx === allLevels.length - 1 ? 'Lowest level' : '';
+        dataRow(ws, row++, [
+          idx + 1,
+          l.label || l.name || '—',
+          l.level_mm != null ? l.level_mm : (l.level_m != null ? Math.round(l.level_m * 1000) : '—'),
+          l.level_m != null ? l.level_m : (l.level_mm != null ? Math.round(l.level_mm / 10) / 100 : '—'),
+          remark
+        ], bg, 'center');
+      });
+
+      // Building height row
+      const maxLevel = allLevels.filter(l => l.level_mm != null).reduce((m, l) => Math.max(m, l.level_mm), 0);
+      const minLevel = allLevels.filter(l => l.level_mm != null).reduce((m, l) => Math.min(m, l.level_mm), 0);
+      row++;
+      ws.mergeCells(row, 1, row, 2);
+      const lc = ws.getCell(row, 1); lc.value = 'TOTAL BUILDING HEIGHT';
+      sc(lc, C.YELLOW, true, 'FF000000', 9, 'right');
+      const lv = ws.getCell(row, 3); lv.value = maxLevel - minLevel;
+      sc(lv, C.YELLOW, true, 'FF000000', 9, 'right');
+      const lvm = ws.getCell(row, 4); lvm.value = Math.round((maxLevel - minLevel) / 10) / 100;
+      sc(lvm, C.YELLOW, true, 'FF000000', 9, 'right');
+      ws.getRow(row).height = 16;
+    } else {
+      mergeRow(ws, row, 5, 'No floor level annotations found. Ensure level text exists in DXF (e.g. "+7590 MM LEVEL").', C.GREY, 'FF595959', 9, 20);
+    }
+
+    // Wall & Construction Notes
+    const wallNotes = dd.wall_notes || [];
+    if (wallNotes.length > 0) {
+      row += 2;
+      mergeRow(ws, row++, 5, 'WALL & CONSTRUCTION NOTES (from DXF annotations)', C.TEAL, 'FFFFFFFF', 10);
+      hdrRow(ws, row++, ['SR', 'ANNOTATION TEXT', 'LAYER', '', ''], C.TEAL);
+      wallNotes.slice(0, 40).forEach((note, idx) => {
+        dataRow(ws, row++, [idx + 1, note, '—', '', ''], idx % 2 === 0 ? C.WHITE : C.GREY, 'left');
+      });
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  // SHEET 3 — ALL TEXT ANNOTATIONS (extracted directly from DXF)
   // ══════════════════════════════════════════════════════════════
   {
     const ws = wb.addWorksheet('ANNOTATIONS');
