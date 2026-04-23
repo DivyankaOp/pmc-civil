@@ -1,0 +1,104 @@
+{
+  "_comment": "PER-DRAWING LEGEND — fill this from the actual drawing's title block legend / user confirmation. The parser uses ONLY what's here; nothing is assumed. Unknown layers/blocks/colors/text patterns are surfaced to the user via user_questions output.",
+  "_schema_version": 1,
+  "_how_to_use": [
+    "1. Run parser once with empty legend — it writes user_questions.txt listing every unmapped layer/block/color/text pattern",
+    "2. For each question, add a mapping below (layers / blocks / colors / text_patterns / abbreviations)",
+    "3. Re-run parser — now items are categorised and quantities computed",
+    "4. Mappings are per drawing-set. For a new project, start a new legend_<project>.json or overwrite."
+  ],
+
+  "project_id": "",
+  "project_type": "",
+
+  "layers": {
+    "_comment": "Map each AutoCAD layer name → semantic meaning. category drives quantity bucket.",
+    "_example": {
+      "A-WALL-100": { "category": "wall",       "wall_thickness_mm": 100, "notes": "100mm block wall" },
+      "A-WALL-230": { "category": "wall",       "wall_thickness_mm": 230, "notes": "230mm block wall" },
+      "A-DOOR":     { "category": "opening",    "opening_type": "door" },
+      "A-WINDOW":   { "category": "opening",    "opening_type": "window" },
+      "S-COLUMN":   { "category": "column" },
+      "S-FOOTING":  { "category": "footing" },
+      "C-EXCA":     { "category": "excavation_line" },
+      "C-DWALL":    { "category": "d_wall" },
+      "A-ROOM":     { "category": "room_boundary" },
+      "A-DIM":      { "category": "dimension" },
+      "A-TXT":      { "category": "annotation" },
+      "A-GRID":     { "category": "grid" },
+      "DEFPOINTS":  { "category": "ignore" }
+    }
+  },
+
+  "blocks": {
+    "_comment": "Map AutoCAD block (INSERT) name → opening/fixture/etc. Width/height in mm for deduction calc.",
+    "_example": {
+      "D1":   { "category": "opening", "opening_type": "door",   "width_mm": 990,  "height_mm": 2520 },
+      "D2":   { "category": "opening", "opening_type": "door",   "width_mm": 840,  "height_mm": 2520 },
+      "GD1":  { "category": "opening", "opening_type": "glass_door", "width_mm": 1200, "height_mm": 2890 },
+      "SLD1": { "category": "opening", "opening_type": "sliding_door", "width_mm": 6000, "height_mm": 2520 },
+      "W1":   { "category": "opening", "opening_type": "window", "width_mm": 3280, "height_mm": 2370 },
+      "V1":   { "category": "opening", "opening_type": "ventilator", "width_mm": 600, "height_mm": 1200 },
+      "KW":   { "category": "opening", "opening_type": "kitchen_window", "width_mm": 1500, "height_mm": 1320 },
+      "LD":   { "category": "opening", "opening_type": "lift_door", "width_mm": 1200, "height_mm": 2520 },
+      "COL-300": { "category": "column", "size_mm": [300, 300] }
+    }
+  },
+
+  "colors": {
+    "_comment": "AutoCAD Color Index (ACI 1-255) → meaning. Only fill if color is semantically used (e.g. red = excavation line).",
+    "_example": {
+      "1":  { "meaning": "excavation_line",  "notes": "red" },
+      "3":  { "meaning": "backfill_line",    "notes": "green" },
+      "5":  { "meaning": "d_wall",           "notes": "blue" },
+      "6":  { "meaning": "dimension",        "notes": "magenta" },
+      "7":  { "meaning": "default",          "notes": "white/black" }
+    }
+  },
+
+  "text_patterns": {
+    "_comment": "Regex patterns to extract structured info from text annotations.",
+    "_example": {
+      "floor_height_mt":   "H\\s*=\\s*(\\d+(?:\\.\\d+)?)\\s*MT",
+      "plinth_rise_mm":    "\\+\\s*(\\d+)\\s*MM\\s+RISED",
+      "grid_ref_sw":       "\\bSW\\d+\\b",
+      "grid_ref_col":      "\\bC\\d+\\b",
+      "wall_thickness_mm": "WALL[-\\s]?(\\d+)\\s*MM",
+      "room_label":        "^(BEDROOM|KITCHEN|TOILET|LIVING|PASSAGE|STORE|BATH|WASH|LIFT|STAIR|FOYER|BALCONY|DECK)"
+    }
+  },
+
+  "abbreviations": {
+    "_comment": "Short codes used in the drawing → full meaning. Only the ones confirmed by user.",
+    "_example": {
+      "NGL":  "Natural Ground Level",
+      "FFL":  "Finished Floor Level",
+      "D-WALL": "Diaphragm Wall",
+      "GD":   "Glass Door",
+      "SLD":  "Sliding Door",
+      "LD":   "Lift Door",
+      "MD":   "Main Door",
+      "FD":   "Fire Door",
+      "KW":   "Kitchen Window",
+      "W":    "Window",
+      "V":    "Ventilator",
+      "SW":   "Shear Wall (grid reference)"
+    }
+  },
+
+  "excavation_rules": {
+    "_comment": "Per-drawing rules for excavation/backfill offsets. User provides from drawing section.",
+    "offset_from_dwall_outer_mm": null,
+    "plinth_above_ngl_mm":        null,
+    "footing_bottom_depth_m":     null
+  },
+
+  "floor_heights": {
+    "_comment": "Floor label → clear height (m). Filled from section drawing title (H=3.66 MT).",
+    "_example": {
+      "3RD BASEMENT": 3.66,
+      "GROUND FLOOR": 3.64,
+      "TYPICAL FLOOR": 3.35
+    }
+  }
+}
