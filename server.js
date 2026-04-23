@@ -498,7 +498,7 @@ app.post('/analyze-dxf', async (req, res) => {
     const { RATES: ratesMap } = require('./dxf_parser');
     const ratesSummary = Object.entries(ratesMap).slice(0, 30).map(([k,v]) => `${k}:${v}`).join(', ');
 
-    const prompt = `You are a senior PMC civil engineer analyzing a DXF drawing.
+    const prompt = `You are a senior PMC civil engineer analyzing a DXF architectural/structural drawing.
 ALL DATA BELOW IS EXTRACTED DIRECTLY FROM THIS DXF FILE. DO NOT INVENT VALUES. Do NOT copy values from other drawings or examples.
 If a value is not present in the data below, leave it 0 / "" / [] in the JSON.
 
@@ -513,12 +513,21 @@ ${JSON.stringify(civilData.element_counts || {}, null, 2)}
 
 WALL LENGTH FROM LINES: ${civilData.wall_length_m || 0} m
 
+FLOOR LEVELS FOUND IN DRAWING (${(civilData.floor_levels||[]).length}):
+${(civilData.floor_levels||[]).map(l=>`${l.label} = ${l.level_m||'?'}m`).join('\n')||'none'}
+
+WALL & CONSTRUCTION NOTES:
+${(civilData.wall_notes||[]).slice(0,30).join('\n')||'none'}
+
+RAMP NOTES:
+${(civilData.ramp_notes||[]).join('\n')||'none'}
+
 TEXT ANNOTATIONS (${civilData.stats.total_texts}):
-${civilData.all_texts.slice(0,150).join('\n')}
+${civilData.all_texts.slice(0,120).join('\n')}
 
 ROOM LABELS: ${(civilData.room_annotations||[]).map(r=>r.text).join(', ')||'none'}
 
-DIMENSIONS (top 60): ${civilData.dimension_values.slice(0,60).map(d=>`${d.value_m}m[${d.layer}]`).join(', ')}
+DIMENSIONS (top 50): ${civilData.dimension_values.slice(0,50).map(d=>`${d.value_m}m[${d.layer}]`).join(', ')}
 
 AREAS from polylines (${civilData.polyline_areas.length}): ${civilData.polyline_areas.slice(0,30).map(p=>`${p.area_sqm}sqm(${p.layer})`).join(', ')}
 
@@ -526,8 +535,8 @@ LAYERS: ${civilData.layer_names.join(', ')}
 BLOCKS: ${Object.entries(civilData.block_counts||{}).slice(0,20).map(([k,v])=>`${k}x${v}`).join(', ')||'none'}
 RATES AVAILABLE: ${ratesSummary}
 
-Return ONLY raw JSON (no markdown). Every numeric field you fill must be traceable to the data above:
-{"project_name":"","drawing_type":"FLOOR_PLAN|SECTION|ELEVATION|SITE_PLAN|ROAD_PLAN|STRUCTURAL|GENERAL","scale":"","date":"","spaces":[{"name":"","area_sqm":0}],"boq":[{"description":"","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0}],"total_bua_sqm":0,"element_counts":{"door_count":0,"window_count":0,"lift_count":0,"staircase_count":0,"floor_count":0},"observations":[],"pmc_recommendation":""}`;
+Return ONLY raw JSON (no markdown). Every numeric field must come from the data above:
+{"project_name":"","drawing_type":"FLOOR_PLAN|SECTION|ELEVATION|SITE_PLAN|STRUCTURAL|GENERAL","scale":"","date":"","building_height_m":0,"floor_count":0,"basement_count":0,"floor_levels":[{"name":"","level_m":0}],"spaces":[{"name":"","area_sqm":0}],"wall_notes":[],"boq":[{"description":"","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0}],"total_bua_sqm":0,"element_counts":{"door_count":0,"window_count":0,"lift_count":0,"staircase_count":0,"floor_count":0},"observations":[],"pmc_recommendation":""}`;
 
     const geminiData3 = await fetchGeminiWithRetry(key, {
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
