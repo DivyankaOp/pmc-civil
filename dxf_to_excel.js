@@ -402,86 +402,175 @@ async function buildDXFExcel(dxfData, geminiResult, ExcelJS) {
   }
 
   // ══════════════════════════════════════════════════════════════
-  // SHEET 7 — BOQ (from Gemini interpretation, no hardcoded items)
+  // SHEET 7 — BOQ ESTIMATE (dynamic per drawing type)
   // ══════════════════════════════════════════════════════════════
   {
+    const { getBOQForDrawingType, detectDrawingType, DRAWING_TYPES } = require('./drawing_analyzer');
+
     const ws = wb.addWorksheet('BOQ ESTIMATE');
     ws.getColumn(1).width = 6;
-    ws.getColumn(2).width = 42;
+    ws.getColumn(2).width = 46;
     ws.getColumn(3).width = 10;
     ws.getColumn(4).width = 14;
     ws.getColumn(5).width = 14;
     ws.getColumn(6).width = 16;
+    ws.getColumn(7).width = 24;
+
+    // Resolve drawing type — Gemini first, then DXF keyword detection, then general
+    const detectedType = gi.drawing_type ||
+      detectDrawingType(dd.all_texts || [], dd.layer_names || [], dd.filename || '') ||
+      'GENERAL';
+
+    const dtLabel = DRAWING_TYPES[detectedType] || detectedType;
+    const totalBUA = Math.max(
+      gi.total_bua_sqm || 0,
+      dd.total_bua_sqm || 0,
+      (dd.polyline_areas || []).reduce((s, a) => s + (a.area_sqm || 0), 0)
+    ) || 100; // fallback 100 sqm if nothing parseable
+
+    const elementCounts = { ...(dd.element_counts || {}), ...(gi.element_counts || {}) };
+    const parsedDims    = { floor_count: gi.floor_count || dd.floor_count || 10 };
 
     let row = 1;
-    mergeRow(ws, row++, 6, 'BILL OF QUANTITIES — AI INTERPRETED FROM DRAWING', C.NAVY, 'FFFFFFFF', 11, 22);
-    mergeRow(ws, row++, 6, `Project: ${projectName}  |  Drawing: ${dd.filename || '—'}  |  Date: ${today}`, C.MIDBLUE, 'FFFFFFFF', 9, 16);
-    mergeRow(ws, row++, 6, 'NOTE: Quantities extracted from DXF geometry + AI interpretation. Verify before use.', C.YELLOW, 'FF000000', 9, 16);
+    mergeRow(ws, row++, 7, `BILL OF QUANTITIES — ${detectedType.replace(/_/g,' ')}`, C.NAVY, 'FFFFFFFF', 12, 24);
+    mergeRow(ws, row++, 7, `Drawing Type: ${dtLabel}`, C.MIDBLUE, 'FFFFFFFF', 9, 16);
+    mergeRow(ws, row++, 7, `Project: ${projectName}  |  File: ${dd.filename || '—'}  |  BUA: ${Math.round(totalBUA)} sqm  |  Date: ${today}`, C.LTBLUE, 'FF1F3864', 9, 14);
+    mergeRow(ws, row++, 7, '⚠ ESTIMATED: Quantities from drawing geometry + engineering thumb-rules. Verify before final use.', 'FFFFC000', 'FF7F0000', 9, 16);
+    row++;
+    hdrRow(ws, row++, ['SR', 'DESCRIPTION OF WORK', 'UNIT', 'QTY', 'RATE (₹)', 'AMOUNT (₹)', 'BASIS / REMARK'], C.NAVY);
 
-    hdrRow(ws, row++, ['SR', 'DESCRIPTION', 'UNIT', 'QTY', 'RATE (₹)', 'AMOUNT (₹)']);
-
-    const boqItems = gi.boq || [];
+    // ── Layer 1: Gemini BOQ if AI gave items ──────────────────────────
+    const gemBOQ = (gi.boq || []).filter(it => (parseFloat(it.qty) || 0) > 0 && (parseFloat(it.rate) || 0) > 0);
     let grandTotal = 0;
+    let sr = 1;
 
-    if (boqItems.length > 0) {
-      boqItems.forEach((item, idx) => {
-        const bg = idx % 2 === 0 ? C.WHITE : C.GREY;
-        const qty    = parseFloat(item.qty)    || 0;
-        const rate   = parseFloat(item.rate)   || 0;
-        const amount = parseFloat(item.amount) || (qty * rate);
-        grandTotal += amount;
+    if (gemBOQ.length > 0) {
+      mergeRow(ws, row++, 7, `── AI-EXTRACTED BOQ (from drawing annotations) ──`, C.DKGREEN, 'FFFFFFFF', 9, 15);
+      gemBOQ.forEach((item, idx) => {
+        const bg  = idx % 2 === 0 ? C.WHITE : C.GREY;
+        const qty = parseFloat(item.qty)    || 0;
+        const rate= parseFloat(item.rate)   || 0;
+        const amt = Math.round(qty * rate);
+        grandTotal += amt;
         const rc = ws.getRow(row);
-        [idx+1, item.description, item.unit, qty, rate, Math.round(amount)].forEach((v, i) => {
-          const c = rc.getCell(i+1); c.value = v;
+        [sr++, item.description||item.particular||'', item.unit, qty, rate, amt, 'AI extracted'].forEach((v, i) => {
+          const c = rc.getCell(i + 1);
+          c.value = v;
           sc(c, bg, false, 'FF000000', 9, i < 2 ? 'left' : 'right');
           if (i >= 3 && typeof v === 'number') c.numFmt = '#,##0';
         });
         ws.getRow(row++).height = 15;
       });
-
-      // Grand total row
-      ws.mergeCells(row, 1, row, 4);
-      const gt = ws.getCell(row, 1); gt.value = 'GRAND TOTAL';
-      sc(gt, C.YELLOW, true, 'FF000000', 10, 'right');
-      const gv = ws.getCell(row, 6); gv.value = Math.round(grandTotal);
-      gv.numFmt = '₹#,##0'; sc(gv, C.YELLOW, true, 'FF000000', 10, 'right');
-      ws.getRow(row).height = 18;
-    } else {
-      // Auto-generate BOQ from polyline areas if no Gemini BOQ available
-      row = autoGenerateBOQ(ws, row, dd, today);
     }
+
+    // ── Layer 2: Template BOQ from drawing type (fills gaps / replaces if AI gave nothing) ──
+    const templateBOQ = getBOQForDrawingType(detectedType, totalBUA, elementCounts, parsedDims);
+    if (templateBOQ.length > 0) {
+      const headerLabel = gemBOQ.length > 0
+        ? `── SUPPLEMENTARY BOQ (${detectedType.replace(/_/g,' ')} thumb-rule quantities) ──`
+        : `── BOQ FOR ${detectedType.replace(/_/g,' ')} (Gujarat DSR 2025 rates) ──`;
+      mergeRow(ws, row++, 7, headerLabel, C.ORANGE, 'FFFFFFFF', 9, 15);
+      templateBOQ.forEach((item, idx) => {
+        const bg  = idx % 2 === 0 ? C.WHITE : C.GREY;
+        grandTotal += item.amount;
+        const rc = ws.getRow(row);
+        [sr++, item.desc, item.unit, item.qty, item.rate, item.amount, `Template: ${detectedType}`].forEach((v, i) => {
+          const c = rc.getCell(i + 1);
+          c.value = v;
+          sc(c, bg, false, 'FF000000', 9, i < 2 ? 'left' : 'right');
+          if (i >= 3 && typeof v === 'number') c.numFmt = '#,##0';
+        });
+        ws.getRow(row++).height = 15;
+      });
+    }
+
+    if (gemBOQ.length === 0 && templateBOQ.length === 0) {
+      mergeRow(ws, row++, 7, 'No BOQ items could be generated — drawing data insufficient.', C.GREY, 'FF595959', 9, 18);
+    }
+
+    // Grand total row
+    row++;
+    ws.mergeCells(row, 1, row, 5);
+    const gt = ws.getCell(row, 1);
+    gt.value = `GRAND TOTAL — ${detectedType.replace(/_/g,' ')}  (BUA: ${Math.round(totalBUA)} sqm)`;
+    sc(gt, C.NAVY, true, 'FFFFFFFF', 10, 'right');
+    const gv = ws.getCell(row, 6);
+    gv.value = grandTotal;
+    gv.numFmt = '₹#,##0';
+    sc(gv, C.NAVY, true, 'FFFFD966', 11, 'right');
+    ws.getRow(row++).height = 22;
+
+    // Lacs / Crore summary
+    const lacs   = Math.round(grandTotal / 100000 * 100) / 100;
+    const crores = Math.round(lacs / 100 * 100) / 100;
+    ws.mergeCells(row, 1, row, 5);
+    const sl = ws.getCell(row, 1);
+    sl.value = `TOTAL: ₹${lacs} LACS  (₹${crores} CR)  — ${drawingType} estimate`;
+    sc(sl, C.LTBLUE, true, 'FF1F3864', 9, 'right');
+    ws.getRow(row++).height = 16;
   }
 
   // ══════════════════════════════════════════════════════════════
-  // SHEET 8 — RATES REFERENCE (from rates.json, fully editable)
+  // SHEET 8 — SPECIAL DATA (drawing-type specific extra info)
   // ══════════════════════════════════════════════════════════════
   {
-    const ws = wb.addWorksheet('RATES REFERENCE');
-    ws.getColumn(1).width = 6;
-    ws.getColumn(2).width = 38;
-    ws.getColumn(3).width = 12;
-    ws.getColumn(4).width = 18;
-    ws.getColumn(5).width = 22;
+    const specialData = gi.special_data || {};
+    const hasSpecial  = Object.values(specialData).some(v => v && v !== 0);
+    const drawingType = gi.drawing_type || 'GENERAL';
 
-    let row = 1;
-    mergeRow(ws, row++, 5, 'RATES REFERENCE — FROM rates.json CONFIG', C.NAVY, 'FFFFFFFF', 11, 22);
-    mergeRow(ws, row++, 5, 'Edit rates.json to update. No code change required.', C.MIDBLUE, 'FFFFFFFF', 9, 16);
+    if (hasSpecial) {
+      const ws = wb.addWorksheet('SPECIAL DATA');
+      ws.getColumn(1).width = 6;
+      ws.getColumn(2).width = 36;
+      ws.getColumn(3).width = 28;
+      ws.getColumn(4).width = 20;
 
-    for (const [category, items] of Object.entries(RATES_CONFIG)) {
-      if (category.startsWith('_') || typeof items !== 'object') continue;
-      row++;
-      const catLabel = category.toUpperCase().replace(/_/g, ' ');
-      mergeRow(ws, row++, 5, catLabel, C.NAVY, 'FFFFFFFF', 10);
-      hdrRow(ws, row++, ['SR', 'DESCRIPTION', 'UNIT', 'RATE (₹)', 'REMARKS']);
+      let row = 1;
+      mergeRow(ws, row++, 4, `SPECIAL DATA — ${drawingType.replace(/_/g,' ')}`, C.NAVY, 'FFFFFFFF', 12, 22);
+      mergeRow(ws, row++, 4, 'Drawing-type specific parameters extracted from drawing', C.MIDBLUE, 'FFFFFFFF', 9, 15);
+      hdrRow(ws, row++, ['SR', 'PARAMETER', 'VALUE', 'UNIT / NOTE'], C.NAVY);
+
+      const paramLabels = {
+        lift_car_size:          ['Lift Car Size (W×D)', ''],
+        lift_shaft_size:        ['Lift Shaft Size (W×D)', ''],
+        lift_pit_depth_m:       ['Lift Pit Depth', 'm'],
+        lift_overhead_m:        ['Overhead Clearance', 'm'],
+        stair_rise_mm:          ['Stair Rise', 'mm'],
+        stair_tread_mm:         ['Stair Tread', 'mm'],
+        stair_flight_width_m:   ['Stair Flight Width', 'm'],
+        column_size:            ['Column Size (b×d)', 'mm'],
+        beam_size:              ['Beam Size (b×d)', 'mm'],
+        main_bar_dia_mm:        ['Main Bar Diameter', 'mm Fe500'],
+        stirrup_spacing_mm:     ['Stirrup Spacing', 'mm c/c'],
+        cover_mm:               ['Clear Cover', 'mm'],
+        parking_bay_size:       ['Parking Bay Size', 'm×m'],
+        ramp_grade_pct:         ['Ramp Grade', '%'],
+        plot_area_sqm:          ['Plot Area', 'sqm'],
+        setback_front_m:        ['Front Setback', 'm'],
+        setback_side_m:         ['Side Setback', 'm'],
+        road_carriageway_width_m:['Carriageway Width', 'm'],
+        road_total_length_m:    ['Road Total Length', 'm'],
+        pile_dia_mm:            ['Pile Diameter', 'mm'],
+        pile_depth_m:           ['Pile Depth', 'm'],
+        pipe_dia_mm:            ['Pipe Diameter', 'mm'],
+        pipe_material:          ['Pipe Material', ''],
+        invert_level_m:         ['Invert Level', 'm'],
+        floor_height_m:         ['Typical Floor Height', 'm'],
+        parapet_height_m:       ['Parapet Height', 'm'],
+        cladding_material:      ['Cladding Material', ''],
+      };
+
       let sr = 1;
-      for (const [key, val] of Object.entries(items)) {
+      for (const [key, [label, unit]] of Object.entries(paramLabels)) {
+        const val = specialData[key];
+        if (val === undefined || val === null || val === 0 || val === '') continue;
         const bg = sr % 2 === 0 ? C.WHITE : C.GREY;
-        dataRow(ws, row++, [sr++, val.description || key, val.unit || '—', val.rate || 0, `rates.json → ${category}.${key}`], bg, 'left');
+        dataRow(ws, row++, [sr++, label, val, unit], bg, 'left');
       }
-    }
 
-    if (Object.keys(RATES_CONFIG).filter(k => !k.startsWith('_')).length === 0) {
-      mergeRow(ws, row, 5, 'rates.json not found or empty. Add rates.json to project folder.', C.GREY, 'FF595959', 9);
+      if (sr === 1) {
+        mergeRow(ws, row, 4, 'No special parameters extracted for this drawing type.', C.GREY, 'FF595959', 9, 18);
+      }
     }
   }
 
