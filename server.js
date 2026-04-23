@@ -955,7 +955,291 @@ OUTPUT FORMAT — Full PMC Analysis Report:
   }
 });
 
-// ─── 9. HEALTH ─────────────────────────────────────────────────────
+// ─── 9. SYMBOL CLASSIFICATION — Step 1: classify known/unknown ────
+// Called right after DXF upload. Returns known symbols + unknown list.
+// Unknown symbols will be shown to user as questions in the chat UI.
+app.post('/classify-dxf', async (req, res) => {
+  try {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
+    const { dxfContent, filename } = req.body;
+    if (!dxfContent) return res.status(400).json({ error: 'No DXF content.' });
+
+    const fs = require('fs');
+
+    // Load learned symbols from disk
+    const learnedPath = path.join(__dirname, 'symbols-learned.json');
+    let learned = { blocks: {}, layers: {} };
+    try { learned = JSON.parse(fs.readFileSync(learnedPath, 'utf8')); } catch(e) {}
+
+    // Parse DXF
+    const parsed = parseDXF(dxfContent);
+    const civilData = extractCivilData(parsed, filename);
+
+    const allBlocks = Object.keys(civilData.block_counts || {});
+    const allLayers = civilData.layer_names || [];
+
+    // Split blocks into known (in learned dict) vs unknown
+    const knownBlocks = {};
+    const unknownBlocks = [];
+    for (const b of allBlocks) {
+      const bUp = b.toUpperCase();
+      // Check learned dict first
+      if (learned.blocks[bUp]) {
+        knownBlocks[b] = learned.blocks[bUp];
+        continue;
+      }
+      // Check common AutoCAD naming conventions
+      const autoType = guessBlockType(b);
+      if (autoType) {
+        knownBlocks[b] = autoType;
+      } else {
+        unknownBlocks.push({ name: b, count: civilData.block_counts[b] || 1 });
+      }
+    }
+
+    // Split layers into known vs unknown
+    const knownLayers = {};
+    const unknownLayers = [];
+    const LAYER_PREFIXES = {
+      'A-': 'architectural', 'S-': 'structural', 'E-': 'electrical',
+      'P-': 'plumbing', 'M-': 'mechanical', 'C-': 'civil',
+      'WALL': 'wall', 'DOOR': 'door', 'WINDOW': 'window',
+      'COLUMN': 'column', 'COL': 'column', 'BEAM': 'beam',
+      'SLAB': 'slab', 'STAIR': 'staircase', 'LIFT': 'lift',
+      'RAMP': 'ramp', 'TOILET': 'toilet', 'KITCHEN': 'kitchen',
+      'PARK': 'parking', 'ROAD': 'road', 'HATCH': 'hatch',
+      'DIM': 'dimension', 'TEXT': 'text', 'TITLE': 'title-block',
+      'DEFPOINTS': 'dimension-helper', '0': 'default'
+    };
+    for (const l of allLayers) {
+      const lUp = l.toUpperCase();
+      if (learned.layers[lUp]) { knownLayers[l] = learned.layers[lUp]; continue; }
+      let matched = false;
+      for (const [pfx, type] of Object.entries(LAYER_PREFIXES)) {
+        if (lUp.startsWith(pfx) || lUp.includes(pfx)) {
+          knownLayers[l] = type; matched = true; break;
+        }
+      }
+      if (!matched) unknownLayers.push(l);
+    }
+
+    // Ask Gemini to classify ONLY the unknowns (saves tokens)
+    let geminiClassified = { blocks: {}, layers: {} };
+    const needsGemini = unknownBlocks.length > 0 || unknownLayers.length > 0;
+    if (needsGemini) {
+      const classifyPrompt = `You are a senior AutoCAD civil drawing expert.
+Classify these unknown block names and layer names from a civil DXF drawing.
+
+UNKNOWN BLOCKS (name → count in drawing):
+${unknownBlocks.map(b => `${b.name} (×${b.count})`).join('\n') || 'none'}
+
+UNKNOWN LAYERS:
+${unknownLayers.join('\n') || 'none'}
+
+DRAWING CONTEXT:
+- File: ${filename}
+- Drawing type: ${civilData.drawing_type}
+- Texts found: ${civilData.all_texts.slice(0, 30).join(', ')}
+
+For each item, classify as one of:
+door | window | column | beam | slab | wall | staircase | lift | ramp | toilet | kitchen | bedroom | parking | road | hatch | dimension | text | furniture | equipment | unknown
+
+Return ONLY raw JSON:
+{
+  "blocks": { "BLOCK_NAME": "type", ... },
+  "layers": { "LAYER_NAME": "type", ... },
+  "still_unknown_blocks": ["BLOCK_NAME"],
+  "still_unknown_layers": ["LAYER_NAME"]
+}
+
+Rules:
+- If you can reasonably guess from name → classify it
+- If genuinely unclear → put in still_unknown arrays
+- No markdown, no explanation, only JSON`;
+
+      const gData = await fetchGeminiWithRetry(key, {
+        contents: [{ role: 'user', parts: [{ text: classifyPrompt }] }],
+        generationConfig: { maxOutputTokens: 2048, temperature: 0.0, responseMimeType: 'application/json' }
+      });
+      let raw = gData?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
+      if (fb !== -1) {
+        try { geminiClassified = JSON.parse(raw.slice(fb, lb + 1)); } catch(e) {}
+      }
+    }
+
+    // Merge all known
+    const finalKnownBlocks = { ...knownBlocks, ...(geminiClassified.blocks || {}) };
+    const finalKnownLayers = { ...knownLayers, ...(geminiClassified.layers || {}) };
+
+    // These still need user input
+    const askUserBlocks = (geminiClassified.still_unknown_blocks || [])
+      .map(name => ({ name, count: civilData.block_counts[name] || 1 }));
+    const askUserLayers = geminiClassified.still_unknown_layers || [];
+
+    res.json({
+      success: true,
+      filename,
+      dxf_data: civilData,
+      known_blocks: finalKnownBlocks,
+      known_layers: finalKnownLayers,
+      ask_user_blocks: askUserBlocks,
+      ask_user_layers: askUserLayers,
+      needs_questions: askUserBlocks.length > 0 || askUserLayers.length > 0
+    });
+
+  } catch (err) {
+    console.error('classify-dxf error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Helper: guess block type from common AutoCAD naming conventions
+function guessBlockType(name) {
+  const n = name.toUpperCase();
+  if (/^D\d+$|DR[-_]?\d|DOOR|FLUSH|SFD|DOOR[-_]/.test(n)) return 'door';
+  if (/^W\d+$|WIN[-_]?\d|WINDOW|ALUM[-_]WIN|CASEMENT/.test(n)) return 'window';
+  if (/COL[-_]?\d|^C\d+$|COLUMN|PILLAR/.test(n)) return 'column';
+  if (/BEAM|BM[-_]?\d/.test(n)) return 'beam';
+  if (/LIFT|ELEV|ELEVATOR/.test(n)) return 'lift';
+  if (/STAIR|STC|STEP/.test(n)) return 'staircase';
+  if (/RAMP/.test(n)) return 'ramp';
+  if (/TOILET|WC|BATH/.test(n)) return 'toilet';
+  if (/KITCHEN|PANTRY/.test(n)) return 'kitchen';
+  if (/BED|MASTER/.test(n)) return 'bedroom';
+  if (/SOFA|TABLE|CHAIR|FURN/.test(n)) return 'furniture';
+  if (/TREE|SHRUB|PLANT/.test(n)) return 'landscaping';
+  if (/CAR|VEHICLE|PARK/.test(n)) return 'parking';
+  return null;
+}
+
+// ─── 10. ANALYZE WITH USER ANSWERS — Step 2: full BOQ after Q&A ───
+// Receives: original dxf_data + all known symbols + user's answers
+// Returns: full Gemini BOQ analysis → used to generate Excel
+app.post('/analyze-with-answers', async (req, res) => {
+  try {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
+
+    const { dxfContent, filename, knownBlocks, knownLayers, userAnswers, dxfData } = req.body;
+    const fs = require('fs');
+
+    // Save user answers to symbols-learned.json for future drawings
+    const learnedPath = path.join(__dirname, 'symbols-learned.json');
+    let learned = { blocks: {}, layers: {} };
+    try { learned = JSON.parse(fs.readFileSync(learnedPath, 'utf8')); } catch(e) {}
+
+    // Merge user answers into learned dict
+    if (userAnswers?.blocks) {
+      for (const [name, type] of Object.entries(userAnswers.blocks)) {
+        if (type && type !== 'skip') learned.blocks[name.toUpperCase()] = type;
+      }
+    }
+    if (userAnswers?.layers) {
+      for (const [name, type] of Object.entries(userAnswers.layers)) {
+        if (type && type !== 'skip') learned.layers[name.toUpperCase()] = type;
+      }
+    }
+    try { fs.writeFileSync(learnedPath, JSON.stringify(learned, null, 2)); } catch(e) {}
+
+    // Build complete symbol map (known + user answered)
+    const allKnownBlocks = { ...(knownBlocks || {}), ...(userAnswers?.blocks || {}) };
+    const allKnownLayers = { ...(knownLayers || {}), ...(userAnswers?.layers || {}) };
+
+    // Use stored dxfData or re-parse if dxfContent provided
+    let civilData = dxfData;
+    if (!civilData && dxfContent) {
+      const parsed = parseDXF(dxfContent);
+      civilData = extractCivilData(parsed, filename);
+    }
+    if (!civilData) return res.status(400).json({ error: 'No drawing data.' });
+
+    // Build symbol summary for Gemini
+    const symbolSummary = [
+      ...Object.entries(allKnownBlocks).map(([name, type]) =>
+        `Block "${name}" (×${civilData.block_counts?.[name] || '?'}) = ${type}`),
+      ...Object.entries(allKnownLayers).map(([name, type]) =>
+        `Layer "${name}" = ${type}`)
+    ].join('\n');
+
+    const { RATES: ratesMap } = require('./dxf_parser');
+    const ratesSummary = Object.entries(ratesMap).slice(0, 30).map(([k, v]) => `${k}:${v}`).join(', ');
+
+    const prompt = `You are a senior PMC civil engineer generating a complete BOQ.
+ALL DATA IS FROM THIS DXF FILE. DO NOT INVENT VALUES.
+
+FILE: ${filename}
+DRAWING TYPE: ${civilData.drawing_type}
+SCALE: ${civilData.scale || 'not detected'}
+UNITS: ${civilData.units}
+DRAWING SIZE: ${civilData.drawing_extents.width_m}m × ${civilData.drawing_extents.height_m}m
+
+SYMBOL DICTIONARY (confirmed by user + AI):
+${symbolSummary || 'none'}
+
+ELEMENT COUNTS:
+Doors: ${Object.entries(allKnownBlocks).filter(([,t])=>t==='door').map(([n])=>`${n}(×${civilData.block_counts?.[n]||0})`).join(', ')||civilData.element_counts?.door_count||0}
+Windows: ${Object.entries(allKnownBlocks).filter(([,t])=>t==='window').map(([n])=>`${n}(×${civilData.block_counts?.[n]||0})`).join(', ')||civilData.element_counts?.window_count||0}
+Columns: ${Object.entries(allKnownBlocks).filter(([,t])=>t==='column').map(([n])=>`${n}(×${civilData.block_counts?.[n]||0})`).join(', ')||civilData.element_counts?.column_count||0}
+Lifts: ${civilData.element_counts?.lift_count||0}
+Staircases: ${civilData.element_counts?.staircase_count||0}
+Floors: ${civilData.element_counts?.floor_count||0}
+Wall length: ${civilData.wall_length_m||0}m
+
+FLOOR LEVELS:
+${(civilData.floor_levels||[]).map(l=>`${l.label}=${l.level_m||'?'}m`).join('\n')||'none'}
+
+TEXT ANNOTATIONS:
+${civilData.all_texts.slice(0,100).join('\n')}
+
+ROOM LABELS: ${(civilData.room_annotations||[]).map(r=>r.text).join(', ')||'none'}
+
+DIMENSIONS (top 40): ${civilData.dimension_values.slice(0,40).map(d=>`${d.value_m}m[${d.layer}]`).join(', ')}
+
+AREAS from polylines: ${civilData.polyline_areas.slice(0,20).map(p=>`${p.area_sqm}sqm(${p.layer})`).join(', ')}
+
+GUJARAT DSR 2025 RATES:
+${ratesSummary}
+
+Generate complete BOQ. Return ONLY raw JSON:
+{
+  "project_name": "",
+  "drawing_type": "",
+  "scale": "",
+  "building_height_m": 0,
+  "floor_count": 0,
+  "total_bua_sqm": 0,
+  "spaces": [{"name":"","area_sqm":0}],
+  "boq": [
+    {"sr":1,"description":"","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0,"source":"drawing|calculated|assumed"}
+  ],
+  "element_counts": {"door_count":0,"window_count":0,"lift_count":0,"staircase_count":0,"column_count":0},
+  "observations": [],
+  "pmc_recommendation": ""
+}`;
+
+    const gData = await fetchGeminiWithRetry(key, {
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 8192, temperature: 0.0, responseMimeType: 'application/json' }
+    });
+
+    let raw = gData?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
+    let geminiResult = {};
+    if (fb !== -1) {
+      try { geminiResult = JSON.parse(raw.slice(fb, lb + 1)); } catch(e) {}
+    }
+
+    res.json({ success: true, interpretation: geminiResult, dxf_data: civilData, learned_count: Object.keys(learned.blocks).length + Object.keys(learned.layers).length });
+
+  } catch (err) {
+    console.error('analyze-with-answers error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── 11. HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   const key = process.env.GEMINI_API_KEY;
   res.json({ status: 'ok', gemini_key_set: !!key, key_preview: key ? key.slice(0, 8) + '...' : 'NOT SET' });
