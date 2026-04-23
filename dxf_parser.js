@@ -415,6 +415,27 @@ function extractCivilData(parsed, filename) {
   // 12. Unique text list
   const uniqueTexts = [...new Set(allTexts.map(t => t.text.trim()))].filter(Boolean);
 
+  // 12a. Floor levels — extract all "+XXXX MM LEVEL" style annotations
+  const floorLevelRE = /(([-+]?\d[\d,.]*)\s*MM\s+LEVEL)|(\bFLOOR\s+LEVEL\b)|(BASEMENT\s+LEVEL)|(TERRACE\s+LEVEL)|(PLINTH\s+LEVEL)|(GROUND\s+LEVEL)|(STAIR\s+CABIN)/i;
+  const floorLevels = uniqueTexts
+    .filter(t => floorLevelRE.test(t))
+    .map(t => {
+      const mmMatch = t.match(/([-+]?\d[\d,.]*)\s*MM/i);
+      return {
+        label:    t.trim(),
+        level_mm: mmMatch ? parseFloat(mmMatch[1].replace(',', '')) : null,
+        level_m:  mmMatch ? Math.round(parseFloat(mmMatch[1].replace(',', '')) / 10) / 100 : null
+      };
+    })
+    .sort((a, b) => (b.level_mm || 0) - (a.level_mm || 0));
+
+  // 12b. Wall & construction notes (THK, RCC, CLADDING etc.)
+  const wallNoteRE = /(THK|THICK|WALL|PARDI|CLADDING|GLASS|GRANITE|RCC|R\.C\.C|LINTEL|COPING|WATERPROOF|SLAB|BEAM|FOOTING)/i;
+  const wallNotes = uniqueTexts.filter(t => wallNoteRE.test(t) && t.length > 8 && t.length < 250);
+
+  // 12c. Ramp / slope notes
+  const rampNotes = uniqueTexts.filter(t => /ramp|slope|ramp\s*dn|ramp\s*up/i.test(t));
+
   // 13. Counts from drawing — doors, windows, lifts, stairs, floors, rooms
   const counts = countDrawingElements(allTexts, allInserts, blockCounts, Object.keys(layerGroups));
 
@@ -436,6 +457,9 @@ function extractCivilData(parsed, filename) {
     drawing_extents: { width_mm: Math.round(extW), height_mm: Math.round(extH), width_m: Math.round(extW/1000*100)/100, height_m: Math.round(extH/1000*100)/100 },
     title_block:     titleBlock,
     all_texts:       uniqueTexts,
+    floor_levels:    floorLevels,      // NEW — sorted floor level annotations
+    wall_notes:      wallNotes,        // NEW — wall/construction annotations
+    ramp_notes:      rampNotes,        // NEW — ramp/slope annotations
     room_annotations: roomAnnotations,
     layer_names:     Object.keys(layerGroups).filter(Boolean),
     layer_groups:    layerGroups,
@@ -443,7 +467,7 @@ function extractCivilData(parsed, filename) {
     inline_dims:     inlineDims,
     polyline_areas:  polylineAreas.slice(0, 300),
     block_counts:    blockCounts,
-    element_counts:  counts,               // doors/windows/lifts/stairs/rooms
+    element_counts:  counts,
     wall_length_m:   Math.round(totalWallLenMm / 1000 * 100) / 100,
     stats: {
       total_texts:     allTexts.length,
