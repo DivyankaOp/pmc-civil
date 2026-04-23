@@ -498,12 +498,18 @@ app.post('/analyze-dxf', async (req, res) => {
     const { RATES: ratesMap } = require('./dxf_parser');
     const ratesSummary = Object.entries(ratesMap).slice(0, 30).map(([k,v]) => `${k}:${v}`).join(', ');
 
+    // Auto-detect drawing type from DXF content (keyword-based, pre-Gemini)
+    const { detectDrawingType, DRAWING_TYPES } = require('./drawing_analyzer');
+    const preDetectedType = civilData.drawing_type || detectDrawingType(civilData.all_texts || [], civilData.layer_names || [], filename);
+    const dtypeList = Object.entries(DRAWING_TYPES).map(([k,v])=>`${k}=${v}`).join(' | ');
+
     const prompt = `You are a senior PMC civil engineer analyzing a DXF architectural/structural drawing.
 ALL DATA BELOW IS EXTRACTED DIRECTLY FROM THIS DXF FILE. DO NOT INVENT VALUES. Do NOT copy values from other drawings or examples.
 If a value is not present in the data below, leave it 0 / "" / [] in the JSON.
 
 FILE: ${filename}
-TYPE: ${civilData.drawing_type}
+PRE-DETECTED TYPE: ${preDetectedType}
+AVAILABLE TYPES: ${dtypeList}
 SCALE: ${civilData.scale || 'not detected'}
 UNITS: ${civilData.units}
 SIZE: ${civilData.drawing_extents.width_m}m x ${civilData.drawing_extents.height_m}m
@@ -536,7 +542,7 @@ BLOCKS: ${Object.entries(civilData.block_counts||{}).slice(0,20).map(([k,v])=>`$
 RATES AVAILABLE: ${ratesSummary}
 
 Return ONLY raw JSON (no markdown). Every numeric field must come from the data above:
-{"project_name":"","drawing_type":"FLOOR_PLAN|SECTION|ELEVATION|SITE_PLAN|STRUCTURAL|GENERAL","scale":"","date":"","building_height_m":0,"floor_count":0,"basement_count":0,"floor_levels":[{"name":"","level_m":0}],"spaces":[{"name":"","area_sqm":0}],"wall_notes":[],"boq":[{"description":"","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0}],"total_bua_sqm":0,"element_counts":{"door_count":0,"window_count":0,"lift_count":0,"staircase_count":0,"floor_count":0},"observations":[],"pmc_recommendation":""}`;
+{"project_name":"","drawing_type":"FLOOR_PLAN|BASEMENT|PARKING|LIFT_SHAFT|STAIRCASE|STRUCTURAL_SECTION|FOUNDATION|SITE_LAYOUT|ROAD_PLAN|MEP_PLUMBING|MEP_ELECTRICAL|MEP_HVAC|ELEVATION|DETAIL_DRAWING|GENERAL","scale":"","date":"","building_height_m":0,"floor_count":0,"basement_count":0,"floor_levels":[{"name":"","level_m":0}],"spaces":[{"name":"","area_sqm":0}],"wall_notes":[],"boq":[{"description":"","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0}],"total_bua_sqm":0,"element_counts":{"door_count":0,"window_count":0,"lift_count":0,"staircase_count":0,"floor_count":0},"observations":[],"pmc_recommendation":""}`;
 
     const geminiData3 = await fetchGeminiWithRetry(key, {
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
@@ -582,7 +588,7 @@ DIMS:${civilData.dimension_values.slice(0,30).map(d=>d.value_m+'m['+d.layer+']')
 AREAS:${civilData.polyline_areas.slice(0,15).map(p=>p.area_sqm+'sqm('+p.layer+')').join(', ')}
 LAYERS:${civilData.layer_names.join(', ')}
 RATES:${rSummary}
-Return ONLY JSON:{"project_name":"","drawing_type":"","scale":"","spaces":[],"boq":[{"description":"","unit":"","qty":0,"rate":0,"amount":0}],"observations":[],"pmc_recommendation":""}`;
+Return ONLY JSON:{"project_name":"","drawing_type":"FLOOR_PLAN|BASEMENT|PARKING|LIFT_SHAFT|STAIRCASE|STRUCTURAL_SECTION|FOUNDATION|SITE_LAYOUT|ROAD_PLAN|MEP_PLUMBING|MEP_ELECTRICAL|MEP_HVAC|ELEVATION|DETAIL_DRAWING|GENERAL","scale":"","spaces":[],"boq":[{"description":"","unit":"","qty":0,"rate":0,"amount":0}],"observations":[],"pmc_recommendation":""}`;
 
       const geminiData4 = await fetchGeminiWithRetry(key, { contents: [{ role:'user', parts:[{text:prompt}] }], generationConfig: { maxOutputTokens:4096, temperature:0.0, responseMimeType:'application/json' } });
       let raw = geminiData4?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
