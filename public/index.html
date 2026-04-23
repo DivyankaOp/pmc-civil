@@ -635,70 +635,36 @@ async function send(){
   hist.push({role:'user',content:disp,fnames});
   tin.value='';tin.style.height='auto';
 
-  // DXF files → send to analyze-dxf endpoint for text parsing
+  // DXF files → classify-first → Q&A → full analysis
   if(hasDXF){
     files=[];renderChips();
     addLoad();
     try{
       const dxfFile=sentFiles.find(f=>f.isDXF);
-      const res=await fetch('/analyze-dxf',{method:'POST',headers:{'Content-Type':'application/json'},
+      const classRes=await fetch('/classify-dxf',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({dxfContent:dxfFile.dxfContent,filename:dxfFile.name})});
-      const data=await res.json();
-      const gi=data.interpretation||{};
-      const dd=data.dxf_data||{};
-      const summary=`## 📐 DXF Drawing Analysis: ${gi.project_name||dxfFile.name}
-
-**Scale:** ${dd.scale||gi.scale||'Not detected'} | **Type:** ${gi.drawing_type||dd.drawing_type||'Section/Plan'} | **Units:** ${(dd.units||'mm').toUpperCase()}
-
----
-### 🏢 Building Overview
-| Parameter | Value |
-|-----------|-------|
-| Total Floors | ${dd.element_counts?.floor_count||gi.element_counts?.floor_count||'—'} |
-| Building Height | ${dd.drawing_extents?.height_m||0} m |
-| Drawing Size | ${dd.drawing_extents?.width_m||0}m × ${dd.drawing_extents?.height_m||0}m |
-| Doors | ${dd.element_counts?.door_count||0} nos |
-| Windows | ${dd.element_counts?.window_count||0} nos |
-| Lifts | ${dd.element_counts?.lift_count||0} nos |
-| Staircases | ${dd.element_counts?.staircase_count||0} nos |
-
----
-### 📊 Drawing Statistics
-| Metric | Count |
-|--------|-------|
-| Layers | ${dd.stats?.total_layers||0} |
-| Text annotations | ${dd.stats?.total_texts||0} |
-| Dimension entities | ${dd.stats?.total_dims||0} |
-| Closed regions | ${dd.polyline_areas?.length||0} |
-| Block instances | ${dd.stats?.total_inserts||0} |
-
----
-### 📏 Floor Levels Found
-${(dd.all_texts||[]).filter(t=>/LEVEL|FLOOR/i.test(t)).slice(0,20).map(t=>`- ${t}`).join('\n')||'— Levels not detected'}
-
----
-### 🏠 Spaces & Rooms
-${(dd.room_annotations||[]).map(r=>r.text).filter((v,i,a)=>a.indexOf(v)===i).slice(0,20).join(' | ')||'— See annotations sheet in Excel'}
-
----
-### 📐 Key Dimensions
-${dd.dimension_values?.slice(0,15).map(d=>`\`${d.value_m}m\``).join(' · ')||'—'}
-
----
-### 🏗️ Layers in Drawing
-${dd.layer_names?.slice(0,20).join(', ')||'—'}
-
----
-**PMC Note:** ${gi.pmc_recommendation||'DXF successfully parsed. Download Excel for full 8-sheet detailed report.'}`;
-
+      const classData=await classRes.json();
       rmLoad();
-      hist=hist.filter(m=>m.role!=='user_parts');
-      hist.push({role:'assistant',content:summary,dxfFile:dxfFile,dxfData:data});
-      addMsgEl('ai',summary,[],true,null,sentText,summary,dxfFile,data);
+      if(!classData.success) throw new Error(classData.error||'Classification failed');
+      window.dxfSession={
+        dxfFile,dxfData:classData.dxf_data,
+        knownBlocks:classData.known_blocks||{},knownLayers:classData.known_layers||{},
+        askBlocks:classData.ask_user_blocks||[],askLayers:classData.ask_user_layers||[],
+        userAnswers:{blocks:{},layers:{}},pendingIdx:0,phase:'blocks'
+      };
+      const dd=classData.dxf_data||{};
+      const ec=dd.element_counts||{};
+      const knownCount=Object.keys(classData.known_blocks||{}).length+Object.keys(classData.known_layers||{}).length;
+      const unknownCount=(classData.ask_user_blocks||[]).length+(classData.ask_user_layers||[]).length;
+      const summary='## \u00f0\u009f\u0093\u0090 Drawing Scan Complete: '+dxfFile.name+'\n\n**Type:** '+(dd.drawing_type||'\u2014')+' | **Scale:** '+(dd.scale||'Not detected')+' | **Units:** '+((dd.units||'mm').toUpperCase())+' | **Size:** '+(dd.drawing_extents?.width_m||0)+'m \u00d7 '+(dd.drawing_extents?.height_m||0)+'m\n\n### \u00f0\u009f\u0094\x8d Symbol Recognition\n| | Count |\n|---|---|\n| \u2705 Auto-recognized | '+knownCount+' symbols |\n| \u2753 Needs your input | '+unknownCount+' symbols |\n| \u00f0\u009f\u0093\x8b Total layers | '+(dd.layer_names||[]).length+' |\n| \u00f0\u009f\u00a7\xb1 Total blocks | '+Object.keys(dd.block_counts||{}).length+' |\n\n### \u00f0\u009f\u008f\u00a2 Pre-detected Elements\nDoors: **'+(ec.door_count||0)+'** | Windows: **'+(ec.window_count||0)+'** | Columns: **'+(ec.column_count||0)+'** | Lifts: **'+(ec.lift_count||0)+'** | Floors: **'+(ec.floor_count||0)+'**\n\n'+(unknownCount>0?'### \u2753 '+unknownCount+' symbol(s) ki clarification chahiye\nMain ek ek karke puchhta hoon \u2014 sirf button click karo \u00f0\u009f\u0091\x87':'### \u2705 Sab symbols auto-pehchaan liye! BOQ generate ho raha hai...');
+      hist.push({role:'assistant',content:summary});
+      addMsgEl('ai',summary,[],true,null,sentText,summary);
       saveChatToHistory(dxfFile.name.slice(0,40));
+      if(unknownCount>0) setTimeout(()=>askNextSymbol(),500);
+      else setTimeout(()=>runFinalAnalysis(),600);
     }catch(err){
       rmLoad();
-      addMsgEl('ai',`**DXF Error:** ${err.message}`);
+      addMsgEl('ai','**DXF Scan Error:** '+err.message);
     }
     busy=false;document.getElementById('sbtn').disabled=false;
     return;
@@ -860,6 +826,194 @@ async function updateEstimateFromDXF(btn, dxfFile) {
     btn.disabled = false;
   }
 }
+
+// ── DXF SYMBOL Q&A SYSTEM ──────────────────────────────────────────
+
+const SYMBOL_TYPES=[
+  {val:'door',      label:'🚪 Door',      desc:'Flush/panel door'},
+  {val:'window',    label:'🪟 Window',    desc:'Aluminium/UPVC window'},
+  {val:'column',    label:'🏛️ Column',    desc:'RCC/steel column'},
+  {val:'beam',      label:'📏 Beam',      desc:'RCC/steel beam'},
+  {val:'wall',      label:'🧱 Wall',      desc:'Brick/RCC wall'},
+  {val:'staircase', label:'🪜 Staircase', desc:'Stair flight/landing'},
+  {val:'lift',      label:'🛗 Lift',      desc:'Elevator/lift'},
+  {val:'toilet',    label:'🚿 Toilet',    desc:'Bathroom/WC'},
+  {val:'kitchen',   label:'🍳 Kitchen',   desc:'Kitchen/pantry'},
+  {val:'parking',   label:'🚗 Parking',   desc:'Car/two-wheeler bay'},
+  {val:'furniture', label:'🪑 Furniture', desc:'Table/sofa/bed'},
+  {val:'equipment', label:'⚙️ Equipment', desc:'HVAC/mechanical'},
+  {val:'skip',      label:'⏭️ Skip',      desc:'Not relevant'},
+];
+
+function askNextSymbol(){
+  const sess=window.dxfSession;
+  if(!sess) return;
+
+  // Move through blocks first, then layers
+  if(sess.phase==='blocks'){
+    if(sess.pendingIdx<sess.askBlocks.length){
+      const item=sess.askBlocks[sess.pendingIdx];
+      showSymbolQuestion('block',item.name,item.count,sess.pendingIdx+1,sess.askBlocks.length+(sess.askLayers||[]).length);
+      return;
+    }
+    // Done with blocks → move to layers
+    sess.phase='layers';
+    sess.pendingIdx=0;
+  }
+  if(sess.phase==='layers'){
+    if(sess.pendingIdx<(sess.askLayers||[]).length){
+      const layerName=sess.askLayers[sess.pendingIdx];
+      showSymbolQuestion('layer',layerName,null,sess.askBlocks.length+sess.pendingIdx+1,sess.askBlocks.length+(sess.askLayers||[]).length);
+      return;
+    }
+  }
+  // All questions done → run final analysis
+  runFinalAnalysis();
+}
+
+function showSymbolQuestion(kind,name,count,current,total){
+  const progressPct=Math.round(((current-1)/total)*100);
+  const qMsg=`### ❓ Symbol Clarification (${current}/${total})
+
+**${kind==='block'?'Block':'Layer'} naam:** \`${name}\`${count?` — drawing mein **${count} baar** use hua`:''}
+
+Yeh element kya hai? Neeche se choose karo:`;
+
+  // Add question to chat
+  addMsgEl('ai',qMsg,[],false,null,'','');
+  hist.push({role:'assistant',content:qMsg});
+
+  // Add button row
+  const chat=document.getElementById('chat');
+  const btnWrap=document.createElement('div');
+  btnWrap.id='sym-btns';
+  btnWrap.style.cssText='display:flex;flex-wrap:wrap;gap:6px;padding:8px 14px 14px 50px;';
+
+  SYMBOL_TYPES.forEach(t=>{
+    const b=document.createElement('button');
+    b.innerHTML=`<span style="font-size:14px">${t.label.split(' ')[0]}</span> <span style="font-size:11px">${t.label.split(' ').slice(1).join(' ')}</span>`;
+    b.style.cssText='padding:6px 12px;border-radius:8px;border:1.5px solid var(--bor2);background:#fff;cursor:pointer;font-family:Inter,sans-serif;font-size:12px;color:var(--tx);transition:all .12s;display:flex;align-items:center;gap:5px;';
+    b.onmouseover=()=>{b.style.borderColor='var(--gem)';b.style.background='#E8F0FE';};
+    b.onmouseout=()=>{b.style.borderColor='var(--bor2)';b.style.background='#fff';};
+    b.onclick=()=>handleSymbolAnswer(kind,name,t.val,t.label,btnWrap);
+    btnWrap.appendChild(b);
+  });
+
+  // Custom type input
+  const customRow=document.createElement('div');
+  customRow.style.cssText='width:100%;display:flex;gap:6px;margin-top:2px;';
+  const customIn=document.createElement('input');
+  customIn.type='text';
+  customIn.placeholder='Ya khud type karo (e.g. planter, AC unit)...';
+  customIn.style.cssText='flex:1;padding:6px 10px;border-radius:8px;border:1.5px solid var(--bor2);font-size:12px;font-family:Inter,sans-serif;outline:none;';
+  customIn.onfocus=()=>{customIn.style.borderColor='var(--gem)';};
+  customIn.onblur=()=>{customIn.style.borderColor='var(--bor2)';};
+  const customBtn=document.createElement('button');
+  customBtn.textContent='✓ Submit';
+  customBtn.style.cssText='padding:6px 14px;border-radius:8px;border:none;background:var(--gem);color:#fff;cursor:pointer;font-size:12px;font-family:Inter,sans-serif;';
+  customBtn.onclick=()=>{
+    const val=customIn.value.trim();
+    if(val) handleSymbolAnswer(kind,name,val,'✏️ '+val,btnWrap);
+  };
+  customIn.onkeydown=e=>{if(e.key==='Enter'&&customIn.value.trim()) customBtn.click();};
+  customRow.appendChild(customIn);
+  customRow.appendChild(customBtn);
+  btnWrap.appendChild(customRow);
+
+  chat.appendChild(btnWrap);
+  chat.scrollTop=chat.scrollHeight;
+}
+
+function handleSymbolAnswer(kind,name,typeVal,typeLabel,btnWrap){
+  const sess=window.dxfSession;
+  if(!sess) return;
+
+  // Save answer
+  if(kind==='block') sess.userAnswers.blocks[name]=typeVal;
+  else sess.userAnswers.layers[name]=typeVal;
+
+  // Remove buttons, show confirmation
+  if(btnWrap&&btnWrap.parentNode) btnWrap.parentNode.removeChild(btnWrap);
+
+  const skipMsg=typeVal==='skip'?'(skipped)':'';
+  const confirmMsg=`✅ \`${name}\` → **${typeLabel}** ${skipMsg}`;
+  addMsgEl('ai',confirmMsg,[],false,null,'','');
+  hist.push({role:'assistant',content:confirmMsg});
+
+  // Move to next
+  sess.pendingIdx++;
+  setTimeout(()=>askNextSymbol(),300);
+}
+
+async function runFinalAnalysis(){
+  const sess=window.dxfSession;
+  if(!sess) return;
+
+  const waitMsg='### ⚙️ Generating Complete BOQ...\n\nSab symbols confirm ho gaye. Ab Gemini complete BOQ bana raha hai — thodi der ruko...';
+  addMsgEl('ai',waitMsg,[],false,null,'','');
+  hist.push({role:'assistant',content:waitMsg});
+  addLoad();
+
+  try{
+    const res=await fetch('/analyze-with-answers',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        dxfContent:sess.dxfFile.dxfContent,
+        filename:sess.dxfFile.name,
+        knownBlocks:sess.knownBlocks,
+        knownLayers:sess.knownLayers,
+        userAnswers:sess.userAnswers,
+        dxfData:sess.dxfData
+      })
+    });
+    const data=await res.json();
+    rmLoad();
+    if(!data.success) throw new Error(data.error||'Analysis failed');
+
+    const gi=data.interpretation||{};
+    const dd=data.dxf_data||sess.dxfData||{};
+    const ec=gi.element_counts||dd.element_counts||{};
+
+    // Build BOQ table
+    const boqRows=(gi.boq||[]).slice(0,40).map((item,i)=>`| ${i+1} | ${item.description||''} | ${item.unit||''} | ${item.qty||0} | ₹${(item.rate||0).toLocaleString('en-IN')} | ₹${(item.amount||0).toLocaleString('en-IN')} |`).join('\n');
+    const totalAmt=(gi.boq||[]).reduce((s,i)=>s+(i.amount||0),0);
+
+    const learnedTxt=data.learned_count>0?`\n\n> 💾 **${data.learned_count} symbols saved** — system ne seekh liya, agle drawing mein automatically use hoga.`:'';
+
+    const finalMsg=`## ✅ Complete BOQ: ${gi.project_name||sess.dxfFile.name}
+
+**Drawing Type:** ${gi.drawing_type||dd.drawing_type||'—'} | **Floors:** ${gi.floor_count||ec.floor_count||0} | **Total BUA:** ${gi.total_bua_sqm||0} sqm
+
+### 📊 Element Summary
+Doors: **${ec.door_count||0}** | Windows: **${ec.window_count||0}** | Columns: **${ec.column_count||0}** | Lifts: **${ec.lift_count||0}** | Staircases: **${ec.staircase_count||0}**
+
+### 📋 Bill of Quantities
+| Sr | Description | Unit | Qty | Rate | Amount |
+|---|---|---|---|---|---|
+${boqRows||'| — | No items | — | — | — | — |'}
+| | **GRAND TOTAL** | | | | **₹${totalAmt.toLocaleString('en-IN')}** |
+
+### 🔍 PMC Observations
+${(gi.observations||[]).map(o=>`- ${o}`).join('\n')||'— No observations'}
+
+### 💡 PMC Recommendation
+${gi.pmc_recommendation||'—'}
+${learnedTxt}`;
+
+    hist.push({role:'assistant',content:finalMsg,dxfFile:sess.dxfFile,dxfData:data});
+    addMsgEl('ai',finalMsg,[],true,null,'',finalMsg,sess.dxfFile,data);
+    saveChatToHistory((gi.project_name||sess.dxfFile.name).slice(0,40));
+
+    // Clear session
+    window.dxfSession=null;
+
+  }catch(err){
+    rmLoad();
+    addMsgEl('ai',`**Analysis Error:** ${err.message}`);
+    window.dxfSession=null;
+  }
+}
+
 // Init
 renderHistList();
 </script>
