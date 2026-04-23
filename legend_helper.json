@@ -1,0 +1,278 @@
+/**
+ * PMC Legend Helper
+ *
+ * Per-drawing semantic dictionary. The parser is drawing-agnostic —
+ * it reads raw AutoCAD entities (layer/block/color/linetype/text) and
+ * consults this legend to decide what category each element belongs to.
+ *
+ * Anything NOT in the legend becomes an "unknown" and is surfaced to the
+ * user via buildUserQuestions(). The user answers, the legend grows,
+ * future drawings become smarter. Nothing is hardcoded.
+ *
+ * AutoCAD semantics this helper understands:
+ *   - Layer (group code 8)      → category by exact name or user-added regex
+ *   - Color (group code 62)     → ACI 1-255 → meaning (only if user mapped)
+ *   - Linetype (group code 6)   → CONTINUOUS / DASHED / HIDDEN / CENTER
+ *   - Block name (INSERT code 2) → fixture/opening/column
+ *   - MTEXT / TEXT content      → regex patterns for heights, grid refs, etc.
+ */
+'use strict';
+
+const fs   = require('fs');
+const path = require('path');
+
+const META_KEYS = new Set(['_comment', '_example', '_schema_version', '_how_to_use', '_last_updated', '_source']);
+
+function isMeta(key) { return typeof key === 'string' && key.startsWith('_'); }
+
+function loadLegend(legendPath) {
+  const p = legendPath || path.join(__dirname, 'legend.json');
+  try {
+    const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return normaliseLegend(raw);
+  } catch (e) {
+    console.warn('legend.json not loaded:', e.message);
+    return emptyLegend();
+  }
+}
+
+function emptyLegend() {
+  return {
+    project_id: '',
+    project_type: '',
+    layers: {},
+    blocks: {},
+    colors: {},
+    text_patterns: {},
+    abbreviations: {},
+    excavation_rules: {},
+    floor_heights: {}
+  };
+}
+
+function normaliseLegend(raw) {
+  const out = emptyLegend();
+  if (!raw || typeof raw !== 'object') return out;
+  out.project_id   = raw.project_id   || '';
+  out.project_type = raw.project_type || '';
+
+  for (const section of ['layers', 'blocks', 'colors', 'floor_heights']) {
+    const src = raw[section] || {};
+    for (const [k, v] of Object.entries(src)) {
+      if (isMeta(k)) continue;
+      out[section][k] = v;
+    }
+  }
+
+  const tps = raw.text_patterns || {};
+  for (const [k, v] of Object.entries(tps)) {
+    if (isMeta(k) || typeof v !== 'string') continue;
+    try { out.text_patterns[k] = new RegExp(v, 'i'); }
+    catch { out.text_patterns[k] = v; }
+  }
+
+  const abb = raw.abbreviations || {};
+  for (const [k, v] of Object.entries(abb)) {
+    if (isMeta(k)) continue;
+    out.abbreviations[k] = v;
+  }
+
+  out.excavation_rules = raw.excavation_rules && !isMeta(raw.excavation_rules) ? { ...raw.excavation_rules } : {};
+  delete out.excavation_rules._comment;
+
+  return out;
+}
+
+// ── LOOKUPS ──────────────────────────────────────────────────────────────
+function matchLayer(layerName, legend) {
+  if (!layerName) return null;
+  const lg = legend.layers[layerName];
+  if (lg) return { ...lg, _match: 'exact' };
+  return null;
+}
+
+function matchBlock(blockName, legend) {
+  if (!blockName) return null;
+  const lg = legend.blocks[blockName];
+  if (lg) return { ...lg, _match: 'exact' };
+  return null;
+}
+
+function matchColor(aciCode, legend) {
+  if (aciCode == null) return null;
+  const lg = legend.colors[String(aciCode)];
+  if (lg) return { ...lg, _match: 'exact' };
+  return null;
+}
+
+function extractFromText(text, legend) {
+  const hits = {};
+  for (const [key, re] of Object.entries(legend.text_patterns || {})) {
+    if (!(re instanceof RegExp)) continue;
+    const m = text.match(re);
+    if (m) hits[key] = m[1] !== undefined ? m[1] : m[0];
+  }
+  return hits;
+}
+
+// ── UNKNOWN DETECTION ────────────────────────────────────────────────────
+/**
+ * Scan parsed DXF data, collect every layer/block/color/text pattern that
+ * is NOT in the legend. Attach sample data so the user can answer quickly.
+ */
+function findUnknowns(parsed, legend) {
+  const unknowns = {
+    layers: [],
+    blocks: [],
+    colors: [],
+    text_labels: []
+  };
+
+  // Layers used by entities but unmapped
+  const layerEntityCounts = {};
+  const layerSampleTexts  = {};
+  const layerColors       = {};
+  for (const e of parsed.entities || []) {
+    const ly = e.layer || '0';
+    layerEntityCounts[ly] = (layerEntityCounts[ly] || 0) + 1;
+    if ((e.type === 'TEXT' || e.type === 'MTEXT') && e.text) {
+      if (!layerSampleTexts[ly]) layerSampleTexts[ly] = [];
+      if (layerSampleTexts[ly].length < 3) layerSampleTexts[ly].push(e.text.slice(0, 60));
+    }
+  }
+  for (const [ly, info] of Object.entries(parsed.layers || {})) {
+    layerColors[ly] = info.color;
+  }
+  for (const [ly, count] of Object.entries(layerEntityCounts)) {
+    if (matchLayer(ly, legend)) continue;
+    unknowns.layers.push({
+      name: ly,
+      entity_count: count,
+      color_aci: layerColors[ly] ?? null,
+      sample_texts: layerSampleTexts[ly] || []
+    });
+  }
+
+  // Blocks referenced via INSERT but unmapped
+  const blockInserts = {};
+  for (const ins of parsed.inserts || []) {
+    const bn = ins.block || '';
+    blockInserts[bn] = (blockInserts[bn] || 0) + 1;
+  }
+  for (const [bn, n] of Object.entries(blockInserts)) {
+    if (matchBlock(bn, legend)) continue;
+    unknowns.blocks.push({ name: bn, insert_count: n });
+  }
+
+  // Colors present on entities but unmapped (only if user has started mapping colors)
+  if (Object.keys(legend.colors).length > 0) {
+    const colorCounts = {};
+    for (const [ly, info] of Object.entries(parsed.layers || {})) {
+      const c = info.color;
+      if (c == null) continue;
+      colorCounts[c] = (colorCounts[c] || 0) + (layerEntityCounts[ly] || 0);
+    }
+    for (const [c, n] of Object.entries(colorCounts)) {
+      if (matchColor(c, legend)) continue;
+      if (c === '0' || c === '7') continue; // ByBlock / default white — usually no semantic
+      unknowns.colors.push({ aci: parseInt(c), usage_count: n });
+    }
+  }
+
+  // Text abbreviations that don't match any pattern and look like codes
+  const codeRE = /^[A-Z]{1,4}\d*$/;
+  const seenLabels = new Set();
+  for (const t of parsed.texts || []) {
+    const txt = (t.text || '').trim();
+    if (!codeRE.test(txt)) continue;
+    if (seenLabels.has(txt)) continue;
+    if (legend.abbreviations[txt]) continue;
+    if (legend.blocks[txt]) continue;
+    seenLabels.add(txt);
+    unknowns.text_labels.push({ label: txt });
+  }
+
+  // Sort by frequency / count for user convenience
+  unknowns.layers.sort((a, b) => b.entity_count - a.entity_count);
+  unknowns.blocks.sort((a, b) => b.insert_count - a.insert_count);
+  unknowns.colors.sort((a, b) => b.usage_count - a.usage_count);
+
+  return unknowns;
+}
+
+// ── USER QUESTION GENERATION ─────────────────────────────────────────────
+function buildUserQuestions(unknowns) {
+  const lines = [];
+  lines.push('UNKNOWN ELEMENTS FOUND IN DRAWING — PLEASE CONFIRM MEANING');
+  lines.push('='.repeat(64));
+  lines.push('');
+
+  if (unknowns.layers.length) {
+    lines.push(`LAYERS (${unknowns.layers.length}) — add to legend.json → "layers"`);
+    lines.push('-'.repeat(64));
+    for (const L of unknowns.layers) {
+      lines.push(`• Layer "${L.name}" — used by ${L.entity_count} entities, color ACI=${L.color_aci ?? '?'}`);
+      if (L.sample_texts.length) lines.push(`    sample text: ${L.sample_texts.map(t => `"${t}"`).join(', ')}`);
+      lines.push(`    Q: category? (wall / opening / column / footing / excavation_line / d_wall / room_boundary / dimension / annotation / grid / ignore)`);
+      lines.push('');
+    }
+    lines.push('');
+  }
+
+  if (unknowns.blocks.length) {
+    lines.push(`BLOCKS (${unknowns.blocks.length}) — add to legend.json → "blocks"`);
+    lines.push('-'.repeat(64));
+    for (const B of unknowns.blocks) {
+      lines.push(`• Block "${B.name}" — inserted ${B.insert_count} times`);
+      lines.push(`    Q: category + opening_type? (door / window / glass_door / sliding_door / ventilator / lift_door / column / other)`);
+      lines.push(`    Q: width_mm x height_mm? (from door/window schedule)`);
+      lines.push('');
+    }
+    lines.push('');
+  }
+
+  if (unknowns.colors.length) {
+    lines.push(`COLORS (${unknowns.colors.length}) — add to legend.json → "colors" (only if color is semantic)`);
+    lines.push('-'.repeat(64));
+    for (const C of unknowns.colors) {
+      lines.push(`• Color ACI=${C.aci} — used ${C.usage_count} times`);
+      lines.push(`    Q: meaning? (excavation_line / backfill_line / d_wall / dimension / ignore)`);
+    }
+    lines.push('');
+  }
+
+  if (unknowns.text_labels.length) {
+    lines.push(`TEXT LABELS (${unknowns.text_labels.length}) — add to legend.json → "abbreviations" if these are codes`);
+    lines.push('-'.repeat(64));
+    for (const T of unknowns.text_labels.slice(0, 50)) {
+      lines.push(`• "${T.label}"  — Q: full meaning?`);
+    }
+    if (unknowns.text_labels.length > 50) lines.push(`... and ${unknowns.text_labels.length - 50} more`);
+    lines.push('');
+  }
+
+  if (!unknowns.layers.length && !unknowns.blocks.length && !unknowns.colors.length && !unknowns.text_labels.length) {
+    lines.push('✓ No unknowns — every layer/block/color in this drawing has a legend mapping.');
+  }
+
+  return lines.join('\n');
+}
+
+function writeUserQuestions(unknowns, outPath) {
+  const text = buildUserQuestions(unknowns);
+  const p = outPath || path.join(__dirname, 'user_questions.txt');
+  fs.writeFileSync(p, text, 'utf8');
+  return p;
+}
+
+module.exports = {
+  loadLegend,
+  emptyLegend,
+  matchLayer,
+  matchBlock,
+  matchColor,
+  extractFromText,
+  findUnknowns,
+  buildUserQuestions,
+  writeUserQuestions
+};
