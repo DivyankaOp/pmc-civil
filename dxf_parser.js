@@ -17,11 +17,14 @@
 'use strict';
 
 // ── LOAD RATES FROM CONFIG (no hardcoding) ───────────────────────
+const fs   = require('fs');
+const path = require('path');
 let RATES = {};
 try {
-  const fs   = require('fs');
-  const path = require('path');
-  const raw  = JSON.parse(fs.readFileSync(path.join(__dirname, 'rates.json'), 'utf8'));
+  const ratesPath = fs.existsSync(path.join(__dirname, 'rates.json'))
+    ? path.join(__dirname, 'rates.json')
+    : path.join(__dirname, 'Rates.json');
+  const raw = JSON.parse(fs.readFileSync(ratesPath, 'utf8'));
   for (const category of Object.values(raw)) {
     if (typeof category === 'object' && !Array.isArray(category)) {
       for (const [key, val] of Object.entries(category)) {
@@ -32,6 +35,11 @@ try {
 } catch(e) {
   console.warn('rates.json not loaded:', e.message);
 }
+
+// ── LOAD LEGEND (semantic dictionary, nothing hardcoded) ─────────
+let legendHelper = null;
+try { legendHelper = require('./legend_helper'); }
+catch(e) { console.warn('legend_helper not loaded:', e.message); }
 
 // ─────────────────────────────────────────────────────────────────
 // SECTION 1 — RAW DXF PARSER
@@ -293,7 +301,8 @@ function parseDXF(dxfContent) {
 // SECTION 2 — INTELLIGENT EXTRACTION (100% from drawing data)
 // ─────────────────────────────────────────────────────────────────
 
-function extractCivilData(parsed, filename) {
+function extractCivilData(parsed, filename, legendArg) {
+  const legend = legendArg || (legendHelper ? legendHelper.loadLegend() : null);
   const allTexts = [
     ...parsed.texts,
     ...Object.values(parsed.blocks).flatMap(b => b.texts || [])
@@ -375,11 +384,15 @@ function extractCivilData(parsed, filename) {
     .filter(a => a.area_sqm > 0.01)
     .sort((a, b) => b.area_sqm - a.area_sqm);
 
-  // 7. Room annotations from text
-  const spaceRE = /bed\s*room|bedroom|living|drawing\s*room|dining|kitchen|bath|toilet|wc|passage|corridor|lobby|hall|store|staircase|stair|lift|balcony|terrace|utility|servant|garage|office|flat|unit|room/i;
-  const roomAnnotations = allTexts
-    .filter(t => spaceRE.test(t.text))
-    .map(t => ({ text: t.text.trim(), x: t.x, y: t.y, layer: t.layer }));
+  // 7. Room annotations — driven by legend.text_patterns.room_label if user provided one.
+  //    No hardcoded room list. If user hasn't defined room_label pattern,
+  //    room_annotations stays empty and a note is surfaced to the user.
+  const roomLabelRE = legend && legend.text_patterns && (legend.text_patterns.room_label instanceof RegExp)
+    ? legend.text_patterns.room_label
+    : null;
+  const roomAnnotations = roomLabelRE
+    ? allTexts.filter(t => roomLabelRE.test(t.text)).map(t => ({ text: t.text.trim(), x: t.x, y: t.y, layer: t.layer }))
+    : [];
 
   // 8. Inline dimension text (e.g. "3000x4500")
   const inlineDims = [];
@@ -409,43 +422,41 @@ function extractCivilData(parsed, filename) {
   const blockCounts = {};
   for (const ins of allInserts) blockCounts[ins.block] = (blockCounts[ins.block] || 0) + 1;
 
-  // 11. Drawing type
-  const drawingType = inferDrawingType(Object.keys(layerGroups), allTexts.map(t => t.text), filename || '');
+  // 11. Drawing type — from legend if user set it, else 'UNKNOWN' (surface to user)
+  const drawingType = (legend && legend.project_type) ? legend.project_type.toUpperCase() : 'UNKNOWN';
 
   // 12. Unique text list
   const uniqueTexts = [...new Set(allTexts.map(t => t.text.trim()))].filter(Boolean);
 
-  // 12a. Floor levels — extract all "+XXXX MM LEVEL" style annotations
-  const floorLevelRE = /(([-+]?\d[\d,.]*)\s*MM\s+LEVEL)|(\bFLOOR\s+LEVEL\b)|(BASEMENT\s+LEVEL)|(TERRACE\s+LEVEL)|(PLINTH\s+LEVEL)|(GROUND\s+LEVEL)|(STAIR\s+CABIN)/i;
-  const floorLevels = uniqueTexts
-    .filter(t => floorLevelRE.test(t))
-    .map(t => {
-      const mmMatch = t.match(/([-+]?\d[\d,.]*)\s*MM/i);
-      return {
-        label:    t.trim(),
-        level_mm: mmMatch ? parseFloat(mmMatch[1].replace(',', '')) : null,
-        level_m:  mmMatch ? Math.round(parseFloat(mmMatch[1].replace(',', '')) / 10) / 100 : null
-      };
-    })
-    .sort((a, b) => (b.level_mm || 0) - (a.level_mm || 0));
+  // 13. Counts from drawing — legend-driven
+  const counts = countDrawingElements(allTexts, allInserts, blockCounts, Object.keys(layerGroups), legend);
 
-  // 12b. Wall & construction notes (THK, RCC, CLADDING etc.)
-  const wallNoteRE = /(THK|THICK|WALL|PARDI|CLADDING|GLASS|GRANITE|RCC|R\.C\.C|LINTEL|COPING|WATERPROOF|SLAB|BEAM|FOOTING)/i;
-  const wallNotes = uniqueTexts.filter(t => wallNoteRE.test(t) && t.length > 8 && t.length < 250);
-
-  // 12c. Ramp / slope notes
-  const rampNotes = uniqueTexts.filter(t => /ramp|slope|ramp\s*dn|ramp\s*up/i.test(t));
-
-  // 13. Counts from drawing — doors, windows, lifts, stairs, floors, rooms
-  const counts = countDrawingElements(allTexts, allInserts, blockCounts, Object.keys(layerGroups));
-
-  // 14. Wall length from LINE entities on wall layers (metres)
-  const wallLines = parsed.entities.filter(e => e.type === 'LINE' && /wall|brick|masonry/i.test(e.layer || ''));
+  // 14. Wall length — sum LINE entities on layers tagged as category "wall" in legend.
+  //    No hardcoded layer-name regex. If legend has no wall layers, wall_length_m = 0
+  //    and an unknowns entry is raised via findUnknowns() downstream.
+  const wallLayers = new Set();
+  if (legend) {
+    for (const [name, m] of Object.entries(legend.layers || {})) {
+      if (!m || m._comment) continue;
+      if (m.category === 'wall') wallLayers.add(name);
+    }
+  }
+  const wallLines = parsed.entities.filter(e => e.type === 'LINE' && wallLayers.has(e.layer || ''));
   const totalWallLenMm = wallLines.reduce((s, l) => s + Math.sqrt((l.x2-l.x1)**2 + (l.y2-l.y1)**2) * u2m, 0);
 
-  // 15. Project type — classify the drawing (high-rise / commercial / cafe / institute / road / generic)
-  const extAreaSqm = (extW / 1000) * (extH / 1000);
-  const projectType = detectProjectType(allTexts, filename || '', counts.floor_count, extAreaSqm);
+  // 15. Project type — use legend value, otherwise 'unknown'.
+  const projectType = { type: (legend && legend.project_type) ? legend.project_type : 'unknown', scores: {}, notes: ['project_type from legend.json; set it there if not already set'] };
+
+  // 16. Collect unknowns (layer/block/color/text code not in legend) so the
+  //     user can fill them in and re-run. This is the mechanism that lets the
+  //     tool learn per-drawing conventions instead of hardcoding.
+  let unknowns = null;
+  let questions_path = null;
+  if (legendHelper && legend) {
+    unknowns = legendHelper.findUnknowns(parsed, legend);
+    try { questions_path = legendHelper.writeUserQuestions(unknowns); }
+    catch(e) { console.warn('user_questions write failed:', e.message); }
+  }
 
   return {
     filename,
@@ -457,9 +468,6 @@ function extractCivilData(parsed, filename) {
     drawing_extents: { width_mm: Math.round(extW), height_mm: Math.round(extH), width_m: Math.round(extW/1000*100)/100, height_m: Math.round(extH/1000*100)/100 },
     title_block:     titleBlock,
     all_texts:       uniqueTexts,
-    floor_levels:    floorLevels,      // NEW — sorted floor level annotations
-    wall_notes:      wallNotes,        // NEW — wall/construction annotations
-    ramp_notes:      rampNotes,        // NEW — ramp/slope annotations
     room_annotations: roomAnnotations,
     layer_names:     Object.keys(layerGroups).filter(Boolean),
     layer_groups:    layerGroups,
@@ -469,6 +477,9 @@ function extractCivilData(parsed, filename) {
     block_counts:    blockCounts,
     element_counts:  counts,
     wall_length_m:   Math.round(totalWallLenMm / 1000 * 100) / 100,
+    legend_used:     Boolean(legend && (Object.keys(legend.blocks).length || Object.keys(legend.layers).length)),
+    unknowns,
+    questions_path,
     stats: {
       total_texts:     allTexts.length,
       total_dims:      allDims.length,
@@ -482,11 +493,19 @@ function extractCivilData(parsed, filename) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Count doors / windows / lifts / staircases / floors / rooms
-// by inspecting block names, insert references, text annotations,
-// and layer names. Everything comes FROM the drawing — no defaults.
+// Legend-driven element counter.
+//
+// Nothing is hardcoded. Every block/layer/text mapping comes from
+// legend.json. If the legend is empty or missing a mapping, the
+// element becomes an "unknown" surfaced via findUnknowns() — the
+// user confirms the meaning once, it is saved, future drawings
+// with the same block/layer are auto-recognised.
+//
+// Backward-compat fields (door_count / window_count / etc.) are
+// still produced for downstream consumers, but they are filled
+// ONLY from legend mappings — never from regex guessing.
 // ─────────────────────────────────────────────────────────────────
-function countDrawingElements(allTexts, allInserts, blockCounts, layerNames) {
+function countDrawingElements(allTexts, allInserts, blockCounts, layerNames, legend) {
   const out = {
     door_count:       0,
     window_count:     0,
@@ -500,214 +519,121 @@ function countDrawingElements(allTexts, allInserts, blockCounts, layerNames) {
     bedroom_count:    0,
     floor_count:      0,
     floor_labels:     [],
+    category_counts:  {},       // any user-defined category from legend
     room_types:       {},
+    text_extractions: {},       // regex capture results from legend.text_patterns
     source_notes:     []
   };
 
-  const matchers = {
-    door_count:      /^(?:.*[_-])?(dr|door|dwr)\d*$/i,
-    window_count:    /^(?:.*[_-])?(win|window|wnd)\d*$/i,
-    lift_count:      /^(?:.*[_-])?(lift|elevator|elev)\d*$/i,
-    staircase_count: /^(?:.*[_-])?(stair|staircase|step|stc)\d*$/i,
-    column_count:    /^(?:.*[_-])?(col|column|cl)\d*$/i,
-    beam_count:      /^(?:.*[_-])?(beam|bm)\d*$/i,
-    footing_count:   /^(?:.*[_-])?(footing|ftg|foot)\d*$/i
-  };
+  const lg = legend || (legendHelper ? legendHelper.emptyLegend() : { blocks:{}, layers:{}, text_patterns:{}, abbreviations:{} });
+  const noLegend = Object.keys(lg.blocks).length === 0 && Object.keys(lg.layers).length === 0;
 
-  // 1. Count from BLOCK INSERTs — each insert is a physical instance
-  for (const [blockName, n] of Object.entries(blockCounts || {})) {
-    for (const [field, re] of Object.entries(matchers)) {
-      if (re.test(blockName)) {
-        out[field] += n;
-        out.source_notes.push(`${field.replace('_count','')}: +${n} from block "${blockName}"`);
-      }
+  if (noLegend) {
+    out.source_notes.push('Legend empty — run legend_helper.findUnknowns() and fill legend.json, then re-parse.');
+    return out;
+  }
+
+  // 1. Count from BLOCK INSERTs using legend.blocks mapping
+  for (const ins of (allInserts || [])) {
+    const mapping = lg.blocks[ins.block];
+    if (mapping && !mapping._comment) {
+      _bumpCategory(out, mapping);
+      continue;
+    }
+    // Fallback: try layer mapping if block name is unmapped
+    const layerMap = lg.layers[ins.layer];
+    if (layerMap && !layerMap._comment) {
+      _bumpCategory(out, layerMap);
     }
   }
 
-  // 2. Also count from layer names if any layer is explicitly for doors/windows/etc.
-  //    We count INSERTs on that layer (fallback when block name doesn't match).
-  const layerMatchers = {
-    door_count:      /door/i,
-    window_count:    /window|glazing/i,
-    lift_count:      /lift|elev/i,
-    staircase_count: /stair/i,
-    column_count:    /column/i,
-    beam_count:      /beam/i,
-    footing_count:   /footing/i
-  };
-  for (const ins of allInserts) {
-    const bn = ins.block || '';
-    const ly = ins.layer || '';
-    // Skip if we already matched this instance via block-name regex
-    let matchedByBlock = false;
-    for (const re of Object.values(matchers)) if (re.test(bn)) { matchedByBlock = true; break; }
-    if (matchedByBlock) continue;
-    for (const [field, re] of Object.entries(layerMatchers)) {
-      if (re.test(ly)) {
-        out[field] += 1;
-        out.source_notes.push(`${field.replace('_count','')}: +1 from insert on layer "${ly}"`);
-        break;
-      }
-    }
+  // 2. Run legend.text_patterns against every text to extract structured data
+  //    (floor heights, plinth rises, grid refs, room labels — whatever user defined)
+  for (const [key, re] of Object.entries(lg.text_patterns || {})) {
+    if (!(re instanceof RegExp)) continue;
+    out.text_extractions[key] = [];
   }
-
-  // 3. Room-type counts and floor labels — from text annotations
-  const roomRegexes = [
-    ['toilet_count',   /(toilet|w\.?c|bath(room)?)/i],
-    ['kitchen_count',  /(kitchen|pantry)/i],
-    ['bedroom_count',  /(bed\s*room|bedroom|m\.?\s*bed|master\s*bed)/i],
-    ['lift_count',     /^\s*(lift|elevator)\b/i],     // lift text label
-    ['staircase_count',/^\s*(stair|staircase)\b/i]
-  ];
-  const floorRE = /\b(ground\s*floor|g\.?\s*floor|gf|first\s*floor|1st\s*floor|second\s*floor|2nd\s*floor|third\s*floor|3rd\s*floor|fourth\s*floor|4th\s*floor|fifth\s*floor|5th\s*floor|\d+(?:st|nd|rd|th)\s*floor|basement|parking|podium|terrace|mezzanine)\b/i;
-  const floorSchemeRE = /\b(b?\+?g\+\d+)\b/i;   // e.g. "B+G+5", "G+7"
-
-  const seenFloors = new Set();
-  for (const t of allTexts) {
+  const seenFloorLabels = new Set();
+  for (const t of (allTexts || [])) {
     const txt = (t.text || '').trim();
     if (!txt) continue;
-
-    for (const [field, re] of roomRegexes) {
-      if (re.test(txt)) {
-        // For bedroom/toilet/kitchen — count once per occurrence;
-        // for lift/staircase — only add if not already counted from blocks
-        if (field === 'lift_count' || field === 'staircase_count') {
-          if (out[field] === 0) {
-            out[field] += 1;
-            out.source_notes.push(`${field.replace('_count','')}: +1 from text "${txt.slice(0,30)}"`);
+    for (const [key, re] of Object.entries(lg.text_patterns || {})) {
+      if (!(re instanceof RegExp)) continue;
+      const m = txt.match(re);
+      if (m) {
+        const captured = m[1] !== undefined ? m[1] : m[0];
+        out.text_extractions[key].push(captured);
+        // Floor-scheme pattern → compute floor_count
+        if (/floor.*scheme|scheme.*floor|^floor_scheme$/i.test(key)) {
+          const upper = (captured.match(/\+(\d+)/) || [])[1];
+          const basement = /^b/i.test(captured);
+          const total = 1 + (parseInt(upper) || 0) + (basement ? 1 : 0);
+          if (total > out.floor_count) {
+            out.floor_count = total;
+            out.source_notes.push(`floor_count: ${total} from pattern "${key}" match "${captured}"`);
           }
-        } else {
-          out[field] += 1;
         }
-        const key = field.replace('_count','');
-        out.room_types[key] = (out.room_types[key] || 0) + 1;
-      }
-    }
-
-    // Floor labels
-    let m = txt.match(floorRE);
-    if (m) {
-      const label = m[0].toUpperCase().trim();
-      if (!seenFloors.has(label)) {
-        seenFloors.add(label);
-        out.floor_labels.push(label);
-      }
-    }
-    // Floor scheme "B+G+N" or "G+N"
-    m = txt.match(floorSchemeRE);
-    if (m) {
-      const scheme = m[1].toUpperCase();
-      const hasBasement = /^B/.test(scheme);
-      const topMatch = scheme.match(/\+(\d+)/);
-      const upper = topMatch ? parseInt(topMatch[1]) : 0;
-      const total = 1 /* ground */ + upper + (hasBasement ? 1 : 0);
-      if (total > out.floor_count) {
-        out.floor_count = total;
-        out.source_notes.push(`floor_count: ${total} from scheme "${scheme}"`);
+        // Floor-label pattern → collect distinct labels
+        if (/^floor_label$/i.test(key)) {
+          const label = captured.toUpperCase().trim();
+          if (!seenFloorLabels.has(label)) {
+            seenFloorLabels.add(label);
+            out.floor_labels.push(label);
+          }
+        }
+        // Room-label pattern → per-room counts
+        if (/^room_label$/i.test(key)) {
+          const cat = captured.toUpperCase().trim();
+          out.room_types[cat] = (out.room_types[cat] || 0) + 1;
+          if (cat === 'TOILET' || cat === 'BATH' || cat === 'WC')  out.toilet_count++;
+          else if (cat === 'KITCHEN' || cat === 'PANTRY')          out.kitchen_count++;
+          else if (/^BED/.test(cat))                               out.bedroom_count++;
+        }
       }
     }
   }
 
-  // If no scheme found, fall back to distinct floor labels
+  // 3. Fallback floor_count from distinct labels
   if (out.floor_count === 0 && out.floor_labels.length > 0) {
     out.floor_count = out.floor_labels.length;
-    out.source_notes.push(`floor_count: ${out.floor_count} from ${out.floor_labels.length} distinct floor labels`);
+    out.source_notes.push(`floor_count: ${out.floor_count} from ${out.floor_labels.length} distinct floor_label matches`);
   }
 
   return out;
 }
 
-function inferDrawingType(layers, texts, filename) {
-  const all = [...layers, ...texts, filename].join(' ').toLowerCase();
-  if (/section|sectional/.test(all))                 return 'SECTION';
-  if (/floor\s*plan|flat\s*plan|layout/.test(all))   return 'FLOOR_PLAN';
-  if (/elevation/.test(all))                         return 'ELEVATION';
-  if (/site\s*plan|master\s*plan/.test(all))         return 'SITE_PLAN';
-  if (/road|highway|carriageway/.test(all))          return 'ROAD_PLAN';
-  if (/rcc|reinforcement|bbs/.test(all))             return 'STRUCTURAL';
-  if (/detail/.test(all))                            return 'DETAIL';
-  return 'GENERAL';
+// Bump the correct backward-compat counter + category_counts based on legend mapping.
+function _bumpCategory(out, mapping) {
+  const cat = mapping.category;
+  if (!cat) return;
+  out.category_counts[cat] = (out.category_counts[cat] || 0) + 1;
+
+  if (cat === 'opening') {
+    const ot = mapping.opening_type || '';
+    if (ot === 'door' || ot === 'glass_door' || ot === 'sliding_door' || ot === 'main_door' || ot === 'fire_door') out.door_count++;
+    else if (ot === 'window' || ot === 'kitchen_window')          out.window_count++;
+    else if (ot === 'lift_door')                                   out.lift_count++;
+    else if (ot === 'ventilator')                                  out.window_count++;
+  } else if (cat === 'column')    out.column_count++;
+  else if (cat === 'beam')        out.beam_count++;
+  else if (cat === 'footing')     out.footing_count++;
+  else if (cat === 'staircase')   out.staircase_count++;
+  else if (cat === 'lift')        out.lift_count++;
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Classify what KIND of building/site this drawing is of.
-// Used to pick the correct BOQ builder downstream.
-// Scored by keyword hits + structural signals (floor count, area).
-// ─────────────────────────────────────────────────────────────────
-function detectProjectType(allTexts, filename, floorCount, extAreaSqm) {
-  const hay = [
-    ...(allTexts || []).map(t => (t && t.text ? t.text : String(t || ''))),
-    filename || ''
-  ].join(' ').toLowerCase();
-
-  const score = {
-    high_rise_residential: 0,
-    commercial:            0,
-    institute:             0,
-    cafe:                  0,
-    road_site:             0,
-    industrial:            0
+// Drawing-type and project-type are NOT inferred from hardcoded keywords
+// any more. The user declares them in legend.json (project_type + optional
+// drawing_type text pattern). If unset, the value is 'UNKNOWN' and the
+// parser surfaces that as a user question.
+function detectProjectType(allTexts, filename, floorCount, extAreaSqm, legendArg) {
+  const legend = legendArg || (legendHelper ? legendHelper.loadLegend() : null);
+  return {
+    type: (legend && legend.project_type) ? legend.project_type : 'unknown',
+    scores: {},
+    notes: legend && legend.project_type
+      ? [`project_type from legend.json = "${legend.project_type}"`]
+      : ['project_type not set in legend.json — please set it (high_rise_residential / commercial / institute / cafe / road_site / industrial / other)']
   };
-  const notes = [];
-
-  const buckets = {
-    high_rise_residential: [
-      /\bapartment/i, /\bflat(s)?\b/i, /\btower\b/i, /\bresidential/i,
-      /\bbhk\b/i, /\bunit\s*(plan|type)/i, /\bpent\s*house/i, /\bpodium/i,
-      /\brefuge\s*area/i, /\bsociety\b/i, /\bmasterbed|master\s*bed/i
-    ],
-    commercial: [
-      /\bshop\b/i, /\bretail\b/i, /\bshowroom/i, /\bmall\b/i, /\boffice\b/i,
-      /\bcommercial/i, /\batrium/i, /\bfood\s*court/i, /\bfoyer\b/i
-    ],
-    institute: [
-      /\bclass\s*room/i, /\bclassroom/i, /\blab(oratory)?\b/i,
-      /\blibrary\b/i, /\bauditorium/i, /\bstaff\s*room/i, /\bprincipal/i,
-      /\bschool\b/i, /\bcollege\b/i, /\buniversity/i, /\bhostel\b/i,
-      /\binstitute/i, /\bacademy/i, /\blecture\s*hall/i
-    ],
-    cafe: [
-      /\bcafe\b/i, /\brestaurant/i, /\bkitchen\s*(area|counter)/i,
-      /\bseating\s*(area|plan)/i, /\bcounter\b/i, /\bdine\s*in/i,
-      /\bbar\s*(counter|area)/i, /\bmenu\b/i, /\bcoffee\b/i
-    ],
-    road_site: [
-      /\bchainage/i, /\bcarriageway/i, /\bshoulder/i, /\bculvert/i,
-      /\bhighway/i, /\bpavement/i, /\bgsb\b/i, /\bwmm\b/i, /\bpqc\b/i,
-      /\bcross\s*section/i, /\bl-?section/i, /\bmedian\b/i, /\bchain\s*age/i
-    ],
-    industrial: [
-      /\bwarehouse/i, /\bfactory/i, /\bgodown/i, /\bshed\b/i,
-      /\bmachine\s*room/i, /\bprocess\s*area/i, /\bpeb\b/i
-    ]
-  };
-
-  for (const [type, regs] of Object.entries(buckets)) {
-    for (const re of regs) {
-      const matches = hay.match(new RegExp(re.source, 'gi'));
-      if (matches && matches.length) {
-        score[type] += matches.length;
-      }
-    }
-  }
-
-  // Structural signals
-  const fc = Number(floorCount) || 0;
-  const area = Number(extAreaSqm) || 0;
-
-  if (fc >= 5) { score.high_rise_residential += 3; notes.push(`+3 high_rise: ${fc} floors`); }
-  if (fc >= 10) { score.high_rise_residential += 3; notes.push(`+3 high_rise: ${fc}≥10 floors`); }
-  if (fc === 1 && area > 0 && area < 500) { score.cafe += 2; notes.push('+2 cafe: single floor < 500 sqm'); }
-  if (fc <= 2 && /chainage|carriageway|pavement/i.test(hay)) { score.road_site += 3; notes.push('+3 road_site: road keywords'); }
-
-  // Pick winner
-  let winner = 'generic', top = 0;
-  for (const [type, s] of Object.entries(score)) {
-    if (s > top) { top = s; winner = type; }
-  }
-  if (top === 0) winner = 'generic';
-
-  return { type: winner, scores: score, notes };
 }
 
 function shoelaceArea(pts) {
