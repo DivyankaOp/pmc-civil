@@ -480,81 +480,63 @@ app.post('/export-drawing', async (req, res) => {
 });
 
 // ─── 7. DXF UPLOAD & ANALYSIS ─────────────────────────────────────
+// Uses drawing_intelligence.js — reads legend, auto-maps layers, extracts levels
+const { analyzeDrawing, buildAIPrompt } = require('./drawing_intelligence');
+
 app.post('/analyze-dxf', async (req, res) => {
   try {
     const key = process.env.GEMINI_API_KEY;
     if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
     const { dxfContent, filename } = req.body;
-
     if (!dxfContent) return res.status(400).json({ error: 'No DXF content provided.' });
 
-    // Step 1: Parse DXF — extract everything dynamically from drawing
-    const parsed = parseDXF(dxfContent);
-    const civilData = extractCivilData(parsed, filename);
-    // Attach raw positioned texts for Excel (x,y coordinates per annotation)
-    civilData._raw_texts = parsed.texts.map(t => ({ text: t.text, layer: t.layer, x: t.x, y: t.y }));
+    // ── Step 1: Drawing Intelligence — scan, detect legend, auto-map layers ──
+    const analyzed = analyzeDrawing(dxfContent, filename);
+    console.log(`[DXF] ${filename} | ${analyzed.total_layers} layers | ${analyzed.floor_levels.length} floor levels | ${analyzed.element_counts.wall_polylines} wall polylines | ${analyzed.unknown_layers.length} unknown layers`);
 
-    // Step 2: Build rich Gemini prompt from ACTUAL extracted data (no hardcoded values)
+    // ── Step 2: Build rich prompt from what was actually found in drawing ─────
     const { RATES: ratesMap } = require('./dxf_parser');
-    const ratesSummary = Object.entries(ratesMap).slice(0, 30).map(([k,v]) => `${k}:${v}`).join(', ');
+    const ratesSummary = Object.entries(ratesMap).slice(0, 25).map(([k,v]) => `${k}:₹${v}`).join(' | ');
+    const prompt = buildAIPrompt(analyzed, ratesSummary);
 
-    // Auto-detect drawing type from DXF content (keyword-based, pre-Gemini)
-    const { detectDrawingType, DRAWING_TYPES } = require('./drawing_analyzer');
-    const preDetectedType = civilData.drawing_type || detectDrawingType(civilData.all_texts || [], civilData.layer_names || [], filename);
-    const dtypeList = Object.entries(DRAWING_TYPES).map(([k,v])=>`${k}=${v}`).join(' | ');
-
-    const prompt = `You are a senior PMC civil engineer analyzing a DXF architectural/structural drawing.
-ALL DATA BELOW IS EXTRACTED DIRECTLY FROM THIS DXF FILE. DO NOT INVENT VALUES. Do NOT copy values from other drawings or examples.
-If a value is not present in the data below, leave it 0 / "" / [] in the JSON.
-
-FILE: ${filename}
-PRE-DETECTED TYPE: ${preDetectedType}
-AVAILABLE TYPES: ${dtypeList}
-SCALE: ${civilData.scale || 'not detected'}
-UNITS: ${civilData.units}
-SIZE: ${civilData.drawing_extents.width_m}m x ${civilData.drawing_extents.height_m}m
-
-ELEMENT COUNTS (pre-counted from blocks + text):
-${JSON.stringify(civilData.element_counts || {}, null, 2)}
-
-WALL LENGTH FROM LINES: ${civilData.wall_length_m || 0} m
-
-FLOOR LEVELS FOUND IN DRAWING (${(civilData.floor_levels||[]).length}):
-${(civilData.floor_levels||[]).map(l=>`${l.label} = ${l.level_m||'?'}m`).join('\n')||'none'}
-
-WALL & CONSTRUCTION NOTES:
-${(civilData.wall_notes||[]).slice(0,30).join('\n')||'none'}
-
-RAMP NOTES:
-${(civilData.ramp_notes||[]).join('\n')||'none'}
-
-TEXT ANNOTATIONS (${civilData.stats.total_texts}):
-${civilData.all_texts.slice(0,120).join('\n')}
-
-ROOM LABELS: ${(civilData.room_annotations||[]).map(r=>r.text).join(', ')||'none'}
-
-DIMENSIONS (top 50): ${civilData.dimension_values.slice(0,50).map(d=>`${d.value_m}m[${d.layer}]`).join(', ')}
-
-AREAS from polylines (${civilData.polyline_areas.length}): ${civilData.polyline_areas.slice(0,30).map(p=>`${p.area_sqm}sqm(${p.layer})`).join(', ')}
-
-LAYERS: ${civilData.layer_names.join(', ')}
-BLOCKS: ${Object.entries(civilData.block_counts||{}).slice(0,20).map(([k,v])=>`${k}x${v}`).join(', ')||'none'}
-RATES AVAILABLE: ${ratesSummary}
-
-Return ONLY raw JSON (no markdown). Every numeric field must come from the data above:
-{"project_name":"","drawing_type":"FLOOR_PLAN|BASEMENT|PARKING|LIFT_SHAFT|STAIRCASE|STRUCTURAL_SECTION|FOUNDATION|SITE_LAYOUT|ROAD_PLAN|MEP_PLUMBING|MEP_ELECTRICAL|MEP_HVAC|ELEVATION|DETAIL_DRAWING|GENERAL","scale":"","date":"","building_height_m":0,"floor_count":0,"basement_count":0,"floor_levels":[{"name":"","level_m":0}],"spaces":[{"name":"","area_sqm":0}],"wall_notes":[],"boq":[{"description":"","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0}],"total_bua_sqm":0,"element_counts":{"door_count":0,"window_count":0,"lift_count":0,"staircase_count":0,"floor_count":0},"observations":[],"pmc_recommendation":""}`;
-
-    const geminiData3 = await fetchGeminiWithRetry(key, {
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 4096, temperature: 0.0, responseMimeType: 'application/json' }
-      });
-    let raw = geminiData3?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    // ── Step 3: Gemini AI interprets + fills BOQ ──────────────────────────────
+    const geminiData = await fetchGeminiWithRetry(key, {
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 8192, temperature: 0.0, responseMimeType: 'application/json' }
+    });
+    let raw = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
     const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
     let geminiResult = {};
-    if (fb !== -1) try { geminiResult = JSON.parse(raw.slice(fb, lb+1)); } catch(e) {}
+    if (fb !== -1) try { geminiResult = JSON.parse(raw.slice(fb, lb+1)); } catch(e) { console.error('JSON parse fail:', e.message); }
 
-    // Return parsed data + gemini interpretation
-    res.json({ success: true, dxf_data: civilData, interpretation: geminiResult });
+    // ── Step 4: Return everything — drawing data + AI interpretation ──────────
+    res.json({
+      success: true,
+      dxf_data: {
+        filename:         analyzed.filename,
+        project_name:     analyzed.project_name,
+        drawing_extents:  analyzed.drawing_extents,
+        floor_levels:     analyzed.floor_levels,
+        floor_heights:    analyzed.floor_heights,
+        legend_items:     analyzed.legend_items,
+        layer_summary:    analyzed.layer_summary,
+        wall_by_thickness_m2: analyzed.wall_by_thickness_m2,
+        hatch_summary:    analyzed.hatch_summary,
+        element_counts:   analyzed.element_counts,
+        unknown_layers:   analyzed.unknown_layers,
+        unknown_blocks:   analyzed.unknown_blocks,
+        all_texts:        analyzed.all_texts_sample,
+        layer_names:      analyzed.layer_names,
+        stats: {
+          total_layers:    analyzed.total_layers,
+          total_texts:     analyzed.total_texts,
+          total_hatches:   analyzed.total_hatches,
+          total_polylines: analyzed.total_polylines,
+          total_inserts:   analyzed.total_inserts,
+        }
+      },
+      interpretation: geminiResult
+    });
 
   } catch (err) {
     console.error('DXF analyze error:', err);
