@@ -479,10 +479,9 @@ app.post('/export-drawing', async (req, res) => {
   }
 });
 
-// ─── 7. DXF UPLOAD & ANALYSIS (AI-First — works for ANY drawing) ──
-const { analyzeDrawing, buildAIPrompt, saveLearnedFromAI } = require('./drawing_intelligence');
-let RATES_JSON = {};
-try { RATES_JSON = JSON.parse(require('fs').readFileSync(require('path').join(__dirname,'Rates.json'),'utf8')); } catch(e) {}
+// ─── 7. DXF UPLOAD & ANALYSIS ─────────────────────────────────────
+// Uses drawing_intelligence.js — reads legend, auto-maps layers, extracts levels
+const { analyzeDrawing, buildAIPrompt } = require('./drawing_intelligence');
 
 app.post('/analyze-dxf', async (req, res) => {
   try {
@@ -491,14 +490,16 @@ app.post('/analyze-dxf', async (req, res) => {
     const { dxfContent, filename } = req.body;
     if (!dxfContent) return res.status(400).json({ error: 'No DXF content provided.' });
 
-    // Step 1: Raw scan + build dump
+    // ── Step 1: Drawing Intelligence — scan, detect legend, auto-map layers ──
     const analyzed = analyzeDrawing(dxfContent, filename);
-    console.log(`[DXF] ${filename} | layers:${analyzed.stats.total_layers} | texts:${analyzed.stats.total_texts} | polys:${analyzed.stats.total_polylines} | inserts:${analyzed.stats.total_inserts}`);
+    console.log(`[DXF] ${filename} | ${analyzed.total_layers} layers | ${analyzed.floor_levels.length} floor levels | ${analyzed.element_counts.wall_polylines} wall polylines | ${analyzed.unknown_layers.length} unknown layers`);
 
-    // Step 2: Build AI prompt with full raw dump + learned data + rates
-    const prompt = buildAIPrompt(analyzed.raw_dump, analyzed.learned, RATES_JSON);
+    // ── Step 2: Build rich prompt from what was actually found in drawing ─────
+    const { RATES: ratesMap } = require('./dxf_parser');
+    const ratesSummary = Object.entries(ratesMap).slice(0, 25).map(([k,v]) => `${k}:₹${v}`).join(' | ');
+    const prompt = buildAIPrompt(analyzed, ratesSummary);
 
-    // Step 3: Gemini reads everything and interprets like a human engineer
+    // ── Step 3: Gemini AI interprets + fills BOQ ──────────────────────────────
     const geminiData = await fetchGeminiWithRetry(key, {
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       generationConfig: { maxOutputTokens: 8192, temperature: 0.0, responseMimeType: 'application/json' }
@@ -506,34 +507,33 @@ app.post('/analyze-dxf', async (req, res) => {
     let raw = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
     const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
     let geminiResult = {};
-    if (fb !== -1) {
-      try { geminiResult = JSON.parse(raw.slice(fb, lb+1)); }
-      catch(e) { console.error('JSON parse fail:', e.message); }
-    }
+    if (fb !== -1) try { geminiResult = JSON.parse(raw.slice(fb, lb+1)); } catch(e) { console.error('JSON parse fail:', e.message); }
 
-    // Step 4: Save what AI learned (layer meanings, block meanings, architect profile)
-    saveLearnedFromAI(geminiResult, analyzed._scanned, filename);
-
-    // Step 5: Return full data
+    // ── Step 4: Return everything — drawing data + AI interpretation ──────────
     res.json({
       success: true,
       dxf_data: {
         filename:         analyzed.filename,
-        project_name:     geminiResult.project_name || filename.replace(/\.[^.]+$/,''),
-        drawing_type:     geminiResult.drawing_type || 'GENERAL',
+        project_name:     analyzed.project_name,
         drawing_extents:  analyzed.drawing_extents,
-        stats:            analyzed.stats,
-        all_texts:        analyzed.all_texts,
-        dimension_values: analyzed.dimension_values,
-        polyline_areas:   analyzed.polyline_areas,
-        block_counts:     analyzed.block_counts,
-        layer_groups:     analyzed.layer_groups,
-        room_annotations: analyzed.room_annotations,
-        inline_dims:      analyzed.inline_dims,
-        known_layers:     analyzed.known_layers,
+        floor_levels:     analyzed.floor_levels,
+        floor_heights:    analyzed.floor_heights,
+        legend_items:     analyzed.legend_items,
+        layer_summary:    analyzed.layer_summary,
+        wall_by_thickness_m2: analyzed.wall_by_thickness_m2,
+        hatch_summary:    analyzed.hatch_summary,
+        element_counts:   analyzed.element_counts,
         unknown_layers:   analyzed.unknown_layers,
-        known_blocks:     analyzed.known_blocks,
         unknown_blocks:   analyzed.unknown_blocks,
+        all_texts:        analyzed.all_texts_sample,
+        layer_names:      analyzed.layer_names,
+        stats: {
+          total_layers:    analyzed.total_layers,
+          total_texts:     analyzed.total_texts,
+          total_hatches:   analyzed.total_hatches,
+          total_polylines: analyzed.total_polylines,
+          total_inserts:   analyzed.total_inserts,
+        }
       },
       interpretation: geminiResult
     });
@@ -546,54 +546,44 @@ app.post('/analyze-dxf', async (req, res) => {
 
 app.post('/export-dxf-excel', async (req, res) => {
   try {
-    const { dxfContent, filename } = req.body;
+    const { dxfContent, filename, aiResponse } = req.body;
     const key = process.env.GEMINI_API_KEY;
     if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
     if (!dxfContent) return res.status(400).json({ error: 'No DXF content.' });
 
-    // Step 1: Analyze drawing (raw scan + learned lookup)
-    const analyzed = analyzeDrawing(dxfContent, filename);
-    console.log(`[DXF-Excel] ${filename} | layers:${analyzed.stats.total_layers} | texts:${analyzed.stats.total_texts}`);
+    // Parse DXF
+    const parsed = parseDXF(dxfContent);
+    const civilData = extractCivilData(parsed, filename);
 
-    // Step 2: Build AI prompt
-    const prompt = buildAIPrompt(analyzed.raw_dump, analyzed.learned, RATES_JSON);
-
-    // Step 3: Gemini interpretation
+    // Get Gemini interpretation via analyze-dxf logic
     let geminiResult = {};
     try {
-      const gd = await fetchGeminiWithRetry(key, {
-        contents: [{ role:'user', parts:[{text:prompt}] }],
-        generationConfig: { maxOutputTokens:8192, temperature:0.0, responseMimeType:'application/json' }
-      });
-      let raw = gd?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-      const fb=raw.indexOf('{'), lb=raw.lastIndexOf('}');
-      if(fb!==-1) geminiResult=JSON.parse(raw.slice(fb,lb+1));
-    } catch(e) { console.log('Gemini fail:', e.message); }
+      const fakeReq = { body: { dxfContent, filename } };
+      // reuse the prompt building
+      const GEMINI_URL = k => `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k}`;
+      const { RATES: rMap } = require('./dxf_parser');
+      const rSummary = Object.entries(rMap).slice(0,20).map(([k,v])=>`${k}:${v}`).join(',');
+      const prompt = `PMC civil engineer. Analyze DXF. Use ONLY data below, no invented values.
+FILE:${filename} TYPE:${civilData.drawing_type} SCALE:${civilData.scale||'?'}
+TEXTS:${civilData.all_texts.slice(0,100).join(' | ')}
+DIMS:${civilData.dimension_values.slice(0,30).map(d=>d.value_m+'m['+d.layer+']').join(', ')}
+AREAS:${civilData.polyline_areas.slice(0,15).map(p=>p.area_sqm+'sqm('+p.layer+')').join(', ')}
+LAYERS:${civilData.layer_names.join(', ')}
+RATES:${rSummary}
+Return ONLY JSON:{"project_name":"","drawing_type":"FLOOR_PLAN|BASEMENT|PARKING|LIFT_SHAFT|STAIRCASE|STRUCTURAL_SECTION|FOUNDATION|SITE_LAYOUT|ROAD_PLAN|MEP_PLUMBING|MEP_ELECTRICAL|MEP_HVAC|ELEVATION|DETAIL_DRAWING|GENERAL","scale":"","spaces":[],"boq":[{"description":"","unit":"","qty":0,"rate":0,"amount":0}],"observations":[],"pmc_recommendation":""}`;
 
-    // Step 4: Save learned
-    saveLearnedFromAI(geminiResult, analyzed._scanned, filename);
+      const geminiData4 = await fetchGeminiWithRetry(key, { contents: [{ role:'user', parts:[{text:prompt}] }], generationConfig: { maxOutputTokens:4096, temperature:0.0, responseMimeType:'application/json' } });
+      let raw = geminiData4?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
+      if (fb !== -1) geminiResult = JSON.parse(raw.slice(fb,lb+1));
+    } catch(e) { console.log('Gemini interp fail:', e.message); }
 
-    // Step 5: Build Excel with matched field names
-    const dxfData = {
-      filename,
-      drawing_type:     geminiResult.drawing_type || 'GENERAL',
-      drawing_extents:  analyzed.drawing_extents,
-      stats:            analyzed.stats,
-      all_texts:        analyzed.all_texts,
-      dimension_values: analyzed.dimension_values,
-      polyline_areas:   analyzed.polyline_areas,
-      block_counts:     analyzed.block_counts,
-      layer_groups:     analyzed.layer_groups,
-      room_annotations: analyzed.room_annotations,
-      inline_dims:      analyzed.inline_dims,
-      _raw_texts:       analyzed._scanned?.texts || [],
-    };
-    const wb = await buildDXFExcel(dxfData, geminiResult, ExcelJS);
-
+    // Build Excel
+    const wb = await buildDXFExcel(civilData, geminiResult, ExcelJS);
     const today = new Date().toLocaleDateString('en-IN').replace(/\//g,'-');
     const pname = (geminiResult.project_name||filename||'DXF').replace(/[^a-zA-Z0-9_]/g,'_').slice(0,20);
-    res.setHeader('Content-Type','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition',`attachment; filename="${pname}_DXF_Analysis_${today}.xlsx"`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${pname}_DXF_Analysis_${today}.xlsx"`);
     await wb.xlsx.write(res); res.end();
 
   } catch (err) {
