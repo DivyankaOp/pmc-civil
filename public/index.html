@@ -401,29 +401,33 @@ function onFiles(e){
   Array.from(e.target.files).forEach(f=>{
     const name = f.name.toLowerCase();
 
-    // ── DXF: parse as text, send to /analyze-dxf
-    if(name.match(/\.dxf$/)){
-      const rd=new FileReader();
-      rd.onload=ev=>{
-        files.push({name:f.name,type:'application/dxf',isDXF:true,dxfContent:ev.target.result});
-        renderChips();
-      };
-      rd.readAsText(f);
-    }
-    // ── DWG/DXF/DWF: read as base64 → server converts to PNG via ezdxf+matplotlib → Gemini sees actual drawing
-    else if(name.match(/\.dwg$/) || name.match(/\.dxf$/) || name.match(/\.dwf$/)){
+    // ── DXF/DWG/DWF: ALWAYS read as base64 → server renders PNG via ezdxf+matplotlib → Gemini SEES actual drawing
+    // This works for ANY drawing — server reads legend, symbols, hatches visually
+    if(name.match(/\.(dxf|dwg|dwf)$/)){
       const rd=new FileReader();
       rd.onload=ev=>{
         const b64 = ev.target.result.split(',')[1];
-        const isDXFfile = name.match(/\.dxf$/i);
-        const isDWFfile = name.match(/\.dwf$/i);
+        const isDXF = name.match(/\.dxf$/i);
+        const isDWF = name.match(/\.dwf$/i);
         files.push({
-          name:f.name,
-          type: isDXFfile ? 'application/dxf' : (isDWFfile ? 'application/dwf' : 'application/dwg'),
-          isDWG:true,
-          isDWF:!!isDWFfile,
-          b64: b64
+          name: f.name,
+          type: isDXF ? 'application/dxf' : (isDWF ? 'application/dwf' : 'application/dwg'),
+          isDWG: true,   // always use image-render route
+          isDXF: !!isDXF,
+          isDWF: !!isDWF,
+          b64: b64,
+          // Also store text content for DXF so drawing_intelligence can run in parallel
+          _dxfTextPending: isDXF ? f : null
         });
+        // For DXF: also read as text for the intelligence engine
+        if(isDXF){
+          const rd2 = new FileReader();
+          rd2.onload = ev2 => {
+            const fi = files.find(x => x.name === f.name && x.isDXF);
+            if(fi) fi.dxfContent = ev2.target.result;
+          };
+          rd2.readAsText(f);
+        }
         renderChips();
       };
       rd.readAsDataURL(f);
