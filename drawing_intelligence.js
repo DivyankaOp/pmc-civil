@@ -1,467 +1,705 @@
 'use strict';
 /**
- * PMC Drawing Intelligence Engine — v3.0 (AI-First)
- *
- * PHILOSOPHY:
- *   Do NOT depend on layer names. Layer names differ per architect.
- *   Extract EVERYTHING raw from DXF — every text, note, symbol,
- *   dimension, block name, hatch pattern, layer name — and send
- *   it ALL to Gemini AI. AI reads drawing content like a human engineer.
- *
- *   LEARNING: What AI understands gets saved to symbols-learned.json.
- *   Next time same architect's drawing comes → learned data used directly.
- *
- * FLOW:
- *   1. scanDXF()          → extract all raw entities
- *   2. buildRawDump()     → format everything for AI
- *   3. buildAIPrompt()    → create Gemini prompt
- *   4. saveLearnedFromAI()→ store AI's understanding for future
+ * PMC Drawing Intelligence Engine
+ * 
+ * Step 1 → Scan DXF: extract ALL layers, hatches, blocks, texts, dimensions
+ * Step 2 → Find Legend: read the symbol/legend table drawn INSIDE the DXF itself
+ * Step 3 → Auto-Map: map layers by name patterns (works for ANY drawing)
+ * Step 4 → Learn & Save: save new mappings to symbols-learned.json
+ * Step 5 → Calculate: compute quantities from mapped data
+ * 
+ * Works for ANY DXF — no hardcoding of layer names.
+ * Learned mappings grow over time across drawings.
  */
 
 const fs   = require('fs');
 const path = require('path');
+
 const LEARNED_FILE = path.join(__dirname, 'symbols-learned.json');
 
 // ─────────────────────────────────────────────────────────────────
-// SECTION 1 — LEARNED SYMBOLS
+// SECTION 1 — LOAD / SAVE LEARNED SYMBOLS
 // ─────────────────────────────────────────────────────────────────
 function loadLearned() {
   try {
-    if (fs.existsSync(LEARNED_FILE))
-      return JSON.parse(fs.readFileSync(LEARNED_FILE, 'utf8'));
+    if (fs.existsSync(LEARNED_FILE)) return JSON.parse(fs.readFileSync(LEARNED_FILE, 'utf8'));
   } catch(e) {}
-  return { layer_meanings:{}, block_meanings:{}, hatch_meanings:{}, text_patterns:[], architect_profiles:{} };
+  return { layers: {}, blocks: {}, text_patterns: {}, floor_heights: {} };
 }
 
-function saveLearned(data) {
-  try {
-    const existing = loadLearned();
-    const merged = {
-      layer_meanings:     { ...existing.layer_meanings,     ...(data.layer_meanings     || {}) },
-      block_meanings:     { ...existing.block_meanings,     ...(data.block_meanings     || {}) },
-      hatch_meanings:     { ...existing.hatch_meanings,     ...(data.hatch_meanings     || {}) },
-      text_patterns:      [...(existing.text_patterns||[]), ...(data.text_patterns      || [])],
-      architect_profiles: { ...existing.architect_profiles, ...(data.architect_profiles || {}) },
-      _last_updated: new Date().toISOString(),
-      _total_drawings: (existing._total_drawings || 0) + 1
-    };
-    // Deduplicate text_patterns
-    const seen = new Set();
-    merged.text_patterns = merged.text_patterns.filter(p => {
-      if (seen.has(p.pattern)) return false;
-      seen.add(p.pattern); return true;
-    });
-    fs.writeFileSync(LEARNED_FILE, JSON.stringify(merged, null, 2));
-    return merged;
-  } catch(e) { console.warn('Save learned failed:', e.message); return data; }
-}
-
-function saveLearnedFromAI(aiResult, scanned, filename) {
-  if (!aiResult || typeof aiResult !== 'object') return;
-  const toLearn = { layer_meanings:{}, block_meanings:{}, hatch_meanings:{}, text_patterns:[], architect_profiles:{} };
-  if (aiResult.layer_mappings) {
-    for (const [k,v] of Object.entries(aiResult.layer_mappings)) {
-      if (k && v && v.category) toLearn.layer_meanings[k] = v;
-    }
-  }
-  if (aiResult.block_mappings) {
-    for (const [k,v] of Object.entries(aiResult.block_mappings)) {
-      if (k && v && v.category) toLearn.block_meanings[k] = v;
-    }
-  }
-  if (aiResult.architect_name) {
-    const key = aiResult.architect_name.toUpperCase().replace(/\s+/g,'_').slice(0,20);
-    const layerNames = Object.keys(scanned.layers);
-    const prefixes = {};
-    for (const n of layerNames) { const m = n.match(/^([A-Z]{1,4}[-_])/); if (m) prefixes[m[1]] = (prefixes[m[1]]||0)+1; }
-    const prefix = Object.entries(prefixes).sort((a,b)=>b[1]-a[1])[0]?.[0] || '';
-    toLearn.architect_profiles[key] = { name: aiResult.architect_name, layer_prefix: prefix, unit: aiResult.unit||'mm', _from: filename, _at: new Date().toISOString() };
-  }
-  saveLearned(toLearn);
+function saveLearned(learned) {
+  try { fs.writeFileSync(LEARNED_FILE, JSON.stringify(learned, null, 2)); }
+  catch(e) { console.warn('Could not save learned symbols:', e.message); }
 }
 
 // ─────────────────────────────────────────────────────────────────
-// SECTION 2 — RAW DXF SCANNER
+// SECTION 2 — RAW DXF SCANNER (zero-dependency)
 // ─────────────────────────────────────────────────────────────────
 function scanDXF(content) {
   const lines = content.split(/\r?\n/);
   const result = {
-    layers:{}, hatches:[], polylines:[], inserts:[], texts:[], dims:[], lines_:[], blocks:{},
-    extents:{ xmin:Infinity, xmax:-Infinity, ymin:Infinity, ymax:-Infinity }
+    layers:    {},   // name → { color, linetype, entity_count }
+    hatches:   [],   // { layer, pattern, color }
+    polylines: [],   // { layer, pts, area_m2 }
+    inserts:   [],   // { block, layer, x, y }
+    texts:     [],   // { text, layer, x, y }
+    dims:      [],   // { value_mm, layer, x, y }
+    blocks:    {},   // block name → { entities[] }
+    extents:   { xmin: Infinity, xmax: -Infinity, ymin: Infinity, ymax: -Infinity }
   };
+
   let i = 0;
   const nxt = () => lines[i++]?.trim() ?? '';
-  const pk  = () => lines[i]?.trim()  ?? '';
+  const pk  = () => lines[i]?.trim() ?? '';
 
   function readPairs() {
     const p = {};
     while (i < lines.length) {
-      const c = parseInt(pk());
+      const cStr = pk();
+      const c = parseInt(cStr);
       if (isNaN(c)) { nxt(); nxt(); continue; }
       if (c === 0) break;
-      nxt(); const v = nxt();
-      if (c in p) p[c] = Array.isArray(p[c]) ? [...p[c],v] : [p[c],v];
+      nxt();
+      const v = nxt();
+      if (c in p) { p[c] = Array.isArray(p[c]) ? [...p[c], v] : [p[c], v]; }
       else p[c] = v;
     }
     return p;
   }
 
-  function clean(s) {
+  function cleanText(s) {
     if (!s) return '';
-    return s.replace(/\\P/g,' ').replace(/\\p[^;]*;/g,'').replace(/\\f[^;]*;/g,'')
-      .replace(/\\[HWhWAaCScs][^;]*;/g,'').replace(/\{\\[^}]*\}/g,m=>m.replace(/\{\\[^;]*;/g,'').replace(/[{}]/g,''))
-      .replace(/[{}]/g,'').replace(/%%[cCdDpP]/g,'°').replace(/\\[CcLlOoUu]\d*;?/g,'').trim();
+    return s
+      .replace(/\\P/g, ' ')
+      .replace(/\\p[^;]*;/g, '')
+      .replace(/\\f[^;]*;/g, '')
+      .replace(/\\[HWhWAaCScs][^;]*;/g, '')
+      .replace(/\{\\[^}]*\}/g, m => m.replace(/\{\\[^;]*;/g, '').replace(/[{}]/g,''))
+      .replace(/[{}]/g, '')
+      .replace(/%%[cCdDpP]/g, '')
+      .replace(/\\L|\\l|\\O|\\o|\\U|\\u/g, '')
+      .trim();
   }
 
   function shoelace(pts) {
-    const n=pts.length; if(n<3) return 0;
-    let a=0; for(let j=0;j<n;j++){const k=(j+1)%n; a+=pts[j][0]*pts[k][1]-pts[k][0]*pts[j][1];} return Math.abs(a)/2;
+    const n = pts.length;
+    if (n < 3) return 0;
+    let a = 0;
+    for (let j = 0; j < n; j++) {
+      const k = (j + 1) % n;
+      a += pts[j][0] * pts[k][1] - pts[k][0] * pts[j][1];
+    }
+    return Math.abs(a) / 2;
   }
-  function perimeter(pts) {
-    let p=0; for(let j=0;j<pts.length;j++){const k=(j+1)%pts.length; p+=Math.sqrt((pts[k][0]-pts[j][0])**2+(pts[k][1]-pts[j][1])**2);} return p;
-  }
-  function upd(x,y) {
-    if(!isNaN(x)&&!isNaN(y)&&isFinite(x)&&isFinite(y)) {
-      if(x<result.extents.xmin) result.extents.xmin=x; if(x>result.extents.xmax) result.extents.xmax=x;
-      if(y<result.extents.ymin) result.extents.ymin=y; if(y>result.extents.ymax) result.extents.ymax=y;
+
+  function updateExt(x, y) {
+    if (!isNaN(x) && !isNaN(y)) {
+      if (x < result.extents.xmin) result.extents.xmin = x;
+      if (x > result.extents.xmax) result.extents.xmax = x;
+      if (y < result.extents.ymin) result.extents.ymin = y;
+      if (y > result.extents.ymax) result.extents.ymax = y;
     }
   }
 
+  // ── TABLES section: read layer definitions ──────────────────────
   function parseTables() {
-    while(i<lines.length) {
-      const c=parseInt(pk()); if(isNaN(c)){nxt();nxt();continue;}
-      if(c===0){nxt();const v=nxt(); if(v==='ENDSEC') break;
-        if(v==='LAYER'){const p=readPairs();const name=p[2]||'';if(name) result.layers[name]={color:Math.abs(parseInt(p[62])||7),linetype:p[6]||'Continuous',entity_count:0};}
-      } else {nxt();nxt();}
+    while (i < lines.length) {
+      const c = parseInt(pk());
+      if (isNaN(c)) { nxt(); nxt(); continue; }
+      if (c === 0) {
+        nxt();
+        const v = nxt();
+        if (v === 'ENDSEC') break;
+        if (v === 'LAYER') {
+          const p = readPairs();
+          const name  = p[2] || '';
+          const color = Math.abs(parseInt(p[62])) || 7;
+          const ltype = p[6] || 'Continuous';
+          if (name) result.layers[name] = { color, linetype: ltype, entity_count: 0 };
+        }
+      } else { nxt(); nxt(); }
     }
   }
 
-  function parseEntities() {
-    while(i<lines.length) {
-      const c=parseInt(pk()); if(isNaN(c)){nxt();nxt();continue;} if(c!==0){nxt();nxt();continue;}
-      nxt(); const etype=nxt(); if(!etype) continue; const up=etype.toUpperCase();
-      if(up==='ENDSEC'||up==='EOF') break;
+  // ── ENTITIES section ────────────────────────────────────────────
+  function parseEntities(sectionName) {
+    while (i < lines.length) {
+      const cStr = pk();
+      const c = parseInt(cStr);
+      if (isNaN(c)) { nxt(); nxt(); continue; }
+      if (c !== 0) { nxt(); nxt(); continue; }
+      nxt();
+      const etype = nxt();
+      if (!etype) continue;
+      const up = etype.toUpperCase();
+      if (up === 'ENDSEC' || up === 'EOF') break;
 
-      if(up==='TEXT'||up==='ATTDEF'||up==='ATTRIB') {
-        const p=readPairs(); const layer=p[8]||'0'; const txt=clean(p[1]||'');
-        const x=parseFloat(p[10])||0,y=parseFloat(p[20])||0;
-        if(txt){result.texts.push({text:txt,layer,x,y,height:parseFloat(p[40])||2.5}); if(result.layers[layer]) result.layers[layer].entity_count++; upd(x,y);}
-
-      } else if(up==='MTEXT') {
-        const p=readPairs(); const layer=p[8]||'0';
-        let txt=clean(Array.isArray(p[1])?p[1].join(''):p[1]||'');
-        if(!txt) txt=clean(Array.isArray(p[3])?p[3].join(''):p[3]||'');
-        const x=parseFloat(p[10])||0,y=parseFloat(p[20])||0;
-        if(txt){result.texts.push({text:txt,layer,x,y,height:parseFloat(p[40])||2.5}); if(result.layers[layer]) result.layers[layer].entity_count++; upd(x,y);}
-
-      } else if(up==='DIMENSION') {
-        const p=readPairs(); const layer=p[8]||'0'; const measured=parseFloat(p[42]); const txtOver=clean(p[1]||'');
-        const x1=parseFloat(p[13])||0,y1=parseFloat(p[23])||0,x2=parseFloat(p[14])||0,y2=parseFloat(p[24])||0;
-        const geom=Math.sqrt((x2-x1)**2+(y2-y1)**2); const val=(!isNaN(measured)&&measured>0)?measured:geom;
-        if(val>1){result.dims.push({value_mm:Math.round(val),value_m:Math.round(val)/1000,text_override:txtOver,layer,x:x1,y:y1}); if(result.layers[layer]) result.layers[layer].entity_count++;}
-
-      } else if(up==='HATCH') {
-        const p=readPairs(); result.hatches.push({layer:p[8]||'0',pattern:p[2]||'SOLID',color:p[62]||''});
-        if(result.layers[p[8]||'0']) result.layers[p[8]||'0'].entity_count++;
-
-      } else if(up==='LWPOLYLINE') {
-        const p=readPairs(); const layer=p[8]||'0'; const flags=parseInt(p[70])||0; const closed=!!(flags&1);
-        const xs=Array.isArray(p[10])?p[10]:(p[10]?[p[10]]:[]);
-        const ys=Array.isArray(p[20])?p[20]:(p[20]?[p[20]]:[]);
-        if(xs.length>=2) {
-          const pts=xs.map((x,idx)=>[parseFloat(x)||0,parseFloat(ys[idx]||0)]);
-          const areaMm2=shoelace(pts); const periMm=perimeter(pts);
-          pts.forEach(([x,y])=>upd(x,y));
-          const isClosed=closed||(pts.length>2&&Math.abs(pts[0][0]-pts[pts.length-1][0])<10&&Math.abs(pts[0][1]-pts[pts.length-1][1])<10);
-          result.polylines.push({layer,pts,area_m2:Math.round(areaMm2/1e6*100)/100,area_sqft:Math.round(areaMm2/92903*100)/100,perimeter_m:Math.round(periMm/1000*100)/100,vertices:pts.length,is_closed:isClosed});
-          if(result.layers[layer]) result.layers[layer].entity_count++;
+      if (up === 'TEXT' || up === 'MTEXT' || up === 'ATTDEF') {
+        const p = readPairs();
+        const layer = p[8] || '0';
+        let txt = cleanText(p[1] || p[3] || '');
+        if (p[3] && up === 'MTEXT') txt = cleanText(Array.isArray(p[3]) ? p[3].join('') : p[3]) || txt;
+        const x = parseFloat(p[10]) || 0;
+        const y = parseFloat(p[20]) || 0;
+        if (txt) {
+          result.texts.push({ text: txt, layer, x, y });
+          if (result.layers[layer]) result.layers[layer].entity_count++;
+          updateExt(x, y);
         }
 
-      } else if(up==='INSERT') {
-        const p=readPairs(); const block=p[2]||'',layer=p[8]||'0';
-        const x=parseFloat(p[10])||0,y=parseFloat(p[20])||0;
-        result.inserts.push({block,layer,x,y,scale_x:parseFloat(p[41])||1,scale_y:parseFloat(p[42])||1,rotation:parseFloat(p[50])||0});
-        if(result.layers[layer]) result.layers[layer].entity_count++; upd(x,y);
+      } else if (up === 'DIMENSION') {
+        const p = readPairs();
+        const layer = p[8] || '0';
+        const measured = parseFloat(p[42]);
+        const x1 = parseFloat(p[13]) || 0, y1 = parseFloat(p[23]) || 0;
+        const x2 = parseFloat(p[14]) || 0, y2 = parseFloat(p[24]) || 0;
+        const geom = Math.sqrt((x2-x1)**2 + (y2-y1)**2);
+        const val  = (!isNaN(measured) && measured > 0) ? measured : geom;
+        if (val > 0) result.dims.push({ value_mm: Math.round(val), layer, x: x1, y: y1 });
+        if (result.layers[layer]) result.layers[layer].entity_count++;
 
-      } else if(up==='LINE') {
-        const p=readPairs(); const layer=p[8]||'0';
-        const x1=parseFloat(p[10])||0,y1=parseFloat(p[20])||0,x2=parseFloat(p[11])||0,y2=parseFloat(p[21])||0;
-        const len=Math.sqrt((x2-x1)**2+(y2-y1)**2);
-        if(len>0) result.lines_.push({layer,x1,y1,x2,y2,length_mm:Math.round(len)});
-        if(result.layers[layer]) result.layers[layer].entity_count++; upd(x1,y1); upd(x2,y2);
-      } else { readPairs(); }
+      } else if (up === 'HATCH') {
+        const p = readPairs();
+        const layer   = p[8] || '0';
+        const pattern = p[2] || '';
+        const color   = p[62] || '';
+        result.hatches.push({ layer, pattern, color });
+        if (result.layers[layer]) result.layers[layer].entity_count++;
+
+      } else if (up === 'LWPOLYLINE' || up === 'POLYLINE') {
+        const p = readPairs();
+        const layer = p[8] || '0';
+        const xs = Array.isArray(p[10]) ? p[10] : (p[10] ? [p[10]] : []);
+        const ys = Array.isArray(p[20]) ? p[20] : (p[20] ? [p[20]] : []);
+        if (xs.length >= 2) {
+          const pts = xs.map((x, idx) => [parseFloat(x), parseFloat(ys[idx] || 0)]);
+          const areaMm2 = shoelace(pts);
+          const area_m2 = areaMm2 / 1e6;
+          pts.forEach(([x, y]) => updateExt(x, y));
+          if (areaMm2 > 0) result.polylines.push({ layer, pts, area_m2 });
+          if (result.layers[layer]) result.layers[layer].entity_count++;
+        }
+
+      } else if (up === 'INSERT') {
+        const p = readPairs();
+        const block = p[2] || '';
+        const layer = p[8] || '0';
+        const x = parseFloat(p[10]) || 0;
+        const y = parseFloat(p[20]) || 0;
+        result.inserts.push({ block, layer, x, y });
+        if (result.layers[layer]) result.layers[layer].entity_count++;
+        updateExt(x, y);
+
+      } else if (up === 'LINE') {
+        const p = readPairs();
+        const layer = p[8] || '0';
+        if (result.layers[layer]) result.layers[layer].entity_count++;
+        updateExt(parseFloat(p[10])||0, parseFloat(p[20])||0);
+        updateExt(parseFloat(p[11])||0, parseFloat(p[21])||0);
+
+      } else {
+        readPairs();
+      }
     }
   }
 
-  function parseBlocks() {
-    let cur=null;
-    while(i<lines.length) {
-      const c=parseInt(pk()); if(isNaN(c)){nxt();nxt();continue;} if(c!==0){nxt();nxt();continue;}
-      nxt(); const v=nxt(); if(v==='ENDSEC') break;
-      if(v==='BLOCK'){const p=readPairs();cur=p[2]||'';if(cur&&!cur.startsWith('*')) result.blocks[cur]={texts:[],inserts:[]};}
-      else if(v==='ENDBLK'){cur=null;}
-      else if(cur&&result.blocks[cur]) {
-        if(v==='TEXT'||v==='MTEXT'){const p=readPairs();const txt=clean(p[1]||p[3]||'');if(txt) result.blocks[cur].texts.push(txt);}
-        else if(v==='INSERT'){const p=readPairs();result.blocks[cur].inserts.push(p[2]||'');}
-        else readPairs();
-      } else readPairs();
+  // ── BLOCKS section ──────────────────────────────────────────────
+  function parseBlocksSection() {
+    let currentBlock = null;
+    while (i < lines.length) {
+      const cStr = pk();
+      const c = parseInt(cStr);
+      if (isNaN(c)) { nxt(); nxt(); continue; }
+      if (c !== 0) { nxt(); nxt(); continue; }
+      nxt();
+      const v = nxt();
+      if (v === 'ENDSEC') break;
+      if (v === 'BLOCK') {
+        const p = readPairs();
+        currentBlock = p[2] || '';
+        if (currentBlock && !currentBlock.startsWith('*')) {
+          result.blocks[currentBlock] = { texts: [], inserts: [] };
+        }
+      } else if (v === 'ENDBLK') {
+        currentBlock = null;
+      } else if (currentBlock && result.blocks[currentBlock]) {
+        if (v === 'TEXT' || v === 'MTEXT') {
+          const p = readPairs();
+          const txt = cleanText(p[1] || p[3] || '');
+          if (txt) result.blocks[currentBlock].texts.push(txt);
+        } else if (v === 'INSERT') {
+          const p = readPairs();
+          result.blocks[currentBlock].inserts.push(p[2] || '');
+        } else {
+          readPairs();
+        }
+      } else {
+        readPairs();
+      }
     }
   }
 
-  while(i<lines.length) {
-    const c=parseInt(pk()); if(isNaN(c)){nxt();nxt();continue;} if(c!==0){nxt();nxt();continue;}
-    nxt(); const v=nxt();
-    if(v==='SECTION'){nxt();const sec=nxt();
-      if(sec==='TABLES') parseTables(); else if(sec==='ENTITIES') parseEntities(); else if(sec==='BLOCKS') parseBlocks();
+  // ── Main parser loop ────────────────────────────────────────────
+  while (i < lines.length) {
+    const c = parseInt(pk());
+    if (isNaN(c)) { nxt(); nxt(); continue; }
+    if (c !== 0) { nxt(); nxt(); continue; }
+    nxt();
+    const v = nxt();
+    if (v === 'SECTION') {
+      nxt();
+      const sec = nxt();
+      if (sec === 'TABLES')   parseTables();
+      else if (sec === 'ENTITIES') parseEntities('MODEL');
+      else if (sec === 'BLOCKS')   parseBlocksSection();
     }
   }
+
   return result;
 }
 
 // ─────────────────────────────────────────────────────────────────
-// SECTION 3 — BUILD RAW DUMP FOR AI
+// SECTION 3 — LEGEND DETECTION (reads the legend drawn inside DXF)
 // ─────────────────────────────────────────────────────────────────
-function buildRawDump(scanned, filename) {
-  const uniqueTexts = [...new Map(scanned.texts.map(t=>[t.text,t])).values()];
-  const blockCounts = {};
-  for (const ins of scanned.inserts) blockCounts[ins.block]=(blockCounts[ins.block]||0)+1;
+/**
+ * Many drawings contain a LEGEND / SYMBOL TABLE with rows like:
+ *   [hatch symbol]   "230MM THK. BRICK WALL"
+ *   [hatch symbol]   "100 MM THK. BLOCK WALL"
+ *   [hatch symbol]   "R.C.C PARDI"
+ *
+ * Strategy: find texts that match known material/element keywords,
+ * then look for which LAYER has hatches nearby → link text → layer → meaning.
+ */
+const LEGEND_PATTERNS = [
+  { re: /(\d+)\s*MM\s+THK\.?\s*(BRICK|BLOCK|AAC|STONE|GLASS)\s+WALL/i,   cat: 'wall', extract: m => ({ thk_mm: parseInt(m[1]), material: m[2].toUpperCase() }) },
+  { re: /(\d+)\s*MM\s+WALL/i,             cat: 'wall',     extract: m => ({ thk_mm: parseInt(m[1]) }) },
+  { re: /WALL\s*[-–]?\s*(\d+)\s*MM/i,     cat: 'wall',     extract: m => ({ thk_mm: parseInt(m[1]) }) },
+  { re: /R\.?C\.?C\.?\s*PARDI/i,          cat: 'rcc_pardi',extract: _ => ({}) },
+  { re: /R\.?C\.?C\.?\s*(COLUMN|COL)/i,   cat: 'column',   extract: _ => ({}) },
+  { re: /R\.?C\.?C\.?\s*(SLAB|BEAM)/i,    cat: 'slab',     extract: _ => ({}) },
+  { re: /COLUMN/i,                         cat: 'column',   extract: _ => ({}) },
+  { re: /SLAB/i,                           cat: 'slab',     extract: _ => ({}) },
+  { re: /FOOTING|FOUNDATION/i,             cat: 'footing',  extract: _ => ({}) },
+  { re: /EXCAVATION|EXCAV/i,               cat: 'excavation',extract: _=> ({}) },
+  { re: /D[-\s]?WALL|DIAPHRAGM/i,         cat: 'd_wall',   extract: _ => ({}) },
+  { re: /(\d+)\s*MM\s+SUNK/i,             cat: 'sunk',     extract: m => ({ depth_mm: parseInt(m[1]) }) },
+  { re: /RAISED\s*PLATFORM|OTLI/i,        cat: 'raised_platform', extract: _ => ({}) },
+  { re: /GRANITE|MARBLE/i,                cat: 'flooring', extract: _ => ({}) },
+  { re: /TILES|TILING/i,                  cat: 'flooring', extract: _ => ({}) },
+  { re: /RAMP/i,                           cat: 'ramp',     extract: _ => ({}) },
+  { re: /STAIR/i,                          cat: 'stair',    extract: _ => ({}) },
+  { re: /LIFT\s*SHAFT|ELEVATOR/i,         cat: 'lift',     extract: _ => ({}) },
+  { re: /GLASS/i,                          cat: 'glass',    extract: _ => ({}) },
+];
 
-  const layerStats = Object.entries(scanned.layers)
-    .sort((a,b)=>b[1].entity_count-a[1].entity_count).slice(0,60)
-    .map(([n,info])=>`${n}(${info.entity_count})`);
+const FLOOR_LEVEL_RE = /^[{\\]?(?:\\C\d+;)?([+-]?\d[\d,]*)\s*MM\s*LEVEL/i;
+const FLOOR_NAME_RE  = /(THIRD|SECOND|FIRST|GROUND|PLINTH|TERRACE|STAIR\s+CABIN|BASEMENT|TYPICAL|\d+TH|\d+ST|\d+ND|\d+RD)\s*(FLOOR|BASEMENT|LEVEL)?/i;
+const HEIGHT_RE      = /H\s*=\s*(\d+(?:\.\d+)?)\s*(MT|M|MM)/i;
 
-  const hatchByLayer = {};
-  for (const h of scanned.hatches) {
-    if(!hatchByLayer[h.layer]) hatchByLayer[h.layer]={};
-    hatchByLayer[h.layer][h.pattern]=(hatchByLayer[h.layer][h.pattern]||0)+1;
+function extractLegendFromTexts(texts) {
+  const legendItems = [];
+  for (const t of texts) {
+    const clean = t.text;
+    for (const pat of LEGEND_PATTERNS) {
+      const m = clean.match(pat.re);
+      if (m) {
+        const extra = pat.extract(m);
+        legendItems.push({
+          text:  clean,
+          layer: t.layer,
+          x: t.x, y: t.y,
+          category: pat.cat,
+          ...extra
+        });
+        break;
+      }
+    }
   }
+  return legendItems;
+}
 
-  const closedPolys = scanned.polylines.filter(p=>p.is_closed&&p.area_m2>0.1).sort((a,b)=>b.area_m2-a.area_m2);
-  const polyByLayer = {};
-  for (const p of closedPolys) { if(!polyByLayer[p.layer]) polyByLayer[p.layer]=[]; polyByLayer[p.layer].push(p.area_m2); }
-
-  const dimCounts = {};
-  for (const d of scanned.dims) dimCounts[d.value_mm]=(dimCounts[d.value_mm]||0)+1;
-  const topDims = Object.entries(dimCounts).sort((a,b)=>b[1]-a[1]).slice(0,50).map(([v,c])=>`${v}mm${c>1?'×'+c:''}`);
-
-  const ext=scanned.extents;
-  const wMm=isFinite(ext.xmax-ext.xmin)?Math.round(ext.xmax-ext.xmin):0;
-  const hMm=isFinite(ext.ymax-ext.ymin)?Math.round(ext.ymax-ext.ymin):0;
-
-  const textByLayer={};
-  for (const t of scanned.texts) { if(!textByLayer[t.layer]) textByLayer[t.layer]=[]; if(!textByLayer[t.layer].includes(t.text)) textByLayer[t.layer].push(t.text); }
-
-  const linesByLayer={};
-  for (const l of scanned.lines_) { if(!linesByLayer[l.layer]) linesByLayer[l.layer]={count:0,total:0}; linesByLayer[l.layer].count++; linesByLayer[l.layer].total+=l.length_mm; }
-
-  let d='';
-  d+=`FILE: ${filename}\n`;
-  d+=`EXTENTS: ${wMm}mm × ${hMm}mm  (${(wMm/1000).toFixed(2)}m × ${(hMm/1000).toFixed(2)}m)\n`;
-  d+=`COUNTS: Texts=${scanned.texts.length} | Dims=${scanned.dims.length} | Polylines=${scanned.polylines.length} | Inserts=${scanned.inserts.length} | Lines=${scanned.lines_.length} | Hatches=${scanned.hatches.length}\n\n`;
-
-  d+=`═══ ALL TEXT ANNOTATIONS (${uniqueTexts.length} unique) ═══\n`;
-  for (const t of uniqueTexts.slice(0,300)) d+=`  [${t.layer}] "${t.text}"\n`;
-
-  d+=`\n═══ LAYERS (name:entity_count) ═══\n`;
-  d+=layerStats.join(' | ')+'\n';
-
-  d+=`\n═══ TEXTS PER LAYER ═══\n`;
-  for (const [layer,txts] of Object.entries(textByLayer).slice(0,40))
-    d+=`  ${layer}: ${txts.slice(0,10).map(t=>`"${t}"`).join(', ')}\n`;
-
-  d+=`\n═══ BLOCK INSTANCES ═══\n`;
-  for (const [name,count] of Object.entries(blockCounts).sort((a,b)=>b[1]-a[1]).slice(0,80)) {
-    const btexts=scanned.blocks[name]?.texts?.slice(0,3).join(',')||'';
-    d+=`  ${name} × ${count}${btexts?` [contains: ${btexts}]`:''}\n`;
+function extractFloorLevels(texts) {
+  const levels = [];
+  for (const t of texts) {
+    const clean = t.text;
+    const mmMatch = clean.match(/([+-]?\d[\d,]*)\s*MM\s+LEVEL/i);
+    if (mmMatch) {
+      const mm = parseInt(mmMatch[1].replace(',',''));
+      const nameMatch = clean.match(FLOOR_NAME_RE);
+      const name = nameMatch ? nameMatch[0].trim().toUpperCase() : `${mm >= 0 ? '+' : ''}${mm} MM LEVEL`;
+      levels.push({ label: clean.replace(/[{}\\]/g,'').trim(), name, mm, m: mm / 1000, x: t.x, y: t.y });
+    }
   }
-
-  d+=`\n═══ HATCH PATTERNS BY LAYER ═══\n`;
-  for (const [layer,patterns] of Object.entries(hatchByLayer).slice(0,30))
-    d+=`  ${layer}: ${Object.entries(patterns).map(([p,c])=>`${p}×${c}`).join(', ')}\n`;
-
-  d+=`\n═══ CLOSED POLYLINE AREAS BY LAYER ═══\n`;
-  for (const [layer,areas] of Object.entries(polyByLayer).slice(0,30)) {
-    const total=areas.reduce((s,a)=>s+a,0).toFixed(2);
-    d+=`  ${layer}: total=${total}m², [${areas.slice(0,5).map(a=>a.toFixed(2)+'m²').join(', ')}${areas.length>5?'...':''}] count=${areas.length}\n`;
-  }
-
-  d+=`\n═══ DIMENSION VALUES (top 50) ═══\n`;
-  d+=topDims.join(', ')+'\n';
-
-  d+=`\n═══ LINES PER LAYER ═══\n`;
-  for (const [layer,info] of Object.entries(linesByLayer).slice(0,20))
-    d+=`  ${layer}: ${info.count} lines, total=${(info.total/1000).toFixed(1)}m\n`;
-
-  return d;
+  // Deduplicate by mm value, keep unique
+  const seen = new Set();
+  return levels.filter(l => { if (seen.has(l.mm)) return false; seen.add(l.mm); return true; })
+               .sort((a, b) => a.mm - b.mm);
 }
 
 // ─────────────────────────────────────────────────────────────────
-// SECTION 4 — BUILD GEMINI PROMPT
+// SECTION 4 — AUTO-MAP LAYERS (works for any drawing)
 // ─────────────────────────────────────────────────────────────────
-function buildAIPrompt(rawDump, learned, ratesJson) {
-  const learnedLayers = Object.entries(learned.layer_meanings||{}).slice(0,30)
-    .map(([k,v])=>`  "${k}" → ${v.category}${v.thk_mm?' '+v.thk_mm+'mm':''}`).join('\n')||'  none yet';
-  const learnedBlocks = Object.entries(learned.block_meanings||{}).slice(0,30)
-    .map(([k,v])=>`  "${k}" → ${v.category} (${v.type||''})`).join('\n')||'  none yet';
+/**
+ * Try to derive semantic meaning from layer NAME alone (no hardcoding).
+ * E.g. "AR-HATCH 100 MM BLOCK WALL" → { cat: 'wall', thk_mm: 100 }
+ *      "AR-HATCH 230 MM BRICK WALL" → { cat: 'wall', thk_mm: 230 }
+ *      "AR-HATCH COLUMN - SLAB"     → { cat: 'column' }
+ * Returns null if cannot determine meaning.
+ */
+function autoMapLayer(layerName) {
+  const n = layerName.toUpperCase();
 
-  const ratesSummary = Object.entries(ratesJson).filter(([k])=>!k.startsWith('_'))
-    .map(([cat,items])=>typeof items==='object'?Object.entries(items).slice(0,4).map(([,v])=>`${v.description}:₹${v.rate}/${v.unit}`).join(' | '):'')
-    .filter(Boolean).join(' | ').slice(0,800);
+  // WALL thickness from layer name
+  const wallThk = n.match(/(\d+)\s*MM\s*(BLOCK|BRICK|AAC|STONE)?\s*WALL/);
+  if (wallThk) return { category: 'wall', thk_mm: parseInt(wallThk[1]), source: 'layer_name' };
 
-  return `You are a senior PMC civil engineer and drawing expert. Analyze this DXF drawing data extracted directly from the file.
+  // WALL without thickness
+  if (/\bWALL\b/.test(n) && !/CURTAIN|GLASS/.test(n)) return { category: 'wall', thk_mm: null, source: 'layer_name' };
 
-READ CAREFULLY: Every text, note, symbol, block name, dimension and layer tells you what the drawing contains.
-Your job: understand the drawing like a human engineer — read all notes, understand symbols, figure out every element.
+  // RCC types
+  if (/COLUMN\s*[-–]\s*SLAB|HATCH\s*COLUMN/.test(n)) return { category: 'column', source: 'layer_name' };
+  if (/\bCOLUMN\b/.test(n)) return { category: 'column', source: 'layer_name' };
+  if (/R\.?C\.?C\.?\s*PARDI|\bPARDI\b/.test(n)) return { category: 'rcc_pardi', source: 'layer_name' };
+  if (/\bSLAB\b/.test(n)) return { category: 'slab', source: 'layer_name' };
+  if (/\bFOOTING\b|\bFOUNDATION\b/.test(n)) return { category: 'footing', source: 'layer_name' };
 
-═══ PREVIOUSLY LEARNED (from past drawings by same firm) ═══
-LAYER MEANINGS:
-${learnedLayers}
+  // Openings
+  if (/\bDOOR\b/.test(n)) return { category: 'opening', opening_type: 'door', source: 'layer_name' };
+  if (/\bWINDOW\b/.test(n)) return { category: 'opening', opening_type: 'window', source: 'layer_name' };
+  if (/\bGLASS\b/.test(n)) return { category: 'glass', source: 'layer_name' };
 
-BLOCK MEANINGS:
-${learnedBlocks}
+  // Sunk / levels
+  const sunk = n.match(/(\d+)\s*MM\s*SUNK/);
+  if (sunk) return { category: 'sunk', depth_mm: parseInt(sunk[1]), source: 'layer_name' };
 
-═══ THIS DRAWING'S RAW DATA ═══
-${rawDump}
+  // Stairs / lift
+  if (/\bSTAIR\b/.test(n)) return { category: 'stair', source: 'layer_name' };
+  if (/\bRAMP\b/.test(n))  return { category: 'ramp', source: 'layer_name' };
+  if (/\bLIFT\b|\bELEV\b/.test(n)) return { category: 'lift', source: 'layer_name' };
 
-═══ RATES (Gujarat DSR 2025) ═══
-${ratesSummary}
+  // Flooring
+  if (/\bFLOOR\b|\bTILE\b|\bGRANITE\b|\bMARBLE\b/.test(n)) return { category: 'flooring', source: 'layer_name' };
 
-═══ YOUR TASK ═══
-1. Read ALL text annotations — they tell you room names, material specs, notes, levels
-2. Understand each BLOCK name — SW=sliding window, SLD=sliding door, D=door, W=window, COL=column
-3. Read LAYER names as hints (but don't depend on them — read content instead)
-4. Identify HATCH patterns — ANSI31=brick, ANSI37=concrete, SOLID=RCC, AR-CONC=concrete
-5. Read DIMENSION values — sizes of rooms, walls, openings, floor heights
-6. POLYLINE areas on each layer = actual floor areas, wall plan areas etc.
-7. Match text near polylines to identify room/space names
-8. Extract ALL material notes ("12MM THK TOUGHENED GLASS", "230MM BRICK WALL", "M30 CONCRETE" etc.)
-9. If floor levels are mentioned (+7590MM LEVEL etc.) extract them and calculate floor heights
+  // Dimension / text / grid — ignore for quantities
+  if (/\bDIM\b|\bDIMENSION\b/.test(n)) return { category: 'dimension', source: 'layer_name' };
+  if (/\bTEXT\b|\bNOTES?\b|\bANNOT\b/.test(n)) return { category: 'annotation', source: 'layer_name' };
+  if (/\bGRID\b|\bCOL\.?\s*LINE\b/.test(n)) return { category: 'grid', source: 'layer_name' };
+  if (/\bFORMAT\b|\bTITLE\b|\bBORDER\b/.test(n)) return { category: 'ignore', source: 'layer_name' };
 
-Return ONLY raw JSON (no markdown, no backticks):
-{
-  "project_name": "",
-  "architect_name": "",
-  "drawing_type": "FLOOR_PLAN|SECTION_ELEVATION|STRUCTURAL|FOUNDATION|SITE_PLAN|MEP|DETAIL|GENERAL",
-  "drawing_title": "",
-  "scale": "",
-  "unit": "mm",
-  "floors_shown": [],
-  "floor_levels": [{"name":"","level_mm":0,"level_m":0}],
-  "floor_heights": [{"from":"","to":"","height_m":0}],
-  "spaces": [{"name":"","area_sqm":0,"floor":"","dimensions":""}],
-  "wall_schedule": [{"description":"","thickness_mm":0,"layer":"","area_m2":0,"length_m":0}],
-  "opening_schedule": [{"type":"door|window|sliding_door|sliding_window|ventilator","tag":"","count":0,"size":"","remarks":""}],
-  "material_notes": [{"item":"","specification":"","layer":""}],
-  "structural_elements": [{"type":"column|beam|slab|footing","tag":"","size":"","reinforcement":"","count":0,"concrete_grade":""}],
-  "dimension_summary": {"typical_room_width_mm":0,"typical_wall_thk_mm":0,"slab_thk_mm":0,"floor_to_floor_mm":0},
-  "boq": [{"sr":1,"description":"","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0}],
-  "total_bua_sqm": 0,
-  "layer_mappings": {"LAYER_NAME":{"category":"wall|column|slab|door|window|text|dim|grid|hatch|annotation|ignore","thk_mm":null,"notes":""}},
-  "block_mappings": {"BLOCK_NAME":{"category":"opening|column|stair|lift|furniture","type":"door|window|sliding_door|sliding_window|column","remarks":""}},
-  "observations": [],
-  "pmc_recommendation": ""
-}
-
-RULES:
-- Use ONLY data from the drawing. Do NOT invent numbers.
-- If something is unclear, note it in observations — don't guess.
-- BOQ must use actual quantities from polyline areas and dimensions.
-- layer_mappings and block_mappings will be SAVED for future drawings — fill them accurately.
-- For wall BOQ: area_m2 from polylines ÷ thickness = length, length × floor_height = face_area.`;
+  return null;  // unknown
 }
 
 // ─────────────────────────────────────────────────────────────────
-// SECTION 5 — APPLY LEARNED (pre-fill known meanings)
+// SECTION 5 — QUANTITY COMPUTATION
 // ─────────────────────────────────────────────────────────────────
-function applyLearned(scanned, learned) {
-  const result = { known_layers:{}, unknown_layers:[], known_blocks:{}, unknown_blocks:[] };
-  for (const layerName of Object.keys(scanned.layers)) {
-    if (layerName.startsWith('*')||layerName==='Defpoints') continue;
-    if (learned.layer_meanings[layerName]) result.known_layers[layerName]=learned.layer_meanings[layerName];
-    else result.unknown_layers.push({name:layerName,entity_count:scanned.layers[layerName].entity_count});
-  }
-  const usedBlocks=[...new Set(scanned.inserts.map(i=>i.block))];
-  for (const blockName of usedBlocks) {
-    if (learned.block_meanings[blockName]) result.known_blocks[blockName]=learned.block_meanings[blockName];
-    else result.unknown_blocks.push({name:blockName,count:scanned.inserts.filter(i=>i.block===blockName).length});
+/**
+ * Assign each polyline (with area) to a floor based on Y coordinate.
+ * Uses extracted floor levels (sorted by mm) to determine which floor a polyline belongs to.
+ */
+function assignPolylinesToFloors(polylines, floorLevels, scaleToMm) {
+  // Build floor bands from Y coords of level annotations
+  // Each floor: yBottom = Y coord of lower level, yTop = Y coord of upper level
+  if (floorLevels.length < 2) return { 'ALL': polylines };
+
+  // Sort levels by Y coord ascending
+  const sorted = [...floorLevels].sort((a, b) => a.y - b.y);
+
+  const result = {};
+  for (const poly of polylines) {
+    const cy = poly.pts.reduce((s, p) => s + p[1], 0) / poly.pts.length; // centroid Y
+    // Find which floor band this centroid falls in
+    let assigned = null;
+    for (let j = 0; j < sorted.length - 1; j++) {
+      if (cy >= sorted[j].y && cy <= sorted[j+1].y) {
+        assigned = sorted[j+1].name; // label with upper level name
+        break;
+      }
+    }
+    if (!assigned) {
+      // Assign to nearest
+      const dists = sorted.map((l, idx) => ({ idx, d: Math.abs(cy - l.y) }));
+      dists.sort((a,b) => a.d - b.d);
+      assigned = sorted[dists[0].idx].name;
+    }
+    if (!result[assigned]) result[assigned] = [];
+    result[assigned].push(poly);
   }
   return result;
 }
 
+function computeWallQuantities(scanned, floorLevels, layerMap) {
+  const results = {}; // floor → { thk → { sqm, cum } }
+
+  // Group polylines by floor
+  const byFloor = assignPolylinesToFloors(scanned.polylines, floorLevels, 1);
+
+  // For each floor, for each wall-category polyline
+  for (const [floor, polys] of Object.entries(byFloor)) {
+    for (const poly of polys) {
+      const mapped = layerMap[poly.layer];
+      if (!mapped || mapped.category !== 'wall') continue;
+      const thk = mapped.thk_mm || 100;
+      const thkM = thk / 1000;
+
+      if (!results[floor]) results[floor] = {};
+      if (!results[floor][thk]) results[floor][thk] = { area_m2: 0, vol_m3: 0, count: 0 };
+
+      // area_m2 from polyline / thk = wall face area
+      // But polyline IS the plan area of wall = length × thk (in plan)
+      // So face_area = plan_area / thk × height — but we don't know height here
+      // Better: plan_area = poly.area_m2, length ≈ plan_area / thkM
+      const wallLength = poly.area_m2 / thkM;
+      results[floor][thk].area_m2 += poly.area_m2; // plan footprint
+      results[floor][thk].wallLength = (results[floor][thk].wallLength || 0) + wallLength;
+      results[floor][thk].count++;
+    }
+  }
+  return results;
+}
+
 // ─────────────────────────────────────────────────────────────────
-// SECTION 6 — MAIN EXPORT
+// SECTION 6 — MAIN EXPORT: analyzeDrawing()
 // ─────────────────────────────────────────────────────────────────
 function analyzeDrawing(dxfContent, filename) {
+  // 1. Scan raw DXF
   const scanned = scanDXF(dxfContent);
+
+  // 2. Extract floor levels from texts
+  const floorLevels = extractFloorLevels(scanned.texts);
+
+  // Compute floor heights from consecutive levels
+  const floorHeights = [];
+  for (let i = 0; i < floorLevels.length - 1; i++) {
+    const h = (floorLevels[i+1].mm - floorLevels[i].mm) / 1000;
+    if (h > 1.5 && h < 6.0) { // reasonable floor height
+      floorHeights.push({ from_mm: floorLevels[i].mm, to_mm: floorLevels[i+1].mm, height_m: h, name: floorLevels[i+1].name });
+    }
+  }
+
+  // 3. Extract legend items from drawing texts
+  const legendItems = extractLegendFromTexts(scanned.texts);
+
+  // 4. Auto-map all layers
   const learned = loadLearned();
-  const learnedResult = applyLearned(scanned, learned);
-  const rawDump = buildRawDump(scanned, filename);
+  const layerMap = {}; // layerName → { category, thk_mm, ... }
 
-  // Block counts
-  const blockCounts = {};
-  for (const ins of scanned.inserts) blockCounts[ins.block]=(blockCounts[ins.block]||0)+1;
+  const unknownLayers = [];
+  for (const [layerName, info] of Object.entries(scanned.layers)) {
+    if (layerName.startsWith('*') || layerName === 'Defpoints') continue;
 
-  // Layer groups for Excel
-  const layerGroups = {};
-  function ensureLayer(l) { if(!layerGroups[l]) layerGroups[l]={texts:[],lines:[],dims:[],polylines:[],count:0}; }
-  for (const t of scanned.texts)     { ensureLayer(t.layer); layerGroups[t.layer].texts.push(t.text); layerGroups[t.layer].count++; }
-  for (const d of scanned.dims)      { ensureLayer(d.layer); layerGroups[d.layer].dims.push(d); layerGroups[d.layer].count++; }
-  for (const p of scanned.polylines) { ensureLayer(p.layer); layerGroups[p.layer].polylines.push(p); layerGroups[p.layer].count++; }
-  for (const l of scanned.lines_)    { ensureLayer(l.layer); layerGroups[l.layer].lines.push(l); layerGroups[l.layer].count++; }
+    // Priority: (a) user-confirmed learned, (b) auto-detect from name
+    let mapping = learned.layers[layerName] || autoMapLayer(layerName);
 
-  // Polyline areas (closed only, area > 0.1m2)
-  const polylineAreas = scanned.polylines
-    .filter(p=>p.is_closed&&p.area_m2>0.1)
-    .sort((a,b)=>b.area_m2-a.area_m2)
-    .map(p=>({layer:p.layer,area_sqm:p.area_m2,area_sqft:p.area_sqft,perimeter_m:p.perimeter_m,vertices:p.vertices}));
+    if (mapping) {
+      layerMap[layerName] = mapping;
+      // Save to learned if not already there
+      if (!learned.layers[layerName]) {
+        learned.layers[layerName] = { ...mapping, _auto: true };
+      }
+    } else {
+      unknownLayers.push({ name: layerName, entity_count: info.entity_count, color: info.color });
+    }
+  }
 
-  const ext=scanned.extents;
-  const wMm=isFinite(ext.xmax-ext.xmin)?ext.xmax-ext.xmin:0;
-  const hMm=isFinite(ext.ymax-ext.ymin)?ext.ymax-ext.ymin:0;
+  // Auto-map block names
+  const blockMap = {};
+  const unknownBlocks = [];
+  for (const insertName of [...new Set(scanned.inserts.map(ins => ins.block))]) {
+    const lb = learned.blocks[insertName];
+    if (lb) { blockMap[insertName] = lb; continue; }
 
-  // Room annotations — texts that look like room labels
-  const roomAnnotations = scanned.texts.filter(t =>
-    /BEDROOM|TOILET|KITCHEN|LIVING|DINING|HALL|STORE|LOBBY|OFFICE|LIFT|STAIR|DECK|WASH|BATH|ROOM|CORRIDOR|PASSAGE/i.test(t.text)
-  );
+    // Auto-detect block meaning from name
+    const n = insertName.toUpperCase();
+    let bmap = null;
+    const doorW = n.match(/^D(\d+)$/);     if (doorW)   bmap = { category: 'opening', opening_type: 'door', _auto: true };
+    const winW  = n.match(/^W(\d+)$/);     if (winW)    bmap = { category: 'opening', opening_type: 'window', _auto: true };
+    if (/^GD/.test(n))  bmap = { category: 'opening', opening_type: 'glass_door', _auto: true };
+    if (/^SLD/.test(n)) bmap = { category: 'opening', opening_type: 'sliding_door', _auto: true };
+    if (/^LD/.test(n))  bmap = { category: 'opening', opening_type: 'lift_door', _auto: true };
+    if (/^V\d*$/.test(n)) bmap = { category: 'opening', opening_type: 'ventilator', _auto: true };
+    if (/^MD/.test(n))  bmap = { category: 'opening', opening_type: 'main_door', _auto: true };
+    if (/^FD/.test(n))  bmap = { category: 'opening', opening_type: 'fire_door', _auto: true };
+    if (/^KW/.test(n))  bmap = { category: 'opening', opening_type: 'kitchen_window', _auto: true };
+    if (/COL/.test(n))  bmap = { category: 'column', _auto: true };
+    if (/LIFT/.test(n)) bmap = { category: 'lift', _auto: true };
+    if (/STAIR/.test(n))bmap = { category: 'stair', _auto: true };
 
-  // Inline dims — texts like "3660 X 5285" or "3000x4500"
-  const inlineDims = scanned.texts
-    .filter(t => /^\d{3,5}\s*[xX×]\s*\d{3,5}/.test(t.text))
-    .map(t => {
-      const m = t.text.match(/(\d{3,5})\s*[xX×]\s*(\d{3,5})/);
-      if (!m) return null;
-      const l=parseInt(m[1]),w=parseInt(m[2]);
-      return { label:t.text, layer:t.layer, length_mm:l, width_mm:w, area_sqm:Math.round(l*w/1e6*100)/100 };
-    }).filter(Boolean);
+    if (bmap) {
+      blockMap[insertName] = bmap;
+      learned.blocks[insertName] = bmap;
+    } else {
+      unknownBlocks.push({ name: insertName, count: scanned.inserts.filter(ins=>ins.block===insertName).length });
+    }
+  }
+
+  // Save updated learnings
+  saveLearned(learned);
+
+  // 5. Summarize all layers with meaning
+  const layerSummary = Object.entries(scanned.layers).map(([name, info]) => ({
+    name,
+    entity_count: info.entity_count,
+    color: info.color,
+    category: layerMap[name]?.category || 'unknown',
+    thk_mm: layerMap[name]?.thk_mm || null,
+    auto_mapped: !!layerMap[name]
+  })).sort((a, b) => b.entity_count - a.entity_count);
+
+  // 6. Hatch summary (which hatches are on which meaning-layer)
+  const hatchSummary = {};
+  for (const h of scanned.hatches) {
+    const mapped = layerMap[h.layer];
+    const key = mapped ? `${mapped.category}${mapped.thk_mm ? '_' + mapped.thk_mm + 'mm' : ''}` : 'unknown';
+    hatchSummary[key] = (hatchSummary[key] || 0) + 1;
+  }
+
+  // 7. Count elements
+  const wallPolylines      = scanned.polylines.filter(p => layerMap[p.layer]?.category === 'wall');
+  const columnPolylines    = scanned.polylines.filter(p => layerMap[p.layer]?.category === 'column');
+  const slabPolylines      = scanned.polylines.filter(p => layerMap[p.layer]?.category === 'slab');
+  const rccPardiPolylines  = scanned.polylines.filter(p => layerMap[p.layer]?.category === 'rcc_pardi');
+
+  // Wall area by thickness
+  const wallByThk = {};
+  for (const p of wallPolylines) {
+    const thk = layerMap[p.layer]?.thk_mm || 100;
+    wallByThk[thk] = (wallByThk[thk] || 0) + p.area_m2;
+  }
+
+  // Opening counts
+  const doorCount   = scanned.inserts.filter(ins => blockMap[ins.block]?.opening_type === 'door').length;
+  const winCount    = scanned.inserts.filter(ins => blockMap[ins.block]?.opening_type === 'window').length;
+  const liftDoors   = scanned.inserts.filter(ins => blockMap[ins.block]?.opening_type === 'lift_door').length;
+  const allOpenings = scanned.inserts.filter(ins => blockMap[ins.block]?.category === 'opening').length;
+
+  // 8. Extents
+  const ext = scanned.extents;
+  const widthMm  = isFinite(ext.xmax - ext.xmin) ? ext.xmax - ext.xmin : 0;
+  const heightMm = isFinite(ext.ymax - ext.ymin) ? ext.ymax - ext.ymin : 0;
+
+  // 9. Project info from title block texts
+  const projectName = (() => {
+    for (const t of scanned.texts) {
+      if (/modestaa|project\s*title|project\s*name/i.test(t.text)) return t.text.replace(/\\.*/,'').trim();
+    }
+    return filename?.replace(/\.[^.]+$/, '') || '';
+  })();
 
   return {
+    // Raw scan
     filename,
-    drawing_extents:{ width_m:Math.round(wMm/10)/100, height_m:Math.round(hMm/10)/100 },
-    stats:{
-      total_layers:Object.keys(scanned.layers).length, total_texts:scanned.texts.length,
-      total_dims:scanned.dims.length, total_polylines:scanned.polylines.length,
-      total_lines:scanned.lines_.length, total_inserts:scanned.inserts.length,
-      total_hatches:scanned.hatches.length, unique_blocks:Object.keys(scanned.blocks).length
+    project_name: projectName,
+    drawing_extents: { width_m: Math.round(widthMm/10)/100, height_m: Math.round(heightMm/10)/100 },
+    total_texts: scanned.texts.length,
+    total_hatches: scanned.hatches.length,
+    total_polylines: scanned.polylines.length,
+    total_inserts: scanned.inserts.length,
+    total_layers: Object.keys(scanned.layers).length,
+
+    // Derived
+    floor_levels: floorLevels,
+    floor_heights: floorHeights,
+    legend_items: legendItems,
+    layer_summary: layerSummary,
+    hatch_summary: hatchSummary,
+    wall_by_thickness_m2: wallByThk,
+
+    // Counts
+    element_counts: {
+      wall_polylines: wallPolylines.length,
+      column_polylines: columnPolylines.length,
+      slab_polylines: slabPolylines.length,
+      rcc_pardi_polylines: rccPardiPolylines.length,
+      door_count: doorCount,
+      window_count: winCount,
+      lift_door_count: liftDoors,
+      total_openings: allOpenings,
+      floor_levels_found: floorLevels.length,
     },
-    // For Excel
-    all_texts:       [...new Set(scanned.texts.map(t=>t.text))],
-    dimension_values: scanned.dims.map(d=>({value_mm:d.value_mm,value_m:d.value_m,text:d.text_override,layer:d.layer})),
-    polyline_areas:  polylineAreas,
-    block_counts:    blockCounts,
-    layer_groups:    layerGroups,
-    room_annotations: roomAnnotations,
-    inline_dims:     inlineDims,
-    // For AI
-    raw_dump:  rawDump,
-    learned:   learned,
-    // Pre-classified
-    known_layers:   learnedResult.known_layers,
-    unknown_layers: learnedResult.unknown_layers,
-    known_blocks:   learnedResult.known_blocks,
-    unknown_blocks: learnedResult.unknown_blocks,
-    // Pass to saveLearnedFromAI
+
+    // For Gemini / AI prompt
+    all_texts_sample: [...new Set(scanned.texts.map(t => t.text))].slice(0, 100),
+    layer_names: Object.keys(scanned.layers),
+    block_names: Object.keys(scanned.blocks),
+    unknown_layers: unknownLayers,
+    unknown_blocks: unknownBlocks,
+    dims_sample: scanned.dims.slice(0, 50).map(d => ({ mm: d.value_mm, m: Math.round(d.value_mm/10)/100, layer: d.layer })),
+
+    // For BOQ Excel generation
     _scanned: scanned,
+    _layerMap: layerMap,
+    _blockMap: blockMap,
+    _wallPolylines: wallPolylines,
   };
 }
 
-module.exports = { analyzeDrawing, buildAIPrompt, buildRawDump, scanDXF, loadLearned, saveLearned, saveLearnedFromAI };
+// ─────────────────────────────────────────────────────────────────
+// SECTION 7 — BUILD RICH AI PROMPT from analyzed data
+// ─────────────────────────────────────────────────────────────────
+function buildAIPrompt(analyzed, ratesSummary) {
+  const dd = analyzed;
+  const floorLevelStr = dd.floor_levels.map(l => `  ${l.label} = ${l.m > 0 ? '+' : ''}${l.m}m`).join('\n') || 'none found';
+  const floorHtStr    = dd.floor_heights.map(l => `  ${l.name}: H = ${l.height_m}m`).join('\n') || 'none';
+  const legendStr     = dd.legend_items.map(l => `  [${l.layer}] ${l.text} → ${l.category}${l.thk_mm ? ' ' + l.thk_mm + 'mm' : ''}`).join('\n') || 'none';
+  const layerStr      = dd.layer_summary.slice(0, 30).map(l => `  ${l.name} (${l.entity_count} entities) → ${l.category}${l.thk_mm ? ' ' + l.thk_mm + 'mm' : ''}`).join('\n');
+  const wallStr       = Object.entries(dd.wall_by_thickness_m2).map(([thk, sqm]) => `  ${thk}mm wall: ${sqm.toFixed(2)} m² plan area`).join('\n') || 'none';
+  const unknownStr    = dd.unknown_layers.slice(0, 10).map(l => `  "${l.name}" (${l.entity_count} entities) — meaning unknown`).join('\n') || 'none';
+
+  return `You are a senior PMC civil engineer analyzing a DXF drawing: "${dd.filename}"
+All data below is EXTRACTED DIRECTLY from the drawing file. Do NOT invent values.
+
+═══════════════════════════════════════════
+DRAWING OVERVIEW
+═══════════════════════════════════════════
+Project: ${dd.project_name || 'Not found in title block'}
+Size: ${dd.drawing_extents.width_m}m × ${dd.drawing_extents.height_m}m
+Total texts: ${dd.total_texts} | Hatches: ${dd.total_hatches} | Polylines: ${dd.total_polylines} | Inserts: ${dd.total_inserts}
+
+═══════════════════════════════════════════
+FLOOR LEVELS (extracted from drawing annotations)
+═══════════════════════════════════════════
+${floorLevelStr}
+
+CALCULATED FLOOR HEIGHTS:
+${floorHtStr}
+
+═══════════════════════════════════════════
+LEGEND TABLE (read from inside drawing)
+═══════════════════════════════════════════
+${legendStr}
+
+═══════════════════════════════════════════
+LAYER MEANINGS (auto-mapped from layer names)
+═══════════════════════════════════════════
+${layerStr}
+
+═══════════════════════════════════════════
+WALL QUANTITIES (from mapped polyline areas)
+═══════════════════════════════════════════
+${wallStr}
+
+ELEMENT COUNTS:
+  Wall polylines: ${dd.element_counts.wall_polylines}
+  Column/slab polylines: ${dd.element_counts.column_polylines}
+  Doors: ${dd.element_counts.door_count}
+  Windows: ${dd.element_counts.window_count}
+  Lift doors: ${dd.element_counts.lift_door_count}
+  Floor levels found: ${dd.element_counts.floor_levels_found}
+
+═══════════════════════════════════════════
+UNKNOWN LAYERS (not yet mapped)
+═══════════════════════════════════════════
+${unknownStr}
+
+═══════════════════════════════════════════
+SAMPLE DIMENSIONS
+═══════════════════════════════════════════
+${dd.dims_sample.slice(0, 30).map(d => `${d.mm}mm [${d.layer}]`).join(', ')}
+
+RATES (Gujarat DSR 2025): ${ratesSummary}
+
+Return ONLY raw JSON:
+{"project_name":"","drawing_type":"SECTION|ELEVATION|FLOOR_PLAN|STRUCTURAL|SITE_PLAN|FOUNDATION|GENERAL","scale":"","building_height_m":0,"total_floors":0,"basements":0,"floor_levels":[{"name":"","level_m":0,"height_m":0}],"wall_schedule":[{"floor":"","thk_mm":100,"sqm":0,"cum":0}],"spaces":[{"name":"","area_sqm":0}],"boq":[{"description":"","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0}],"total_bua_sqm":0,"observations":[],"pmc_recommendation":""}`;
+}
+
+module.exports = { analyzeDrawing, buildAIPrompt, scanDXF, extractFloorLevels, extractLegendFromTexts, autoMapLayer, loadLearned, saveLearned };
