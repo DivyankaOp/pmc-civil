@@ -866,44 +866,67 @@ app.post('/analyze-dwg', async (req, res) => {
       .filter(d => d.value).map(d => `${d.value}${d.text ? ' ('+d.text+')' : ''}`).slice(0, 80).join(', ');
     const layers = (converterResult.layers || []).join(', ');
 
-    const prompt = `You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience.
-${converterResult.png_path ? 'The image above is the actual rendered AutoCAD drawing — analyze it directly with full vision.' : 'The drawing image could not be rendered, use the extracted data below.'}
+    const prompt = `You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience analyzing an AutoCAD drawing.
+${converterResult.png_path ? 'The image above IS the actual rendered drawing. Read it directly — every line, annotation, hatch, dimension, title block.' : 'Image could not be rendered. Use extracted data below.'}
 
 FILE: ${filename}
-DRAWING TYPE (auto-detected): ${converterResult.drawing_type || 'Unknown'}
-SCALE (from drawing): ${converterResult.scale || 'Not detected — estimate from dimensions'}
-DRAWING EXTENTS: ${JSON.stringify(converterResult.extents || {})}
+LAYERS FOUND: ${layers || 'See image'}
+ALL TEXT IN DRAWING: ${textSummary || 'See image'}
+DIMENSIONS FOUND: ${dimSummary || 'See image'}
+${converterResult.error ? 'Render note: ' + converterResult.error : ''}
 
-LAYERS IN DRAWING: ${layers || 'None extracted'}
+══════════════════════════════════════════════════════
+STEP 1 — READ LEGEND / SYMBOL TABLE FROM DRAWING
+══════════════════════════════════════════════════════
+Every drawing has a legend box. Find it and read:
+- Each symbol/hatch pattern and its label (e.g. "230MM THK. BRICK WALL", "100MM BLOCK WALL", "RCC PARDI")
+- Map each hatch/color/pattern to its material meaning
+- Note which AutoCAD LAYER corresponds to each element type
+- If no legend, infer from layer names (e.g. "AR-HATCH 230 MM BRICK WALL" = 230mm brick wall)
 
-ALL TEXT ANNOTATIONS (${(converterResult.texts||[]).length} found):
-${textSummary || 'None extracted'}
+══════════════════════════════════════════════════════
+STEP 2 — READ TITLE BLOCK
+══════════════════════════════════════════════════════
+Project name, drawing number, scale, date, architect/engineer.
+If not visible: write "Not shown in drawing" — do NOT invent.
 
-DIMENSION VALUES (${(converterResult.dimensions||[]).length} found):
-${dimSummary || 'None extracted'}
+══════════════════════════════════════════════════════
+STEP 3 — IDENTIFY DRAWING TYPE & READ ALL FLOOR LEVELS
+══════════════════════════════════════════════════════
+Drawing type: SECTION / ELEVATION / FLOOR_PLAN / STRUCTURAL / SITE_PLAN / FOUNDATION
+Read every floor level annotation (e.g. "+7590 MM LEVEL", "THIRD BASEMENT LEVEL").
+Calculate floor heights between consecutive levels.
 
-${converterResult.error ? 'NOTE: File reading had issues: ' + converterResult.error : ''}
+══════════════════════════════════════════════════════
+STEP 4 — EXTRACT QUANTITIES BASED ON WHAT YOU SEE
+══════════════════════════════════════════════════════
+Use the legend you read in Step 1 to identify elements.
+For SECTION drawing: wall lengths × thickness × floor height = volume
+For FLOOR PLAN: room areas, wall lengths, openings count
+For STRUCTURAL: column sizes, beam dimensions, slab thickness
+For SITE/ROAD: road lengths × widths
 
-INSTRUCTIONS:
-1. If image is shown above — read EVERY dimension, annotation, scale bar, title block directly from it
-2. Use extracted text + dimensions above to supplement/verify what you see
-3. Calculate ALL quantities using proper PMC formulas:
-   Roads: Area=L×W | GSB=Area×1.15×0.3×1800kg/m³ | WMM=Area×1.15×0.2×2100 | PQC=Area×1.05×0.25
-   Structure: Volume=L×W×H | Steel=Volume×120kg/m³(slab) or 160(beam)
-4. Apply Gujarat DSR 2025 rates:
-   PQC ₹1800/sqmt | GSB ₹655/sqmt | WMM ₹515/sqmt | Soil stab ₹82/sqmt
-   RCC M25 ₹5500/cum | RCC M30 ₹5800/cum | Steel Fe500 ₹56/kg
-   Brickwork ₹4500/cum | Formwork ₹180/sqmt | Excavation ₹180/cum
-   Compound wall ₹8600/rmt | Street light ₹35000/nos | Pipeline ₹4500/rmt
+Calculate:
+| Element | Nos | Length (m) | Width/Thk (m) | Height (m) | Qty | Unit |
 
-OUTPUT FORMAT — Full PMC Analysis Report:
-## Drawing Details (Title Block)
-## Scale & Dimensions
-## Element-wise Quantities Table
-| Element | Length(m) | Width(m) | Area(sqmt) | Qty | Unit | Rate(₹) | Amount(₹) |
-## Cost Summary
-## Steel BBS (if structural drawing)
-## PMC Observations & IS Code References`;
+══════════════════════════════════════════════════════
+STEP 5 — BOQ WITH GUJARAT DSR 2025 RATES
+══════════════════════════════════════════════════════
+100mm block wall: ₹4200/cum | 230mm brick wall: ₹4800/cum
+RCC M25: ₹5500/cum | RCC M30: ₹5800/cum | Steel Fe500: ₹56/kg
+Excavation: ₹180/cum | Formwork: ₹180/sqmt | PQC road: ₹1800/sqmt
+Plaster 12mm: ₹280/sqmt | Waterproofing: ₹450/sqmt
+
+══════════════════════════════════════════════════════
+STEP 6 — PMC OBSERVATIONS
+══════════════════════════════════════════════════════
+IS code compliance, design comments, missing information, recommendations.
+
+CRITICAL RULES:
+- Read from drawing — do NOT invent values not visible
+- If something not visible: state "Not shown in drawing"  
+- Date = today's actual date, not from drawing unless shown
+- Work floor by floor if it's a section/multi-floor drawing`;
 
     parts.push({ text: prompt });
 
