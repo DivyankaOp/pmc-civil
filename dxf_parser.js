@@ -406,49 +406,137 @@ function extractCivilData(parsed, filename, legendArg) {
     }
   }
 
-  // ─── 5. LAYER-BASED WALL MAPPING ─────────────────────────────────
-  // From actual DXF scan: exact layer names with hatch counts
-  const LAYER_MAP = {
-    // Walls
-    'AR-HATCH 100 MM BLOCK WALL': { cat: 'wall', thk_mm: 100,  label: '100MM Block Wall',   unit: 'CUM' },
-    'AR-HATCH 230 MM BRICK WALL': { cat: 'wall', thk_mm: 230,  label: '230MM Brick Wall',   unit: 'CUM' },
-    'AR-WALL':                    { cat: 'wall', thk_mm: 100,  label: '100MM Wall',          unit: 'CUM' },
-    'AR-WALL 230 MM':             { cat: 'wall', thk_mm: 230,  label: '230MM Wall',          unit: 'CUM' },
-    // RCC
-    'AR-HATCH COLUMN - SLAB':     { cat: 'column',  thk_mm: 0, label: 'RCC Column/Slab',    unit: 'CUM' },
-    'AR-HATCH R.C.C PARDI':       { cat: 'rcc_pardi', thk_mm: 0, label: 'RCC Pardi',        unit: 'CUM' },
-    'AR-RCC PARDI':               { cat: 'rcc_pardi', thk_mm: 0, label: 'RCC Pardi',        unit: 'CUM' },
-    'AR-COLUMN ( BASEMENT )':     { cat: 'column',  thk_mm: 0, label: 'Basement Column',    unit: 'CUM' },
-    'STRU COLUMN':                { cat: 'column',  thk_mm: 0, label: 'Structural Column',  unit: 'CUM' },
-    'AR-BEAM DROP HATCH':         { cat: 'beam',    thk_mm: 0, label: 'Beam Drop',          unit: 'CUM' },
-    // Flooring
-    'AR-FLOORING HATCH':          { cat: 'flooring', thk_mm: 0, label: 'Flooring',          unit: 'SQMT' },
-    'AR-TILING':                  { cat: 'tiling',   thk_mm: 0, label: 'Tiling',            unit: 'SQMT' },
-    'AR-TILES':                   { cat: 'tiling',   thk_mm: 0, label: 'Tiles',             unit: 'SQMT' },
-    'AR-GRANITE':                 { cat: 'granite',  thk_mm: 0, label: 'Granite',           unit: 'SQMT' },
-    'AR - HAT. GRANITE':          { cat: 'granite',  thk_mm: 0, label: 'Granite',           unit: 'SQMT' },
-    'AR-SUNK 75 MM':              { cat: 'sunk',     thk_mm: 75, label: '75MM Sunk',        unit: 'SQMT' },
-    // Glass
-    'AR-GLASS':                   { cat: 'glass',    thk_mm: 0, label: 'Glass',             unit: 'SQMT' },
-    'A- GLASS -HATCH':            { cat: 'glass',    thk_mm: 0, label: 'Glass',             unit: 'SQMT' },
-    'DR - WALL GLASS':            { cat: 'glass',    thk_mm: 0, label: 'Wall Glass',        unit: 'SQMT' },
-    // Openings
-    'AR-DOOR':                    { cat: 'door',     thk_mm: 0, label: 'Door',              unit: 'NOS'  },
-    'DOOR':                       { cat: 'door',     thk_mm: 0, label: 'Door',              unit: 'NOS'  },
-    'AR-WINDOW':                  { cat: 'window',   thk_mm: 0, label: 'Window',            unit: 'NOS'  },
-    'WIN':                        { cat: 'window',   thk_mm: 0, label: 'Window',            unit: 'NOS'  },
-    'WINDOW':                     { cat: 'window',   thk_mm: 0, label: 'Window',            unit: 'NOS'  },
-    'I - WINDOW':                 { cat: 'window',   thk_mm: 0, label: 'Window',            unit: 'NOS'  },
-    // Stairs / Ramp
-    'AR-STAIRS':                  { cat: 'stair',    thk_mm: 0, label: 'Staircase',         unit: 'NOS'  },
-    'AR-RAMP':                    { cat: 'ramp',     thk_mm: 0, label: 'Ramp',              unit: 'SQMT' },
-    // Cladding
-    'AR-ELE. TRETMENT':           { cat: 'cladding', thk_mm: 0, label: 'Elevation Treatment', unit: 'SQMT' },
-    'AR-DRY CLADDING JOINTS':     { cat: 'cladding', thk_mm: 0, label: 'Dry Cladding',     unit: 'SQMT' },
-    'AR-ALUMINIUM FINS':          { cat: 'cladding', thk_mm: 0, label: 'Aluminium Fins',   unit: 'SQMT' },
-    'AR-STONE':                   { cat: 'stone',    thk_mm: 0, label: 'Stone Cladding',   unit: 'SQMT' },
-    'I- STONE':                   { cat: 'stone',    thk_mm: 0, label: 'Stone',            unit: 'SQMT' },
-  };
+  // ─── 5. DYNAMIC LAYER MAPPER (works for ANY drawing) ────────────
+  // No hardcoded layer names. Uses regex patterns on layer name itself.
+  // Covers AR-, S-, ST-, A-, ARCH-, STR-, STRUC-, CIVIL-, blank prefix, etc.
+
+  function autoMapLayer(layerName) {
+    const n = layerName.toUpperCase().trim();
+
+    // ── IGNORE layers (format, grid, defpoints) ───────────────────
+    if (/\b(DEFPOINTS|FORMAT|TITLE\s*BLOCK|BORDER|VIEWPORT|VPORT|XREF|REF|GRID|CL|CENTRE\s*LINE|CENTER\s*LINE|NORTH|COMPASS)\b/.test(n))
+      return null;
+    if (/^(0|DEFPOINTS)$/.test(n)) return null;
+
+    // ── WALL: extract thickness from layer name ───────────────────
+    // Handles: "AR-HATCH 100 MM BLOCK WALL", "WALL-115MM", "S-WALL 230", "BRICK WALL 230MM"
+    const wallThk = n.match(/(\d{2,3})\s*MM\s*(BLOCK|BRICK|AAC|FLYASH|FLY\s*ASH|STONE|LIME|LIGHT|THK|THICK)?\s*WALL/)
+                 || n.match(/WALL[\s\-_]*(\d{2,3})\s*MM/)
+                 || n.match(/(\d{2,3})\s*MM[\s\-_]*WALL/)
+                 || n.match(/HATCH[\s\-_]+(\d{2,3})[\s\-_]*MM[\s\-_]*(BLOCK|BRICK|WALL)/);
+    if (wallThk) {
+      const thk = parseInt(wallThk[1]);
+      const mat = wallThk[2] ? wallThk[2].trim() : (thk <= 115 ? 'BLOCK' : 'BRICK');
+      return { cat: 'wall', thk_mm: thk, label: `${thk}MM ${mat} Wall`, unit: 'CUM' };
+    }
+    // Wall without thickness in name
+    if (/\bWALL\b/.test(n) && !/CURTAIN|GLASS|PARAPET|RETAINING|PARTY/.test(n))
+      return { cat: 'wall', thk_mm: null, label: 'Wall', unit: 'CUM' };
+
+    // ── RCC / STRUCTURAL ─────────────────────────────────────────
+    if (/R\.?C\.?C\.?\s*PARDI|PARDI/.test(n))
+      return { cat: 'rcc_pardi', thk_mm: null, label: 'RCC Pardi', unit: 'CUM' };
+    if (/COLUMN[\s\-]*SLAB|HATCH[\s\-]*COLUMN|COL[\s\-]*SLAB/.test(n))
+      return { cat: 'column', thk_mm: null, label: 'RCC Column/Slab', unit: 'CUM' };
+    if (/\bCOLUMN\b|\bCOL\b/.test(n) && !/COLOUR|COLOR/.test(n))
+      return { cat: 'column', thk_mm: null, label: 'Column', unit: 'CUM' };
+    if (/\bSLAB\b/.test(n))
+      return { cat: 'slab', thk_mm: null, label: 'Slab', unit: 'CUM' };
+    if (/\bBEAM\b/.test(n))
+      return { cat: 'beam', thk_mm: null, label: 'Beam', unit: 'CUM' };
+    if (/FOOTING|FOUNDATION|RAFT|PILE\s*CAP/.test(n))
+      return { cat: 'footing', thk_mm: null, label: 'Footing/Foundation', unit: 'CUM' };
+    if (/\bD[\s\-]?WALL\b|DIAPHRAGM/.test(n))
+      return { cat: 'retaining_wall', thk_mm: null, label: 'D-Wall', unit: 'CUM' };
+    if (/SHEAR\s*WALL|CORE\s*WALL/.test(n))
+      return { cat: 'shear_wall', thk_mm: null, label: 'Shear Wall', unit: 'CUM' };
+
+    // ── FLOORING / FINISHES ───────────────────────────────────────
+    if (/(\d{2,3})\s*MM\s*SUNK|SUNK\s*(\d{2,3})\s*MM/.test(n)) {
+      const d = n.match(/(\d{2,3})\s*MM\s*SUNK|SUNK\s*(\d{2,3})\s*MM/);
+      return { cat: 'sunk', thk_mm: parseInt(d[1]||d[2]), label: `${d[1]||d[2]}MM Sunk`, unit: 'SQMT' };
+    }
+    if (/SUNK/.test(n))
+      return { cat: 'sunk', thk_mm: 75, label: 'Sunk', unit: 'SQMT' };
+    if (/RAISED\s*PLATFORM|OTLI|RAISED\s*DECK/.test(n))
+      return { cat: 'raised_platform', thk_mm: null, label: 'Raised Platform', unit: 'SQMT' };
+    if (/GRANITE/.test(n))
+      return { cat: 'granite', thk_mm: null, label: 'Granite Flooring', unit: 'SQMT' };
+    if (/MARBLE/.test(n))
+      return { cat: 'marble', thk_mm: null, label: 'Marble Flooring', unit: 'SQMT' };
+    if (/FLOORING|FLOOR\s*FINISH|FLOOR\s*TILE/.test(n))
+      return { cat: 'flooring', thk_mm: null, label: 'Flooring', unit: 'SQMT' };
+    if (/\bTIL(E|ING)\b|\bTILES\b/.test(n))
+      return { cat: 'tiling', thk_mm: null, label: 'Tiles', unit: 'SQMT' };
+    if (/PLASTER|PUNNING/.test(n))
+      return { cat: 'plaster', thk_mm: null, label: 'Plaster', unit: 'SQMT' };
+    if (/WATERPROOF/.test(n))
+      return { cat: 'waterproofing', thk_mm: null, label: 'Waterproofing', unit: 'SQMT' };
+
+    // ── GLASS / CLADDING ─────────────────────────────────────────
+    if (/\bGLASS\b/.test(n))
+      return { cat: 'glass', thk_mm: null, label: 'Glass', unit: 'SQMT' };
+    if (/ACP|ALUM[IU]NIUM\s*COMPOSITE|ALUMINIUM\s*COMPOSITE/.test(n))
+      return { cat: 'cladding', thk_mm: null, label: 'ACP Cladding', unit: 'SQMT' };
+    if (/DRY\s*CLAD|CLADDING/.test(n))
+      return { cat: 'cladding', thk_mm: null, label: 'Cladding', unit: 'SQMT' };
+    if (/ALUMINIUM\s*FIN|ALUM\s*FIN|AL\s*FIN/.test(n))
+      return { cat: 'cladding', thk_mm: null, label: 'Aluminium Fins', unit: 'SQMT' };
+    if (/\bSTONE\b|\bSLATE\b/.test(n))
+      return { cat: 'stone', thk_mm: null, label: 'Stone Cladding', unit: 'SQMT' };
+    if (/ELEVATION\s*TREAT|ELE[\s\.]TREAT/.test(n))
+      return { cat: 'cladding', thk_mm: null, label: 'Elevation Treatment', unit: 'SQMT' };
+
+    // ── OPENINGS ─────────────────────────────────────────────────
+    if (/\bDOOR\b/.test(n) && !/DOOR\s*FRAME|SCHEDULE/.test(n))
+      return { cat: 'door', thk_mm: null, label: 'Door', unit: 'NOS' };
+    if (/\bWINDOW\b|\bWIN\b/.test(n) && !/SCHEDULE/.test(n))
+      return { cat: 'window', thk_mm: null, label: 'Window', unit: 'NOS' };
+    if (/CURTAIN\s*WALL|CURTAIN\s*GLASS/.test(n))
+      return { cat: 'curtain_wall', thk_mm: null, label: 'Curtain Wall', unit: 'SQMT' };
+
+    // ── MEP / SERVICES ───────────────────────────────────────────
+    if (/LIFT\s*SHAFT|ELEVATOR\s*SHAFT|LIFT\s*WELL/.test(n))
+      return { cat: 'lift_shaft', thk_mm: null, label: 'Lift Shaft', unit: 'NOS' };
+    if (/\bLIFT\b|\bELEVATOR\b|\bELE\b/.test(n) && /SHAFT|WELL|MACHINE|PIT/.test(n))
+      return { cat: 'lift_shaft', thk_mm: null, label: 'Lift Shaft', unit: 'NOS' };
+    if (/DUCT|SHAFT/.test(n) && !/CONDUIT/.test(n))
+      return { cat: 'duct', thk_mm: null, label: 'Duct/Shaft', unit: 'NOS' };
+
+    // ── STAIR / RAMP ─────────────────────────────────────────────
+    if (/\bSTAIR|\bSTEP\b/.test(n))
+      return { cat: 'stair', thk_mm: null, label: 'Staircase', unit: 'NOS' };
+    if (/\bRAMP\b/.test(n))
+      return { cat: 'ramp', thk_mm: null, label: 'Ramp', unit: 'SQMT' };
+
+    // ── PARKING / ROAD ───────────────────────────────────────────
+    if (/PARKING|CAR\s*PARK/.test(n))
+      return { cat: 'parking', thk_mm: null, label: 'Parking', unit: 'SQMT' };
+    if (/ROAD|PAVEMENT|FOOTPATH/.test(n))
+      return { cat: 'road', thk_mm: null, label: 'Road/Pavement', unit: 'SQMT' };
+
+    // ── ANNOTATION / IGNORE ───────────────────────────────────────
+    if (/\bDIM\b|\bDIMENSION\b|\bTEXT\b|\bNOTE\b|\bANNOT\b|\bLEVEL\s*LINE\b|\bHATCH\s*LABEL\b/.test(n))
+      return { cat: 'annotation', thk_mm: null, label: 'Annotation', unit: null };
+    if (/FURNITURE|FITTINGS|SANITARY|LANDSCAPE/.test(n))
+      return { cat: 'furniture', thk_mm: null, label: 'Furniture', unit: null };
+
+    return null; // truly unknown layer
+  }
+
+  // Build dynamic layer map from ALL layers in this drawing
+  const LAYER_MAP = {};
+  for (const layerName of Object.keys(parsed.layers || {})) {
+    const mapped = autoMapLayer(layerName);
+    if (mapped) LAYER_MAP[layerName] = mapped;
+  }
+  // Also map layers found only in entities (not in layer table)
+  for (const e of parsed.entities) {
+    if (e.layer && !LAYER_MAP[e.layer]) {
+      const mapped = autoMapLayer(e.layer);
+      if (mapped) LAYER_MAP[e.layer] = mapped;
+    }
+  }
 
   // Polyline areas grouped by mapped layer category
   function shoelaceArea(verts) {
