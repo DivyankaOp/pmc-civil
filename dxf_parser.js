@@ -183,6 +183,24 @@ function parseDXF(dxfContent) {
     return { block: p[2] || '', x, y, sx: parseFloat(p[41]) || 1, sy: parseFloat(p[42]) || 1, rotation: parseFloat(p[50]) || 0, layer: p[8] || '0' };
   }
 
+  // ── HATCH entity reader ────────────────────────────────────────
+  // DXF group codes for HATCH:
+  //   2  = pattern name (e.g. "AR-BRSTD", "ANSI31", "SOLID", "AR-CONC")
+  //   8  = layer name
+  //   70 = solid fill flag (1 = solid, 0 = patterned)
+  //   52 = hatch angle
+  //   41 = hatch scale
+  // We read raw pairs then return a lightweight object.
+  function readHatch() {
+    const p = readPairs();
+    const layer = p[8] || '0';
+    const patternName = (p[2] || '').trim().toUpperCase();
+    const isSolid = parseInt(p[70] || 0) === 1;
+    const angle = parseFloat(p[52]) || 0;
+    const scale = parseFloat(p[41]) || 1;
+    return { pattern_name: patternName, layer, is_solid: isSolid, angle, scale };
+  }
+
   function skipEntity() { readPairs(); }
 
   function dispatchEntity(etype, dest) {
@@ -201,6 +219,12 @@ function parseDXF(dxfContent) {
       const e = readLine(); if (e) dest.entities.push({ type: t, ...e });
     } else if (t === 'INSERT') {
       const e = readInsert(); if (e) { dest.inserts.push(e); dest.entities.push({ type: t, ...e }); }
+    } else if (t === 'HATCH') {
+      const e = readHatch(); if (e) {
+        if (!dest.hatches) dest.hatches = [];
+        dest.hatches.push(e);
+        dest.entities.push({ type: t, ...e });
+      }
     } else {
       skipEntity();
     }
@@ -321,6 +345,11 @@ function extractCivilData(parsed, filename, legendArg) {
   const allInserts = [
     ...parsed.inserts,
     ...Object.values(parsed.blocks).flatMap(b => b.inserts || [])
+  ];
+
+  const allHatches = [
+    ...(parsed.hatches || []),
+    ...Object.values(parsed.blocks).flatMap(b => b.hatches || [])
   ];
 
   // ─── 1. SMART UNIT DETECTION ──────────────────────────────────────
@@ -705,6 +734,8 @@ function extractCivilData(parsed, filename, legendArg) {
       ])
     ),
     hatch_by_layer:  hatchByLayer,
+    hatch_summary:   buildHatchSummary(allHatches),
+    all_hatches:     allHatches,
     layer_map:       LAYER_MAP,
     layer_names:     Object.keys(layerGroups).filter(Boolean),
     all_texts:       uniqueTexts,
@@ -737,6 +768,68 @@ function extractCivilData(parsed, filename, legendArg) {
 }
 
 
+
+// ─────────────────────────────────────────────────────────────────
+// HATCH PATTERN → MATERIAL LEGEND
+// Maps AutoCAD hatch pattern names (as used in Indian architectural DWGs)
+// to their standard civil engineering material meanings.
+// ─────────────────────────────────────────────────────────────────
+const HATCH_LEGEND = {
+  // Brick / Masonry
+  'AR-BRSTD':  { material: '230 MM THK. BRICK WALL',   category: 'wall',       symbol_desc: 'Diagonal cross-hatch (standard brick)' },
+  'AR-BRELM':  { material: '115 MM THK. BRICK WALL',   category: 'wall',       symbol_desc: 'Diagonal hatch (half-brick)' },
+  'ANSI31':    { material: 'BRICK / MASONRY WALL',      category: 'wall',       symbol_desc: '45° diagonal lines' },
+  'BRICK':     { material: 'BRICK MASONRY',             category: 'wall',       symbol_desc: 'Brick pattern' },
+  // Block Wall
+  'AR-BSTONE': { material: '100 MM THK. BLOCK WALL',   category: 'wall',       symbol_desc: 'Stone/block pattern' },
+  'BLOCK':     { material: 'BLOCK WALL',                category: 'wall',       symbol_desc: 'Grid block pattern' },
+  // Concrete / RCC
+  'AR-CONC':   { material: 'R.C.C. / CONCRETE',        category: 'structure',  symbol_desc: 'Gravel/concrete aggregate pattern' },
+  'GRAVEL':    { material: 'GRAVEL / PCC',              category: 'structure',  symbol_desc: 'Dot/gravel pattern' },
+  'ANSI32':    { material: 'STEEL / RCC REINFORCEMENT', category: 'structure',  symbol_desc: 'Angled steel pattern' },
+  // Earth / Fill
+  'EARTH':     { material: 'SOIL FILLING / EARTH',      category: 'earthwork',  symbol_desc: 'Earth fill pattern' },
+  'SAND':      { material: 'SAND FILLING',              category: 'earthwork',  symbol_desc: 'Sand/dot pattern' },
+  'AR-SAND':   { material: 'SAND BED',                  category: 'earthwork',  symbol_desc: 'Sand bed pattern' },
+  // Sunk / Depressed Slab
+  'ANSI37':    { material: '250 MM SUNK SLAB',          category: 'slab',       symbol_desc: 'Hatch for depressed/sunk area (250mm)' },
+  'ANSI36':    { material: '75 MM SUNK SLAB',           category: 'slab',       symbol_desc: 'Hatch for sunk area (75mm)' },
+  // Raised Platform
+  'AR-RROOF':  { material: 'RAISED PLATFORM (OTLI)',    category: 'platform',   symbol_desc: 'Raised platform / otli pattern' },
+  // Insulation / Waterproofing
+  'INSUL':     { material: 'INSULATION / WATERPROOFING', category: 'finishing', symbol_desc: 'Insulation pattern' },
+  // Wood / Flooring
+  'WOOD':      { material: 'WOODEN FLOORING / SHUTTERING', category: 'finishing', symbol_desc: 'Wood grain pattern' },
+  'AR-RROOF2': { material: 'ROOF / TERRACE TREATMENT', category: 'structure',  symbol_desc: 'Roof pattern' },
+  // Solid Fill
+  'SOLID':     { material: 'SOLID FILL / COLUMN',       category: 'structure',  symbol_desc: 'Solid black fill (column/wall section)' },
+  // Generic fallback for unmapped patterns
+};
+
+function buildHatchSummary(allHatches) {
+  // Group by pattern_name × layer, count occurrences
+  const summary = {};
+  for (const h of allHatches) {
+    const key = h.pattern_name || 'UNKNOWN';
+    if (!summary[key]) {
+      const leg = HATCH_LEGEND[key] || {};
+      summary[key] = {
+        pattern_name:  key,
+        material:      leg.material      || 'REFER DRAWING LEGEND',
+        category:      leg.category      || 'unknown',
+        symbol_desc:   leg.symbol_desc   || '—',
+        count:         0,
+        layers:        new Set()
+      };
+    }
+    summary[key].count++;
+    summary[key].layers.add(h.layer);
+  }
+  // Convert Sets to arrays for JSON serialisation
+  return Object.values(summary)
+    .map(s => ({ ...s, layers: [...s.layers] }))
+    .sort((a, b) => b.count - a.count);
+}
 
 // ─────────────────────────────────────────────────────────────────
 // SECTION 3 — HELPERS
