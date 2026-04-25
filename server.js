@@ -50,14 +50,113 @@ async function fetchGeminiWithRetry(key, body, { maxRetries = 5, baseDelayMs = 2
 }
 
 // ─── 1. CHAT ───────────────────────────────────────────────────────
+
+// PDF → high-res image tiles using Python/PyMuPDF
+// Returns array of base64 PNG strings (one per tile)
+async function pdfToImageTiles(pdfBase64, tilesPerPage = 4) {
+  const { execSync } = require('child_process');
+  const fs = require('fs');
+  const os = require('os');
+  const tmpDir = fs.mkdtempSync(os.tmpdir() + '/pmc_pdf_');
+  const pdfPath = tmpDir + '/input.pdf';
+
+  try {
+    fs.writeFileSync(pdfPath, Buffer.from(pdfBase64, 'base64'));
+
+    const script = `
+import fitz, os, json, base64, sys
+doc = fitz.open('${pdfPath}')
+tiles = []
+for page_num in range(min(len(doc), 3)):  # max 3 pages
+    page = doc[page_num]
+    w, h = page.rect.width, page.rect.height
+    # Full page at 2x
+    mat = fitz.Matrix(2.5, 2.5)
+    pix = page.get_pixmap(matrix=mat)
+    tiles.append(base64.b64encode(pix.tobytes('png')).decode())
+    # 4 quadrant tiles at 4x for detail
+    for row in range(2):
+        for col in range(2):
+            clip = fitz.Rect(col*w/2, row*h/2, (col+1)*w/2, (row+1)*h/2)
+            pix2 = page.get_pixmap(matrix=fitz.Matrix(4.0,4.0), clip=clip)
+            tiles.append(base64.b64encode(pix2.tobytes('png')).decode())
+doc.close()
+print(json.dumps(tiles))
+`.trim();
+
+    const scriptPath = tmpDir + '/convert.py';
+    fs.writeFileSync(scriptPath, script);
+    const out = execSync(`python3 "${scriptPath}"`, { timeout: 60000, maxBuffer: 100 * 1024 * 1024 });
+    return JSON.parse(out.toString());
+  } catch(e) {
+    console.error('PDF tile error:', e.message);
+    return null;
+  } finally {
+    try { require('fs').rmSync(tmpDir, { recursive: true }); } catch(e) {}
+  }
+}
+
 app.post('/gemini', async (req, res) => {
   try {
     const key = process.env.GEMINI_API_KEY;
     if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
-    const { body } = req.body;
+    let { body } = req.body;
+
+    // ── PDF TILE UPGRADE ──────────────────────────────────────────────
+    // If any part is a PDF, convert to image tiles so Gemini can actually SEE the drawing
+    const hasPDF = body?.contents?.some(c =>
+      c.parts?.some(p => p.inline_data?.mime_type === 'application/pdf')
+    );
+
+    if (hasPDF) {
+      console.log('[PDF] Converting PDF to image tiles for Gemini vision...');
+      const newContents = [];
+      for (const content of (body.contents || [])) {
+        const newParts = [];
+        for (const part of (content.parts || [])) {
+          if (part.inline_data?.mime_type === 'application/pdf') {
+            // Convert this PDF to tiles
+            const tiles = await pdfToImageTiles(part.inline_data.data);
+            if (tiles && tiles.length > 0) {
+              console.log(`[PDF] Generated ${tiles.length} image tiles from PDF`);
+              // Add each tile as an image part
+              for (const tileB64 of tiles) {
+                newParts.push({ inline_data: { mime_type: 'image/png', data: tileB64 } });
+              }
+              // Add instruction text
+              newParts.push({ text: `Above are ${tiles.length} high-resolution image tiles from the PDF drawing. The first image is the full page overview, followed by 4 detailed quadrant tiles for each page. Read ALL tiles carefully — zoom into details, read every annotation, dimension, floor level, title block, legend, and symbol. Treat these as the actual drawing.` });
+            } else {
+              // Fallback: keep original PDF
+              newParts.push(part);
+            }
+          } else {
+            newParts.push(part);
+          }
+        }
+        newContents.push({ ...content, parts: newParts });
+      }
+      body = { ...body, contents: newContents };
+      console.log('[PDF] Sending tiled images to Gemini');
+    }
+    // ── END PDF TILE UPGRADE ──────────────────────────────────────────
+
     const data = await fetchGeminiWithRetry(key, body);
+
+    if (data?.error) {
+      console.error('[Gemini Error]', JSON.stringify(data.error));
+      return res.json(data);
+    }
+    const candidate = data?.candidates?.[0];
+    if (!candidate) {
+      console.error('[Gemini] No candidates. Response:', JSON.stringify(data).slice(0,300));
+    } else if (!candidate?.content?.parts?.[0]?.text) {
+      console.error('[Gemini] Empty text. finishReason:', candidate.finishReason);
+    }
     return res.json(data);
-  } catch (e) { return res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    console.error('[Gemini Route]', e.message);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 // ─── 2. EXTRACT DATA ─────────────────────────────────────────────
