@@ -1,4 +1,14 @@
 const path = require('path');
-const dataPath    = path.join(__dirname);
-const scriptsPath = path.join(__dirname);
+const BASE = __dirname;
+
+// dataPath('file.json') → '/app/file.json'
+function dataPath(filename) {
+  return path.join(BASE, filename);
+}
+
+// scriptsPath('script.py') → '/app/script.py'
+function scriptsPath(filename) {
+  return path.join(BASE, filename);
+}
+
 module.exports = { dataPath, scriptsPath };
