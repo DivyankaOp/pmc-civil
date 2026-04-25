@@ -1,13 +1,15 @@
-const express = require('express');
+aconst express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const path = require('path');
 const ExcelJS = require('exceljs');
-const { extractDrawingData, buildDrawingExcel } = require('./server_drawing');
-const { geminiAnalyzeDrawing, runCVAnalysis, RATES } = require('./drawing_analyzer');
-const { parseDXF, extractCivilData, extractTotalAreaSqft } = require('./dxf_parser');
-const { buildExcelFromDrawing, getDrawingPrompt } = require('./drawing_to_excel');
-const { buildDXFExcel } = require('./dxf_to_excel');
+const { dataPath, scriptsPath } = require('./src/paths');
+const { extractDrawingData, buildDrawingExcel } = require('./src/server_drawing');
+const { geminiAnalyzeDrawing, runCVAnalysis, RATES } = require('./src/drawing_analyzer');
+const { parseDXF, extractCivilData, extractTotalAreaSqft } = require('./src/dxf_parser');
+const { buildExcelFromDrawing, getDrawingPrompt } = require('./src/drawing_to_excel');
+const { buildDXFExcel } = require('./src/dxf_to_excel');
+const { analyzeDrawing, buildAIPrompt } = require('./src/drawing_intelligence');
 
 const app = express();
 app.use(cors());
@@ -481,8 +483,6 @@ app.post('/export-drawing', async (req, res) => {
 
 // ─── 7. DXF UPLOAD & ANALYSIS ─────────────────────────────────────
 // Uses drawing_intelligence.js — reads legend, auto-maps layers, extracts levels
-const { analyzeDrawing, buildAIPrompt } = require('./drawing_intelligence');
-
 app.post('/analyze-dxf', async (req, res) => {
   try {
     const key = process.env.GEMINI_API_KEY;
@@ -495,7 +495,7 @@ app.post('/analyze-dxf', async (req, res) => {
     console.log(`[DXF] ${filename} | ${analyzed.total_layers} layers | ${analyzed.floor_levels.length} floor levels | ${analyzed.element_counts.wall_polylines} wall polylines | ${analyzed.unknown_layers.length} unknown layers`);
 
     // ── Step 2: Build rich prompt from what was actually found in drawing ─────
-    const { RATES: ratesMap } = require('./dxf_parser');
+    const { RATES: ratesMap } = require('./src/dxf_parser');
     const ratesSummary = Object.entries(ratesMap).slice(0, 25).map(([k,v]) => `${k}:₹${v}`).join(' | ');
     const prompt = buildAIPrompt(analyzed, ratesSummary);
 
@@ -561,16 +561,21 @@ app.post('/export-dxf-excel', async (req, res) => {
       const fakeReq = { body: { dxfContent, filename } };
       // reuse the prompt building
       const GEMINI_URL = k => `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k}`;
-      const { RATES: rMap } = require('./dxf_parser');
+      const { RATES: rMap } = require('./src/dxf_parser');
       const rSummary = Object.entries(rMap).slice(0,20).map(([k,v])=>`${k}:${v}`).join(',');
+      const specLines = (civilData.material_spec_texts || []).map(m => m.text).slice(0, 50);
       const prompt = `PMC civil engineer. Analyze DXF. Use ONLY data below, no invented values.
-FILE:${filename} TYPE:${civilData.drawing_type} SCALE:${civilData.scale||'?'}
-TEXTS:${civilData.all_texts.slice(0,100).join(' | ')}
-DIMS:${civilData.dimension_values.slice(0,30).map(d=>d.value_m+'m['+d.layer+']').join(', ')}
-AREAS:${civilData.polyline_areas.slice(0,15).map(p=>p.area_sqm+'sqm('+p.layer+')').join(', ')}
+FILE:${filename} DECLARED_TYPE:${civilData.drawing_type} INFERRED_SHEET_KIND:${civilData.inferred_sheet_kind || '?'} SCALE:${civilData.scale || '?'}
+PARSER_NOTES:${(civilData.extraction_notes || []).join(' | ')}
+TEXTS:${civilData.all_texts.slice(0, 120).join(' | ')}
+MATERIAL_SPECS_FROM_TEXT:${specLines.join(' | ')}
+DIMS:${civilData.dimension_values.slice(0, 40).map(d => (d.count > 1 ? d.value_m + 'm×' + d.count : d.value_m + 'm') + '[' + d.layer + ']').join(', ')}
+AREAS:${civilData.polyline_areas.slice(0, 20).map(p => p.area_sqm + 'sqm(' + p.layer + ')').join(', ')}
+BLOCK_COUNTS:${Object.entries(civilData.block_counts || {}).slice(0, 40).map(([k, v]) => k + ':' + v).join(', ')}
+ELEMENT_COUNTS:${JSON.stringify(civilData.element_counts || {})}
 LAYERS:${civilData.layer_names.join(', ')}
 RATES:${rSummary}
-Return ONLY JSON:{"project_name":"","drawing_type":"FLOOR_PLAN|BASEMENT|PARKING|LIFT_SHAFT|STAIRCASE|STRUCTURAL_SECTION|FOUNDATION|SITE_LAYOUT|ROAD_PLAN|MEP_PLUMBING|MEP_ELECTRICAL|MEP_HVAC|ELEVATION|DETAIL_DRAWING|GENERAL","scale":"","spaces":[],"boq":[{"description":"","unit":"","qty":0,"rate":0,"amount":0}],"observations":[],"pmc_recommendation":""}`;
+Return ONLY JSON:{"project_name":"","drawing_type":"FLOOR_PLAN|BASEMENT|PARKING|LIFT_SHAFT|STAIRCASE|STRUCTURAL_SECTION|FOUNDATION|SITE_LAYOUT|ROAD_PLAN|MEP_PLUMBING|MEP_ELECTRICAL|MEP_HVAC|ELEVATION|DETAIL_DRAWING|SECTION_ELEVATION|GENERAL","scale":"","spaces":[],"boq":[{"description":"","unit":"","qty":0,"rate":0,"amount":0}],"observations":[],"pmc_recommendation":"Explain what you used from TEXT vs block symbols vs dimensions; if section/elevation, avoid treating polyline areas as room BUA."}`;
 
       const geminiData4 = await fetchGeminiWithRetry(key, { contents: [{ role:'user', parts:[{text:prompt}] }], generationConfig: { maxOutputTokens:4096, temperature:0.0, responseMimeType:'application/json' } });
       let raw = geminiData4?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
@@ -661,7 +666,7 @@ app.post('/update-area-from-dxf', async (req, res) => {
     if (!totalAreaSqft || totalAreaSqft <= 0)
       return res.status(400).json({ error: 'No closed polylines found in DXF. Area calculate nahi hui.' });
 
-    const estimatePath = path.join(__dirname, 'UPDATED-OVERALL-ESTIMATE-MODESTAA-10.04.2026.xlsx');
+    const estimatePath = path.join(__dirname, 'data', 'templates', 'UPDATED-OVERALL-ESTIMATE-MODESTAA-10.04.2026.xlsx');
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.readFile(estimatePath);
 
@@ -717,7 +722,7 @@ app.post('/fill-template-from-drawing', async (req, res) => {
 
     // ── HIGH-RISE: use MODESTAA template, fill only drawing-derived cells ──
     if (ptype === 'high_rise_residential') {
-      const estimatePath = path.join(__dirname, 'UPDATED-OVERALL-ESTIMATE-MODESTAA-10.04.2026.xlsx');
+      const estimatePath = path.join(__dirname, 'data', 'templates', 'UPDATED-OVERALL-ESTIMATE-MODESTAA-10.04.2026.xlsx');
       const wb = new ExcelJS.Workbook();
       await wb.xlsx.readFile(estimatePath);
 
@@ -805,8 +810,9 @@ app.post('/analyze-dwg', async (req, res) => {
     const key = process.env.GEMINI_API_KEY;
     if (!key) return res.status(500).json({ error: 'GEMINI_API_KEY not set.' });
 
-    const { b64, filename } = req.body;
+    const { b64, filename, detailMode } = req.body;
     if (!b64) return res.status(400).json({ error: 'No file data provided.' });
+    const useDetail = detailMode === true || detailMode === 'true' || detailMode === 1;
 
     const fs = require('fs');
     const { execSync } = require('child_process');
@@ -820,7 +826,7 @@ app.post('/analyze-dwg', async (req, res) => {
     fs.writeFileSync(tmpIn, Buffer.from(b64, 'base64'));
 
     // Run converter. DXF/DWG → ezdxf Python script. DWF → LibreOffice fallback.
-    const scriptPath = path.join(__dirname, 'dwg_converter.py');
+    const scriptPath = scriptsPath('dwg_converter.py');
     let converterResult = {};
 
     if (ext === 'dwf') {
@@ -843,22 +849,65 @@ app.post('/analyze-dwg', async (req, res) => {
       }
     } else {
       try {
-        const out = execSync(`python3 "${scriptPath}" "${tmpIn}" "${tmpPng}"`, { timeout: 60000 });
+        const py = process.env.PMC_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+        const dpi = useDetail ? 180 : 150;
+        const tiledArg = useDetail ? 'true' : 'false';
+        const out = execSync(
+          `${py} "${scriptPath}" "${tmpIn}" "${tmpPng}" ${dpi} ${tiledArg}`,
+          { timeout: 120000, maxBuffer: 20 * 1024 * 1024 }
+        );
         converterResult = JSON.parse(out.toString());
       } catch (e) {
         converterResult = { success: false, error: e.message };
       }
     }
 
-    // Build Gemini parts
-    const parts = [];
+    // DWF or any path that has PNG but no tiles yet: split with helper script
+    if (useDetail && converterResult.png_path && fs.existsSync(converterResult.png_path)
+        && (!converterResult.tiles || !converterResult.tiles.length)) {
+      try {
+        const outDir = path.dirname(converterResult.png_path);
+        const baseName = path.basename(converterResult.png_path, path.extname(converterResult.png_path));
+        const tileScript = path.join(__dirname, 'scripts', 'tile_only.py');
+        const py = process.env.PMC_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+        const tout = execSync(
+          `${py} "${tileScript}" "${converterResult.png_path}" "${outDir}" "${baseName}"`,
+          { timeout: 60000, maxBuffer: 10 * 1024 * 1024 }
+        );
+        const ta = JSON.parse(tout.toString().trim() || '[]');
+        if (Array.isArray(ta) && ta.length) converterResult.tiles = ta;
+      } catch (e) {
+        console.warn('Tile split (fallback):', e.message);
+      }
+    }
 
-    // If PNG rendered successfully — send image to Gemini Vision
+    // Gemini: images first, then one text block (vision models handle this well)
+    const parts = [];
     if (converterResult.png_path && fs.existsSync(converterResult.png_path)) {
       const pngB64 = fs.readFileSync(converterResult.png_path).toString('base64');
       parts.push({ inline_data: { mime_type: 'image/png', data: pngB64 } });
-      try { fs.unlinkSync(converterResult.png_path); } catch(e) {}
     }
+    if (useDetail && Array.isArray(converterResult.tiles)) {
+      for (const t of converterResult.tiles) {
+        if (t.path && fs.existsSync(t.path)) {
+          try {
+            const tb = fs.readFileSync(t.path).toString('base64');
+            parts.push({ inline_data: { mime_type: 'image/png', data: tb } });
+            try { fs.unlinkSync(t.path); } catch (e) {}
+          } catch (e) { /* skip bad tile */ }
+        }
+      }
+    }
+    if (converterResult.png_path) {
+      try { fs.unlinkSync(converterResult.png_path); } catch (e) {}
+    }
+
+    const nDetailTiles = (converterResult.tiles || []).length;
+    const visionHeader = useDetail && nDetailTiles
+      ? `MULTI-IMAGE INPUT: The user message includes ${1 + nDetailTiles} images in order: (1) full sheet render, then (2–${1 + nDetailTiles}) 2×2 quadrant crops of the SAME drawing (higher effective zoom for small text, legend, dimensions). Synthesize one coherent analysis; do not treat crops as different drawings.\n\n`
+      : (parts.length > 0
+        ? 'SINGLE-IMAGE INPUT: The drawing render is above this text. Read like CAD: title block, legend, dimensions, hatches, symbols, notes.\n\n'
+        : '');
 
     // Always include extracted text + dimension data
     const textSummary = (converterResult.texts || []).map(t => t.text).slice(0, 150).join(' | ');
@@ -866,8 +915,8 @@ app.post('/analyze-dwg', async (req, res) => {
       .filter(d => d.value).map(d => `${d.value}${d.text ? ' ('+d.text+')' : ''}`).slice(0, 80).join(', ');
     const layers = (converterResult.layers || []).join(', ');
 
-    const prompt = `You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience analyzing an AutoCAD drawing.
-${converterResult.png_path ? 'The image above IS the actual rendered drawing. Read it directly — every line, annotation, hatch, dimension, title block.' : 'Image could not be rendered. Use extracted data below.'}
+    const prompt = `${visionHeader}You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience analyzing an AutoCAD drawing.
+(Use every image in this user message, if any, together with the extracted text list below.)
 
 FILE: ${filename}
 LAYERS FOUND: ${layers || 'See image'}
@@ -953,7 +1002,13 @@ CRITICAL RULES:
     // Cleanup temp input
     try { fs.unlinkSync(tmpIn); } catch(e) {}
 
-    res.json({ success: true, analysis, converter: converterResult });
+    res.json({
+      success: true,
+      analysis,
+      converter: converterResult,
+      detailMode: useDetail,
+      quadrantTiles: nDetailTiles,
+    });
   } catch (err) {
     console.error('DWG analyze error:', err);
     res.status(500).json({ error: err.message });
@@ -973,7 +1028,7 @@ app.post('/classify-dxf', async (req, res) => {
     const fs = require('fs');
 
     // Load learned symbols from disk
-    const learnedPath = path.join(__dirname, 'symbols-learned.json');
+    const learnedPath = dataPath('symbols-learned.json');
     let learned = { blocks: {}, layers: {} };
     try { learned = JSON.parse(fs.readFileSync(learnedPath, 'utf8')); } catch(e) {}
 
@@ -1131,7 +1186,7 @@ app.post('/analyze-with-answers', async (req, res) => {
     const fs = require('fs');
 
     // Save user answers to symbols-learned.json for future drawings
-    const learnedPath = path.join(__dirname, 'symbols-learned.json');
+    const learnedPath = dataPath('symbols-learned.json');
     let learned = { blocks: {}, layers: {} };
     try { learned = JSON.parse(fs.readFileSync(learnedPath, 'utf8')); } catch(e) {}
 
@@ -1168,7 +1223,7 @@ app.post('/analyze-with-answers', async (req, res) => {
         `Layer "${name}" = ${type}`)
     ].join('\n');
 
-    const { RATES: ratesMap } = require('./dxf_parser');
+    const { RATES: ratesMap } = require('./src/dxf_parser');
     const ratesSummary = Object.entries(ratesMap).slice(0, 30).map(([k, v]) => `${k}:${v}`).join(', ');
 
     const prompt = `You are a senior PMC civil engineer generating a complete BOQ.
@@ -1258,3 +1313,4 @@ app.listen(PORT, () => {
   console.log(`\n✅ PMC Civil AI Agent on port ${PORT}`);
   console.log(`🔑 GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? 'SET ✅' : 'NOT SET ❌'}`);
 });
+
