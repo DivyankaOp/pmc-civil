@@ -3,13 +3,13 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 const path = require('path');
 const ExcelJS = require('exceljs');
-const { dataPath, scriptsPath } = require('./src/paths');
-const { extractDrawingData, buildDrawingExcel } = require('./src/server_drawing');
-const { geminiAnalyzeDrawing, runCVAnalysis, RATES } = require('./src/drawing_analyzer');
-const { parseDXF, extractCivilData, extractTotalAreaSqft } = require('./src/dxf_parser');
-const { buildExcelFromDrawing, getDrawingPrompt } = require('./src/drawing_to_excel');
-const { buildDXFExcel } = require('./src/dxf_to_excel');
-const { analyzeDrawing, buildAIPrompt } = require('./src/drawing_intelligence');
+const { dataPath, scriptsPath } = require('./paths');
+const { extractDrawingData, buildDrawingExcel } = require('./server_drawing');
+const { geminiAnalyzeDrawing, runCVAnalysis, RATES } = require('./drawing_analyzer');
+const { parseDXF, extractCivilData, extractTotalAreaSqft } = require('./dxf_parser');
+const { buildExcelFromDrawing, getDrawingPrompt } = require('./drawing_to_excel');
+const { buildDXFExcel } = require('./dxf_to_excel');
+const { analyzeDrawing, buildAIPrompt } = require('./drawing_intelligence');
 
 const app = express();
 app.use(cors());
@@ -495,7 +495,7 @@ app.post('/analyze-dxf', async (req, res) => {
     console.log(`[DXF] ${filename} | ${analyzed.total_layers} layers | ${analyzed.floor_levels.length} floor levels | ${analyzed.element_counts.wall_polylines} wall polylines | ${analyzed.unknown_layers.length} unknown layers`);
 
     // ── Step 2: Build rich prompt from what was actually found in drawing ─────
-    const { RATES: ratesMap } = require('./src/dxf_parser');
+    const { RATES: ratesMap } = require('./dxf_parser');
     const ratesSummary = Object.entries(ratesMap).slice(0, 25).map(([k,v]) => `${k}:₹${v}`).join(' | ');
     const prompt = buildAIPrompt(analyzed, ratesSummary);
 
@@ -561,7 +561,7 @@ app.post('/export-dxf-excel', async (req, res) => {
       const fakeReq = { body: { dxfContent, filename } };
       // reuse the prompt building
       const GEMINI_URL = k => `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${k}`;
-      const { RATES: rMap } = require('./src/dxf_parser');
+      const { RATES: rMap } = require('./dxf_parser');
       const rSummary = Object.entries(rMap).slice(0,20).map(([k,v])=>`${k}:${v}`).join(',');
       const specLines = (civilData.material_spec_texts || []).map(m => m.text).slice(0, 50);
       const prompt = `PMC civil engineer. Analyze DXF. Use ONLY data below, no invented values.
@@ -1223,7 +1223,7 @@ app.post('/analyze-with-answers', async (req, res) => {
         `Layer "${name}" = ${type}`)
     ].join('\n');
 
-    const { RATES: ratesMap } = require('./src/dxf_parser');
+    const { RATES: ratesMap } = require('./dxf_parser');
     const ratesSummary = Object.entries(ratesMap).slice(0, 30).map(([k, v]) => `${k}:${v}`).join(', ');
 
     const prompt = `You are a senior PMC civil engineer generating a complete BOQ.
@@ -1313,4 +1313,3 @@ app.listen(PORT, () => {
   console.log(`\n✅ PMC Civil AI Agent on port ${PORT}`);
   console.log(`🔑 GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? 'SET ✅' : 'NOT SET ❌'}`);
 });
-
