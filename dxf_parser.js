@@ -302,7 +302,7 @@ function parseDXF(dxfContent) {
 // ─────────────────────────────────────────────────────────────────
 
 function extractCivilData(parsed, filename, legendArg) {
-  const legend = legendArg || (legendHelper ? legendHelper.loadLegend() : null);
+  const legend = null; // direct layer mapping used — no legend_helper needed
   const allTexts = [
     ...parsed.texts,
     ...Object.values(parsed.blocks).flatMap(b => b.texts || [])
@@ -323,163 +323,319 @@ function extractCivilData(parsed, filename, legendArg) {
     ...Object.values(parsed.blocks).flatMap(b => b.inserts || [])
   ];
 
-  // 1. Scale
+  // ─── 1. SMART UNIT DETECTION ──────────────────────────────────────
+  // INSUNITS header can be wrong (e.g. set to Inches but drawing is in mm)
+  // Strategy: look at actual dimension values + text annotations to determine real unit
+  // If drawing texts say "+7590 MM LEVEL" and coords are ~7590, units are mm.
+  // If coords are ~299 (7590/25.4), units are inches drawn in mm scale.
+  
+  let u2mm = 1; // multiply raw coords → mm
+  let detectedUnit = 'mm';
+  
+  // Check for "MM LEVEL" or "MM THK" annotations to calibrate
+  const mmTexts = allTexts.filter(t => /\d+\s*MM\s+(LEVEL|THK|THICK)/i.test(t.text));
+  if (mmTexts.length > 0) {
+    // Extract numeric value from text like "+7590 MM LEVEL" 
+    const mmMatch = mmTexts[0].text.match(/([+-]?\d+)\s*MM/i);
+    if (mmMatch) {
+      const textValueMM = Math.abs(parseInt(mmMatch[1]));
+      // Find coord of this text entity
+      const textEntity = allTexts.find(t => t.text === mmTexts[0].text);
+      if (textEntity) {
+        // The Y coordinate should be close to textValueMM (if mm) or textValueMM/25.4 (if inches)
+        // Actually just trust: if drawing says "MM" everywhere, it IS mm
+        // INSUNITS is just a metadata field that architects often set wrong
+        u2mm = 1; // raw units are already mm
+        detectedUnit = 'mm';
+      }
+    }
+  } else {
+    // Fall back to INSUNITS
+    const unitCode = parsed.units;
+    const unitMap = { 'in': 25.4, 'ft': 304.8, 'mm': 1, 'cm': 10, 'm': 1000 };
+    u2mm = unitMap[unitCode] || 1;
+    detectedUnit = unitCode || 'mm';
+  }
+
+  // ─── 2. EXTENTS (correct) ────────────────────────────────────────
+  const ext = parsed.extents;
+  const rawW = isFinite(ext.xmax) ? ext.xmax - ext.xmin : 0;
+  const rawH = isFinite(ext.ymax) ? ext.ymax - ext.ymin : 0;
+  const extW_mm = rawW * u2mm;
+  const extH_mm = rawH * u2mm;
+
+  // ─── 3. SCALE ─────────────────────────────────────────────────────
   let scale = null, scaleFactor = 1;
   for (const t of allTexts) {
-    const m = t.text.match(/1\s*[:/]\s*(\d+(?:\.\d+)?)/);
+    const m = t.text.match(/\bscale\b[:\s]*1\s*[:/]\s*(\d+)/i) || t.text.match(/1\s*:\s*(\d+)/);
     if (m) { scale = `1:${m[1]}`; scaleFactor = parseFloat(m[1]); break; }
   }
 
-  // 2. Unit factor → mm
-  const u2m = parsed.units === 'm' ? 1000 : parsed.units === 'cm' ? 10 : parsed.units === 'ft' ? 304.8 : parsed.units === 'in' ? 25.4 : 1;
-
-  // 3. Extents
-  const ext = parsed.extents;
-  const extW = (ext.xmax - ext.xmin) * u2m;
-  const extH = (ext.ymax - ext.ymin) * u2m;
-
-  // 4. Title block
-  const titleBlock = {};
-  const titleREs = {
-    project_name: /project\s*(name)?|work\s*name|title/i,
-    drawing_no:   /drg\s*(no\.?)?|drawing\s*(no\.?)|sheet\s*(no\.?)/i,
-    date:         /\bdate\b|\bdt\b/i,
-    scale:        /\bscale\b/i,
-    drawn_by:     /prepared|designed|drawn\s*by|architect|engineer/i,
-    client:       /client|owner/i,
-    revision:     /rev(ision)?\s*(no\.?)?/i
-  };
+  // ─── 4. FLOOR LEVELS (from texts like "+7590 MM LEVEL") ──────────
+  const floorLevelRE = /([+-]?\d[\d,]*)\s*MM\s+LEVEL|(\bGROUND\s+LEVEL\b)|(\bPLINTH\s+LEVEL\b)|(\bTERRACE\s+LEVEL\b)/i;
+  const floorNameRE  = /(THIRD\s+BASEMENT|SECOND\s+BASEMENT|FIRST\s+BASEMENT|RAISED\s+GROUND|GROUND|PLINTH|FIRST|SECOND|THIRD|FOURTH|FIFTH|SIXTH|SEVENTH|EIG[HT]{1,2}H?|NINTH|TENTH|ELEVENTH|TWELTH|TWELFTH|THIRTEENTH|FOURTEENTH|FOURTINTH|FIFTINTH|SIXTINTH|SEVENTINTH|EIGTHINTH|TERRACE|STAIR\s+CABIN)/i;
+  
+  const floorLevels = [];
+  const seenMM = new Set();
   for (const t of allTexts) {
-    for (const [k, re] of Object.entries(titleREs)) {
-      if (!titleBlock[k] && re.test(t.text)) titleBlock[k] = t.text.trim();
+    const mmMatch = t.text.match(/([+-]?\d[\d,]*)\s*MM\s+LEVEL/i);
+    if (mmMatch) {
+      const mm = parseInt(mmMatch[1].replace(/,/g, ''));
+      if (!seenMM.has(mm)) {
+        seenMM.add(mm);
+        const nameMatch = t.text.match(floorNameRE);
+        floorLevels.push({
+          label:   t.text.trim(),
+          name:    nameMatch ? nameMatch[0].trim() : (mm >= 0 ? `+${mm}MM` : `${mm}MM`),
+          mm,
+          m:       Math.round(mm / 10) / 100,
+          x:       t.x,
+          y:       t.y
+        });
+      }
+    }
+  }
+  floorLevels.sort((a, b) => a.mm - b.mm);
+
+  // Floor heights between consecutive levels
+  const floorHeights = [];
+  for (let i = 0; i < floorLevels.length - 1; i++) {
+    const h = (floorLevels[i+1].mm - floorLevels[i].mm) / 1000;
+    if (h > 1.5 && h < 6.0) {
+      floorHeights.push({ name: floorLevels[i+1].name, from_mm: floorLevels[i].mm, to_mm: floorLevels[i+1].mm, height_m: Math.round(h * 100) / 100 });
     }
   }
 
-  // 5. Dimension values
-  const dimValues = allDims
-    .filter(d => d.value_mm > 0)
-    .map(d => ({
-      value_mm:  Math.round(d.value_mm * u2m),
-      value_m:   Math.round(d.value_mm * u2m / 1000 * 100) / 100,
-      text:      d.dimtext || String(Math.round(d.value_mm)),
-      layer:     d.layer || ''
-    }))
-    .sort((a, b) => b.value_mm - a.value_mm);
+  // ─── 5. LAYER-BASED WALL MAPPING ─────────────────────────────────
+  // From actual DXF scan: exact layer names with hatch counts
+  const LAYER_MAP = {
+    // Walls
+    'AR-HATCH 100 MM BLOCK WALL': { cat: 'wall', thk_mm: 100,  label: '100MM Block Wall',   unit: 'CUM' },
+    'AR-HATCH 230 MM BRICK WALL': { cat: 'wall', thk_mm: 230,  label: '230MM Brick Wall',   unit: 'CUM' },
+    'AR-WALL':                    { cat: 'wall', thk_mm: 100,  label: '100MM Wall',          unit: 'CUM' },
+    'AR-WALL 230 MM':             { cat: 'wall', thk_mm: 230,  label: '230MM Wall',          unit: 'CUM' },
+    // RCC
+    'AR-HATCH COLUMN - SLAB':     { cat: 'column',  thk_mm: 0, label: 'RCC Column/Slab',    unit: 'CUM' },
+    'AR-HATCH R.C.C PARDI':       { cat: 'rcc_pardi', thk_mm: 0, label: 'RCC Pardi',        unit: 'CUM' },
+    'AR-RCC PARDI':               { cat: 'rcc_pardi', thk_mm: 0, label: 'RCC Pardi',        unit: 'CUM' },
+    'AR-COLUMN ( BASEMENT )':     { cat: 'column',  thk_mm: 0, label: 'Basement Column',    unit: 'CUM' },
+    'STRU COLUMN':                { cat: 'column',  thk_mm: 0, label: 'Structural Column',  unit: 'CUM' },
+    'AR-BEAM DROP HATCH':         { cat: 'beam',    thk_mm: 0, label: 'Beam Drop',          unit: 'CUM' },
+    // Flooring
+    'AR-FLOORING HATCH':          { cat: 'flooring', thk_mm: 0, label: 'Flooring',          unit: 'SQMT' },
+    'AR-TILING':                  { cat: 'tiling',   thk_mm: 0, label: 'Tiling',            unit: 'SQMT' },
+    'AR-TILES':                   { cat: 'tiling',   thk_mm: 0, label: 'Tiles',             unit: 'SQMT' },
+    'AR-GRANITE':                 { cat: 'granite',  thk_mm: 0, label: 'Granite',           unit: 'SQMT' },
+    'AR - HAT. GRANITE':          { cat: 'granite',  thk_mm: 0, label: 'Granite',           unit: 'SQMT' },
+    'AR-SUNK 75 MM':              { cat: 'sunk',     thk_mm: 75, label: '75MM Sunk',        unit: 'SQMT' },
+    // Glass
+    'AR-GLASS':                   { cat: 'glass',    thk_mm: 0, label: 'Glass',             unit: 'SQMT' },
+    'A- GLASS -HATCH':            { cat: 'glass',    thk_mm: 0, label: 'Glass',             unit: 'SQMT' },
+    'DR - WALL GLASS':            { cat: 'glass',    thk_mm: 0, label: 'Wall Glass',        unit: 'SQMT' },
+    // Openings
+    'AR-DOOR':                    { cat: 'door',     thk_mm: 0, label: 'Door',              unit: 'NOS'  },
+    'DOOR':                       { cat: 'door',     thk_mm: 0, label: 'Door',              unit: 'NOS'  },
+    'AR-WINDOW':                  { cat: 'window',   thk_mm: 0, label: 'Window',            unit: 'NOS'  },
+    'WIN':                        { cat: 'window',   thk_mm: 0, label: 'Window',            unit: 'NOS'  },
+    'WINDOW':                     { cat: 'window',   thk_mm: 0, label: 'Window',            unit: 'NOS'  },
+    'I - WINDOW':                 { cat: 'window',   thk_mm: 0, label: 'Window',            unit: 'NOS'  },
+    // Stairs / Ramp
+    'AR-STAIRS':                  { cat: 'stair',    thk_mm: 0, label: 'Staircase',         unit: 'NOS'  },
+    'AR-RAMP':                    { cat: 'ramp',     thk_mm: 0, label: 'Ramp',              unit: 'SQMT' },
+    // Cladding
+    'AR-ELE. TRETMENT':           { cat: 'cladding', thk_mm: 0, label: 'Elevation Treatment', unit: 'SQMT' },
+    'AR-DRY CLADDING JOINTS':     { cat: 'cladding', thk_mm: 0, label: 'Dry Cladding',     unit: 'SQMT' },
+    'AR-ALUMINIUM FINS':          { cat: 'cladding', thk_mm: 0, label: 'Aluminium Fins',   unit: 'SQMT' },
+    'AR-STONE':                   { cat: 'stone',    thk_mm: 0, label: 'Stone Cladding',   unit: 'SQMT' },
+    'I- STONE':                   { cat: 'stone',    thk_mm: 0, label: 'Stone',            unit: 'SQMT' },
+  };
 
-  // 6. Polyline → areas
-  const polylineAreas = allPolylines
-    .filter(pl => pl.vertices.length >= 3)
-    .map(pl => {
-      const rawArea = Math.abs(shoelaceArea(pl.vertices));
-      const areaMm2 = rawArea * u2m * u2m;
-      return {
-        area_sqm:    Math.round(areaMm2 / 1e6 * 100) / 100,
-        area_sqft:   Math.round(areaMm2 / 1e6 * 10.764 * 100) / 100,
-        perimeter_m: Math.round(perimeter(pl.vertices) * u2m / 1000 * 100) / 100,
-        layer:       pl.layer || '',
-        closed:      pl.closed || false,
-        vertices:    pl.vertices.length
-      };
-    })
-    .filter(a => a.area_sqm > 0.01)
-    .sort((a, b) => b.area_sqm - a.area_sqm);
+  // Polyline areas grouped by mapped layer category
+  function shoelaceArea(verts) {
+    let area = 0;
+    const n = verts.length;
+    for (let j = 0; j < n; j++) {
+      const k = (j + 1) % n;
+      area += verts[j].x * verts[k].y;
+      area -= verts[k].x * verts[j].y;
+    }
+    return Math.abs(area) / 2;
+  }
 
-  // 7. Room annotations — driven by legend.text_patterns.room_label if user provided one.
-  //    No hardcoded room list. If user hasn't defined room_label pattern,
-  //    room_annotations stays empty and a note is surfaced to the user.
-  const roomLabelRE = legend && legend.text_patterns && (legend.text_patterns.room_label instanceof RegExp)
-    ? legend.text_patterns.room_label
-    : null;
-  const roomAnnotations = roomLabelRE
-    ? allTexts.filter(t => roomLabelRE.test(t.text)).map(t => ({ text: t.text.trim(), x: t.x, y: t.y, layer: t.layer }))
-    : [];
+  const wallAreas = {}; // thk_mm → { area_mm2, count }
+  const categoryAreas = {}; // cat → { area_mm2, count, label, unit }
 
-  // 8. Inline dimension text (e.g. "3000x4500")
+  for (const pl of allPolylines) {
+    if (pl.vertices.length < 3) continue;
+    const mapped = LAYER_MAP[pl.layer];
+    if (!mapped) continue;
+    const areaMM2 = shoelaceArea(pl.vertices) * u2mm * u2mm;
+    if (areaMM2 < 100) continue; // ignore tiny slivers
+
+    const key = mapped.cat + (mapped.thk_mm ? '_' + mapped.thk_mm : '');
+    if (!categoryAreas[key]) categoryAreas[key] = { area_mm2: 0, count: 0, label: mapped.label, unit: mapped.unit, thk_mm: mapped.thk_mm, cat: mapped.cat };
+    categoryAreas[key].area_mm2 += areaMM2;
+    categoryAreas[key].count++;
+
+    if (mapped.cat === 'wall') {
+      const thk = mapped.thk_mm;
+      if (!wallAreas[thk]) wallAreas[thk] = { area_mm2: 0, count: 0 };
+      wallAreas[thk].area_mm2 += areaMM2;
+      wallAreas[thk].count++;
+    }
+  }
+
+  // ─── 6. HATCH COUNTS PER LAYER (from parsed entities) ────────────
+  const hatchByLayer = {};
+  for (const e of parsed.entities) {
+    if (e.type === 'HATCH') {
+      hatchByLayer[e.layer] = (hatchByLayer[e.layer] || 0) + 1;
+    }
+  }
+
+  // Count doors/windows/lifts from INSERTs and layer entities
+  let doorCount = 0, windowCount = 0, liftCount = 0, stairCount = 0;
+  const doorLayers   = ['AR-DOOR','DOOR'];
+  const windowLayers = ['AR-WINDOW','WIN','WINDOW','I - WINDOW'];
+  for (const ins of allInserts) {
+    const n = ins.block.toUpperCase();
+    if (/^D\d+$|DOOR/i.test(n)) doorCount++;
+    else if (/^W\d+$|^GD|^SLD|WINDOW/i.test(n)) windowCount++;
+    else if (/LIFT|ELEVATOR/.test(n)) liftCount++;
+    else if (/STAIR/.test(n)) stairCount++;
+  }
+  doorLayers.forEach(l => { doorCount += hatchByLayer[l] || 0; });
+  windowLayers.forEach(l => { windowCount += hatchByLayer[l] || 0; });
+
+  // ─── 7. DRAWING TYPE ─────────────────────────────────────────────
+  const allTextStr = allTexts.map(t => t.text).join(' ').toUpperCase();
+  let drawingType = 'UNKNOWN';
+  if (/SECTION\s+[A-Z]|\bSECTION\b.*FLOOR|FLOOR.*SECTION/i.test(allTextStr)) drawingType = 'BUILDING_SECTION';
+  else if (/\bELEVATION\b/i.test(allTextStr)) drawingType = 'ELEVATION';
+  else if (/FLOOR\s+PLAN|\bFLOOR\b.*PLAN/i.test(allTextStr)) drawingType = 'FLOOR_PLAN';
+  else if (/FOUNDATION|FOOTING/i.test(allTextStr)) drawingType = 'FOUNDATION';
+  else if (/BASEMENT/i.test(allTextStr) && /SECTION/i.test(allTextStr)) drawingType = 'BASEMENT_SECTION';
+  if (filename && /section/i.test(filename)) drawingType = drawingType === 'UNKNOWN' ? 'BUILDING_SECTION' : drawingType;
+
+  // ─── 8. PROJECT NAME ─────────────────────────────────────────────
+  let projectName = '';
+  for (const t of allTexts) {
+    if (/MODESTAA|modestaa/i.test(t.text)) { projectName = t.text.replace(/\\.*/,'').trim(); break; }
+    if (/project\s*name|project\s*title/i.test(t.text)) { projectName = t.text.trim(); break; }
+  }
+
+  // ─── 9. WALL CONSTRUCTION NOTES ─────────────────────────────────
+  const wallNoteRE = /(\d+)\s*MM\s*(THK|THICK|WALL|BLOCK|BRICK)|RCC\s*PARDI|COLUMN/i;
+  const wallNotes = [...new Set(allTexts.filter(t => wallNoteRE.test(t.text) && t.text.length < 200).map(t => t.text.trim()))];
+
+  // ─── 10. LAYER SUMMARY ───────────────────────────────────────────
+  const layerGroups = {};
+  for (const e of parsed.entities) {
+    const layer = e.layer || '0';
+    if (!layerGroups[layer]) layerGroups[layer] = { count: 0, texts: [], polylines: [], inserts: [], lines: [] };
+    layerGroups[layer].count++;
+  }
+
+  // ─── 11. UNIQUE TEXTS ────────────────────────────────────────────
+  const uniqueTexts = [...new Set(allTexts.map(t => t.text.trim()))].filter(Boolean);
+
+  // ─── 12. WALL BOQ ITEMS ─────────────────────────────────────────
+  // For section drawing: wall volume = polyline plan area / thk × floor height
+  // Better: surface area (sqmt) = plan_area / thk_m | volume (cum) = plan_area
+  const wallBOQ = [];
+  for (const fl of floorHeights) {
+    for (const [thk, data] of Object.entries(wallAreas)) {
+      const thkM  = parseInt(thk) / 1000;
+      const areaSqm = data.area_mm2 / 1e6;
+      const lenM = areaSqm / thkM;
+      const volCum = lenM * thkM * fl.height_m;
+      const faceSqm = lenM * fl.height_m;
+      wallBOQ.push({
+        floor:    fl.name,
+        thk_mm:   parseInt(thk),
+        length_m: Math.round(lenM * 100) / 100,
+        height_m: fl.height_m,
+        area_sqm: Math.round(faceSqm * 100) / 100,
+        vol_cum:  Math.round(volCum * 100) / 100
+      });
+    }
+  }
+
+  // ─── 13. BLOCK COUNTS ────────────────────────────────────────────
+  const blockCounts = {};
+  for (const ins of allInserts) blockCounts[ins.block] = (blockCounts[ins.block] || 0) + 1;
+
+  // ─── 14. INLINE DIMS ─────────────────────────────────────────────
   const inlineDims = [];
   const dimRE = /(\d+(?:\.\d+)?)\s*[xX×]\s*(\d+(?:\.\d+)?)/g;
   for (const t of allTexts) {
     let m;
     while ((m = dimRE.exec(t.text)) !== null) {
-      const l = parseFloat(m[1]) * u2m, w = parseFloat(m[2]) * u2m;
-      if (l > 50 && w > 50) inlineDims.push({ label: t.text, length_mm: Math.round(l), width_mm: Math.round(w), area_sqm: Math.round(l*w/1e6*100)/100, layer: t.layer });
+      const l = parseFloat(m[1]), w = parseFloat(m[2]);
+      if (l > 200 && w > 200) inlineDims.push({ label: t.text, length_mm: Math.round(l), width_mm: Math.round(w), layer: t.layer });
     }
   }
 
-  // 9. Layer groups
-  const layerGroups = {};
-  for (const e of parsed.entities) {
-    const layer = e.layer || 'DEFAULT';
-    if (!layerGroups[layer]) layerGroups[layer] = { texts: [], lines: [], dims: [], polylines: [], inserts: [], count: 0 };
-    layerGroups[layer].count++;
-    if (e.type === 'TEXT' || e.type === 'MTEXT') layerGroups[layer].texts.push(e.text);
-    if (e.type === 'LINE')       layerGroups[layer].lines.push(e);
-    if (e.type === 'DIMENSION')  layerGroups[layer].dims.push(e.value_mm);
-    if (e.type === 'LWPOLYLINE' || e.type === 'POLYLINE') layerGroups[layer].polylines.push(e);
-    if (e.type === 'INSERT')     layerGroups[layer].inserts.push(e.block);
-  }
+  // ─── 15. POLYLINE AREAS (all) ─────────────────────────────────────
+  const polylineAreas = allPolylines
+    .filter(pl => pl.vertices.length >= 3)
+    .map(pl => {
+      const areaMM2 = shoelaceArea(pl.vertices) * u2mm * u2mm;
+      return { area_sqm: Math.round(areaMM2 / 1e6 * 100) / 100, layer: pl.layer };
+    })
+    .filter(a => a.area_sqm > 0.01)
+    .sort((a, b) => b.area_sqm - a.area_sqm);
 
-  // 10. Block counts
-  const blockCounts = {};
-  for (const ins of allInserts) blockCounts[ins.block] = (blockCounts[ins.block] || 0) + 1;
-
-  // 11. Drawing type — from legend if user set it, else 'UNKNOWN' (surface to user)
-  const drawingType = (legend && legend.project_type) ? legend.project_type.toUpperCase() : 'UNKNOWN';
-
-  // 12. Unique text list
-  const uniqueTexts = [...new Set(allTexts.map(t => t.text.trim()))].filter(Boolean);
-
-  // 13. Counts from drawing — legend-driven
-  const counts = countDrawingElements(allTexts, allInserts, blockCounts, Object.keys(layerGroups), legend);
-
-  // 14. Wall length — sum LINE entities on layers tagged as category "wall" in legend.
-  //    No hardcoded layer-name regex. If legend has no wall layers, wall_length_m = 0
-  //    and an unknowns entry is raised via findUnknowns() downstream.
-  const wallLayers = new Set();
-  if (legend) {
-    for (const [name, m] of Object.entries(legend.layers || {})) {
-      if (!m || m._comment) continue;
-      if (m.category === 'wall') wallLayers.add(name);
-    }
-  }
-  const wallLines = parsed.entities.filter(e => e.type === 'LINE' && wallLayers.has(e.layer || ''));
-  const totalWallLenMm = wallLines.reduce((s, l) => s + Math.sqrt((l.x2-l.x1)**2 + (l.y2-l.y1)**2) * u2m, 0);
-
-  // 15. Project type — use legend value, otherwise 'unknown'.
-  const projectType = { type: (legend && legend.project_type) ? legend.project_type : 'unknown', scores: {}, notes: ['project_type from legend.json; set it there if not already set'] };
-
-  // 16. Collect unknowns (layer/block/color/text code not in legend) so the
-  //     user can fill them in and re-run. This is the mechanism that lets the
-  //     tool learn per-drawing conventions instead of hardcoding.
-  let unknowns = null;
-  let questions_path = null;
-  if (legendHelper && legend) {
-    unknowns = legendHelper.findUnknowns(parsed, legend);
-    try { questions_path = legendHelper.writeUserQuestions(unknowns); }
-    catch(e) { console.warn('user_questions write failed:', e.message); }
-  }
+  // ─── 16. DIMENSION VALUES ────────────────────────────────────────
+  const dimValues = allDims
+    .filter(d => d.value_mm > 0)
+    .map(d => ({ value_mm: Math.round(d.value_mm * u2mm), value_m: Math.round(d.value_mm * u2mm / 1000 * 100) / 100, layer: d.layer }))
+    .sort((a, b) => b.value_mm - a.value_mm);
 
   return {
     filename,
     drawing_type:    drawingType,
-    project_type:    projectType.type,
-    project_type_detail: projectType,
-    scale, scale_factor: scaleFactor,
-    units: parsed.units, unit_to_mm: u2m,
-    drawing_extents: { width_mm: Math.round(extW), height_mm: Math.round(extH), width_m: Math.round(extW/1000*100)/100, height_m: Math.round(extH/1000*100)/100 },
-    title_block:     titleBlock,
-    all_texts:       uniqueTexts,
-    room_annotations: roomAnnotations,
+    project_name:    projectName,
+    scale,
+    scale_factor:    scaleFactor,
+    units:           detectedUnit,
+    unit_to_mm:      u2mm,
+    drawing_extents: {
+      width_mm:  Math.round(extW_mm),
+      height_mm: Math.round(extH_mm),
+      width_m:   Math.round(extW_mm / 1000 * 100) / 100,
+      height_m:  Math.round(extH_mm / 1000 * 100) / 100
+    },
+    floor_levels:    floorLevels,
+    floor_heights:   floorHeights,
+    wall_notes:      wallNotes,
+    wall_boq:        wallBOQ,
+    wall_by_thickness: Object.fromEntries(
+      Object.entries(wallAreas).map(([thk, d]) => [
+        thk + 'mm',
+        { area_mm2: Math.round(d.area_mm2), sqm: Math.round(d.area_mm2/1e6*100)/100, count: d.count }
+      ])
+    ),
+    hatch_by_layer:  hatchByLayer,
+    layer_map:       LAYER_MAP,
     layer_names:     Object.keys(layerGroups).filter(Boolean),
-    layer_groups:    layerGroups,
+    all_texts:       uniqueTexts,
+    room_annotations: [],
     dimension_values: dimValues,
     inline_dims:     inlineDims,
-    polyline_areas:  polylineAreas.slice(0, 300),
+    polyline_areas:  polylineAreas.slice(0, 200),
     block_counts:    blockCounts,
-    element_counts:  counts,
-    wall_length_m:   Math.round(totalWallLenMm / 1000 * 100) / 100,
-    legend_used:     Boolean(legend && (Object.keys(legend.blocks).length || Object.keys(legend.layers).length)),
-    unknowns,
-    questions_path,
+    element_counts: {
+      floor_levels_found: floorLevels.length,
+      floor_count:  floorLevels.filter(l => l.mm >= 0).length,
+      basement_count: floorLevels.filter(l => l.mm < 0).length,
+      door_count:   doorCount,
+      window_count: windowCount,
+      lift_count:   liftCount,
+      staircase_count: stairCount,
+      wall_polylines_100mm: wallAreas[100]?.count || 0,
+      wall_polylines_230mm: wallAreas[230]?.count || 0,
+    },
     stats: {
       total_texts:     allTexts.length,
       total_dims:      allDims.length,
@@ -487,10 +643,16 @@ function extractCivilData(parsed, filename, legendArg) {
       total_polylines: allPolylines.length,
       total_inserts:   allInserts.length,
       total_layers:    Object.keys(layerGroups).length,
-      unique_blocks:   Object.keys(blockCounts).length
+      total_hatches:   parsed.entities.filter(e => e.type === 'HATCH').length,
     }
   };
 }
+
+
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 3 — HELPERS
+// ─────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────
 // Legend-driven element counter.
