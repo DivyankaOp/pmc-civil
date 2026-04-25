@@ -421,6 +421,89 @@ async function buildDXFExcel(dxfData, geminiResult, ExcelJS) {
     }
   }
 
+  // ══════════════════════════════════════════════════════════════
+  // SHEET — SYMBOL LEGEND (hatch patterns extracted from DXF)
+  // ══════════════════════════════════════════════════════════════
+  {
+    const ws = wb.addWorksheet('SYMBOL LEGEND');
+    ws.getColumn(1).width = 6;
+    ws.getColumn(2).width = 30;   // Pattern Name
+    ws.getColumn(3).width = 38;   // Material / Specification
+    ws.getColumn(4).width = 18;   // Category
+    ws.getColumn(5).width = 34;   // Symbol Description
+    ws.getColumn(6).width = 10;   // Count in drawing
+    ws.getColumn(7).width = 36;   // Layers used on
+
+    let row = 1;
+    mergeRow(ws, row++, 7, projectName.toUpperCase(), C.NAVY, 'FFFFFFFF', 13, 24);
+    mergeRow(ws, row++, 7, 'DRAWING SYMBOL LEGEND — HATCH PATTERNS & MATERIAL SPECIFICATIONS', C.MIDBLUE, 'FFFFFFFF', 11, 20);
+    mergeRow(ws, row++, 7, `PREPARED BY: PMC CIVIL AI AGENT  |  DATE: ${today}  |  Drawing: ${dd.filename || '—'}`, C.LTBLUE, 'FF1F3864', 9, 16);
+    row++;
+
+    // ── Standard CAD Symbol Legend (from drawing's legend/title block) ──
+    mergeRow(ws, row++, 7, 'STANDARD SYMBOLS FROM DRAWING LEGEND', C.NAVY, 'FFFFFFFF', 10);
+    hdrRow(ws, row++, ['SR', 'SYMBOL / HATCH PATTERN', 'MATERIAL / SPECIFICATION', 'CATEGORY', 'SYMBOL DESCRIPTION', 'COUNT IN DWG', 'LAYERS IN DWG'], C.NAVY);
+
+    // Known architectural symbols (always shown for reference, per Image 5 legend table)
+    const knownSymbols = [
+      { pattern: 'AR-BRSTD / AR-BRELM', material: '230 MM THK. BRICK WALL',       category: 'Wall',      symbol_desc: 'Dense diagonal cross-hatch (dark)' },
+      { pattern: 'AR-BRELM',            material: '115 MM THK. BRICK WALL',        category: 'Wall',      symbol_desc: 'Diagonal hatch (lighter, half-brick)' },
+      { pattern: 'AR-BSTONE / BLOCK',   material: '100 MM THK. BLOCK WALL',        category: 'Wall',      symbol_desc: 'Grid/stone block pattern' },
+      { pattern: 'AR-CONC / GRAVEL',    material: 'R.C.C. PARDI',                  category: 'Structure', symbol_desc: 'Aggregate/gravel concrete pattern' },
+      { pattern: 'ANSI37',              material: '250 MM SUNK SLAB',              category: 'Slab',      symbol_desc: 'Cross-hatch for depressed slab (toilet/wet areas)' },
+      { pattern: 'ANSI36',              material: '75 MM SUNK SLAB',               category: 'Slab',      symbol_desc: 'Light hatch for minor sunk area' },
+      { pattern: 'AR-RROOF',            material: 'RAISED PLATFORM (OTLI)',        category: 'Platform',  symbol_desc: 'Raised platform / pooja room / entry step' },
+      { pattern: 'SOLID',               material: 'BUILDING COLUMN (RCC)',         category: 'Structure', symbol_desc: 'Solid black fill — column section cut' },
+      { pattern: 'EARTH',               material: 'SOIL FILLING / EARTH',          category: 'Earthwork', symbol_desc: 'Earth fill / backfill pattern' },
+      { pattern: '— (Red line)',         material: 'F.P. LINE (Face / Plinth)',     category: 'Reference', symbol_desc: 'Red dashed — floor/face plinth line' },
+      { pattern: '— (Black line)',       material: 'BUILDING LINE',                category: 'Reference', symbol_desc: 'Building boundary line' },
+      { pattern: '— (Red line - bold)', material: 'CENTER LINE',                   category: 'Reference', symbol_desc: 'Red — structural center line' },
+      { pattern: '— (Blue line)',        material: 'FACE LINE',                    category: 'Reference', symbol_desc: 'Blue — finished face/surface line' },
+      { pattern: '— (Green line)',       material: 'SHIFT LINE',                   category: 'Reference', symbol_desc: 'Green — construction shift/offset line' },
+      { pattern: '± 0.0 S.S.L.',        material: 'PROPOSED LEVEL (from S.S.L.)', category: 'Reference', symbol_desc: 'Level annotation relative to Site S.L.' },
+    ];
+
+    knownSymbols.forEach((sym, idx) => {
+      const bg = idx % 2 === 0 ? C.WHITE : C.GREY;
+      dataRow(ws, row++, [idx + 1, sym.pattern, sym.material, sym.category, sym.symbol_desc, '—', '—'], bg, 'left');
+    });
+
+    // ── Hatches actually detected in this drawing ──
+    const hatchSummary = dd.hatch_summary || [];
+    if (hatchSummary.length > 0) {
+      row++;
+      mergeRow(ws, row++, 7, 'HATCH ENTITIES DETECTED IN THIS DRAWING (AUTO-EXTRACTED)', C.TEAL, 'FFFFFFFF', 10);
+      hdrRow(ws, row++, ['SR', 'PATTERN NAME', 'MATERIAL / SPECIFICATION', 'CATEGORY', 'SYMBOL DESCRIPTION', 'COUNT', 'LAYERS'], C.MIDBLUE);
+
+      hatchSummary.forEach((h, idx) => {
+        const bg = idx % 2 === 0 ? C.WHITE : C.GREY;
+        dataRow(ws, row++, [
+          idx + 1,
+          h.pattern_name,
+          h.material,
+          (h.category || '—').toUpperCase(),
+          h.symbol_desc || '—',
+          h.count,
+          (h.layers || []).join(', ') || '—'
+        ], bg, 'left');
+      });
+
+      // Summary counts
+      row++;
+      mergeRow(ws, row++, 7, `TOTAL UNIQUE HATCH PATTERNS DETECTED: ${hatchSummary.length}   |   TOTAL HATCH INSTANCES: ${hatchSummary.reduce((s, h) => s + h.count, 0)}`, C.LTBLUE, 'FF1F3864', 9);
+    } else {
+      row++;
+      mergeRow(ws, row++, 7, 'NO HATCH ENTITIES DETECTED — Drawing may be in DWG format (convert to DXF) or hatches are in block definitions.', C.GREY, 'FF595959', 9);
+      row++;
+      mergeRow(ws, row++, 7, 'USE THE STANDARD SYMBOLS TABLE ABOVE as reference legend for this drawing type.', C.YELLOW, 'FF1F3864', 9);
+    }
+
+    // ── PMC Note ──
+    row++;
+    mergeRow(ws, row++, 7, 'PMC NOTE: Symbols shown above follow IS/NBC conventions and standard Indian architectural CAD practice.', C.NAVY, 'FFFFFFFF', 9);
+    mergeRow(ws, row++, 7, 'Cross-reference with the drawing\'s own legend/title block (A_SECTIONS legend table) for project-specific overrides.', C.MIDBLUE, 'FFFFFFFF', 9);
+  }
+
   return wb;
 }
 
