@@ -842,18 +842,23 @@ async function send(){
   files=[];renderChips();
   hist.push({role:'user_parts',parts});
 
-  // Build messages for Gemini (exclude internal user_parts entries)
-  const geminiMsgs=hist.filter(m=>m.role==='user'||m.role==='assistant').map(m=>({
-    role:m.role==='assistant'?'model':'user',
-    parts:[{text:m.content||''}]
+  // Build messages in Claude format directly — no Gemini wrapper
+  const claudeHistory=hist.filter(m=>m.role==='user'||m.role==='assistant').map(m=>({
+    role:m.role==='assistant'?'assistant':'user',
+    content:[{type:'text',text:m.content||''}]
   }));
-  // Replace last user message with actual parts (with file data)
-  geminiMsgs[geminiMsgs.length-1]={role:'user',parts};
+  const claudeParts=parts.map(p=>{
+    if(p.text) return {type:'text',text:p.text};
+    if(p.inline_data?.mime_type==='application/pdf') return {type:'document',source:{type:'base64',media_type:'application/pdf',data:p.inline_data.data}};
+    if(p.inline_data?.mime_type?.startsWith('image/')) return {type:'image',source:{type:'base64',media_type:p.inline_data.mime_type,data:p.inline_data.data}};
+    return null;
+  }).filter(Boolean);
+  claudeHistory[claudeHistory.length-1]={role:'user',content:claudeParts};
 
   addLoad();
   try{
-    const body={system_instruction:{parts:[{text:SYS[mode]}]},contents:geminiMsgs,generationConfig:{maxOutputTokens:8192,temperature:0.1}};
-    const res=await fetch('/gemini',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body})});
+    const body={system:SYS[mode],messages:claudeHistory,max_tokens:8192};
+    const res=await fetch('/claude',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e?.error?.message||'HTTP '+res.status);}
     const data=await res.json();
 
@@ -868,11 +873,11 @@ async function send(){
         throw new Error('CLAUDE_API_KEY invalid hai. Server pe check karo.');
       throw new Error(`Claude Error ${code}: ${msg}`);
     }
-    // Case 2: No candidates at all
-    if(!data?.candidates?.length)
+    // Case 2: No content at all
+    if(!data?.content?.length)
       throw new Error('Claude ne koi response nahi diya. File format check karo — PDF 20MB se chhoti honi chahiye.');
-    // Case 3: Empty text in response
-    const aiText=data?.candidates?.[0]?.content?.parts?.[0]?.text||'';
+    // Case 3: Extract text from Claude response format
+    const aiText=data?.content?.filter(b=>b.type==='text').map(b=>b.text).join('')||'';
     if(!aiText.trim())
       throw new Error('Claude response empty aaya. PDF/image dobara upload karo ya file size check karo.');
     // ── Success ───────────────────────────────────────────────
