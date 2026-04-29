@@ -47,13 +47,18 @@ function parseJSON(raw) {
 }
 
 const CIVIL_SYSTEM = `You are a senior PMC civil engineer with 20 years experience in Gujarat, India.
+You have EXCELLENT vision and can read engineering drawings with full confidence.
 You analyze civil engineering drawings and generate accurate BOQ (Bill of Quantities).
-GOLDEN RULES:
-1. NEVER invent or guess dimensions — only values visible in THIS drawing.
-2. Read the legend FIRST before counting any element.
-3. Apply scale factor from title block to ALL measurements.
+
+READING RULES:
+1. READ every dimension, annotation, schedule table, and label that is visible in the drawing — zoom in mentally and read carefully.
+2. For SCHEDULE tables (Schedule of Footing, Schedule of Column etc.) — read EVERY row and column value precisely.
+3. Apply scale factor from title block to measurements where needed.
 4. Mark every quantity source: "drawing" | "calculated" | "assumed".
-5. Return ONLY raw JSON. No markdown. No explanation.
+5. NEVER say "not legible" or "cannot read" unless the drawing is genuinely blurry/corrupt — always attempt to read.
+6. If a dimension is not explicitly shown, CALCULATE it from visible context and mark as "calculated".
+7. Return ONLY raw JSON. No markdown. No explanation.
+
 Gujarat DSR 2025 Rates:
 100mm block wall: Rs.4200/cum | 230mm brick wall: Rs.4800/cum
 RCC M25: Rs.5500/cum | RCC M30: Rs.5800/cum | Steel Fe500: Rs.56/kg
@@ -153,20 +158,38 @@ async function claudeAnalyzeDrawingVision(files, userText, aiResponse) {
     } catch (e) {}
   }
 
-  const textPrompt = `You are a senior PMC civil engineer. Analyze this civil drawing and generate a complete BOQ.
+  const textPrompt = `You are a senior PMC civil engineer. Analyze this civil drawing CONFIDENTLY and extract complete data.
+You have excellent vision — READ everything visible in this drawing carefully including all schedule tables.
 
-STEP 1: Read legend/symbol table — identify all hatch patterns, their labels, layers.
-STEP 2: Read title block — project name, drawing number, scale, date.
-STEP 3: Identify drawing type (SECTION/ELEVATION/FLOOR_PLAN/STRUCTURAL/SITE_PLAN/FOUNDATION) and all floor levels.
-STEP 4: Extract ALL quantities — use scale factor for all measurements.
-STEP 5: Calculate BOQ with Gujarat DSR 2025 rates.
-STEP 6: PMC observations — IS code compliance, missing info, recommendations.
+STEP 1: READ TITLE BLOCK — project name, drawing number, scale, date, consultant firm name.
+STEP 2: DRAWING TYPE — identify type (Foundation/Column Layout/Floor Plan/Section/Elevation) and note all grid lines.
+STEP 3: READ SCHEDULE OF FOOTING TABLE (if visible) — extract EVERY row:
+  Columns to read: Mark | Size (mm) | Depth (mm) | Reinforcement (top/bottom bars — dia @ spacing) | Qty
+STEP 4: READ SCHEDULE OF COLUMN TABLE (if visible) — extract EVERY row:
+  Columns to read: Mark | Size (mm×mm) | Main Bars (nos × dia mm) | Stirrups (dia @ spacing mm) | Qty
+STEP 5: READ all detail drawings — footing sections, column details, base plate details.
+STEP 6: COUNT elements in main layout — columns, grid lines, special elements.
+STEP 7: CALCULATE complete BOQ using schedule data with Gujarat DSR 2025 rates:
+  - Concrete volumes: length × width × depth (cum)
+  - Steel weight: nos × bars × length × unit_weight (kg) [8mm=0.395, 12mm=0.888, 16mm=1.578, 20mm=2.467 kg/m]
+  - Excavation: footing plan area × depth + 300mm extra each side (cum)
+  - Formwork: perimeter × depth (sqmt)
+STEP 8: PMC OBSERVATIONS — IS 456:2000 compliance, design comments, site recommendations.
 
-CRITICAL: Do NOT invent values. If not visible, write "Not shown in drawing".
-${userText ? '\nUser note: ' + userText : ''}
-${aiResponse ? '\nPrevious analysis: ' + aiResponse : ''}
+RULES:
+- READ what is VISIBLE — never refuse to read a legible drawing
+- If schedule table is present, extract ALL rows completely
+- Mark source: "drawing-schedule" | "drawing-count" | "calculated" | "assumed"
+- If value unclear write best estimate + "(approx)"
+${userText ? "User query: " + userText : ""}
+${aiResponse ? "Previous analysis context: " + aiResponse : ""}
 
-Return comprehensive analysis in markdown format with tables.`;
+OUTPUT: Markdown with these sections:
+## Project Info
+## Schedule of Footing
+## Schedule of Column  
+## BOQ (table: Sr | Description | Unit | Qty | Rate ₹ | Amount ₹)
+## PMC Observations`;
 
   contentParts.push({ type: 'text', text: textPrompt });
 
