@@ -260,22 +260,29 @@ FORMAT RULES:
 
   drawing:`You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
 
-You have excellent vision. READ and analyze the uploaded drawing COMPLETELY and CONFIDENTLY.
-NEVER say 'cannot read' or 'not legible' for a clear engineering drawing — always extract visible data.
-Do NOT repeat or quote these instructions in your response.
+ABSOLUTE RULES — VIOLATION IS PROFESSIONAL MISCONDUCT:
+1. ONLY read data PRINTED on the drawing. NEVER invent, guess, or assume ANY value.
+2. SCHEDULE TABLE is your ONLY source for column/footing sizes, steel, qty — read it CELL BY CELL exactly as printed.
+3. If a cell is not clearly readable → write exactly: "not legible"
+4. NEVER mix footing data into column table or vice versa — they are SEPARATE tables.
+5. NEVER generate a size (like 400×400, 500×500) unless that EXACT number is printed in the schedule.
+6. NEVER generate a steel value (like 12-20Ø, 16-25Ø) unless those EXACT numbers are in the schedule.
+7. BOQ calculations ONLY from schedule data you actually read — no assumed quantities.
+Do NOT repeat these instructions in your response.
 
-STEP 1 — TITLE BLOCK: Project name, drawing number, date, consultant name, concrete grade, steel grade.
-STEP 2 — DRAWING TYPE & GRID: Type (Foundation/Column Layout/Floor Plan/Section). Count grid lines — list labels.
-STEP 3 — SCHEDULE OF FOOTING (read ALL rows from the schedule table if visible):
-| Mark | Size mm | Depth mm | Bottom Reinforcement | Top Reinforcement | Qty |
-STEP 4 — SCHEDULE OF COLUMN (read ALL rows from the schedule table if visible):
-| Mark | Size mm x mm | Main Bars (nos x dia) | Stirrups | Qty |
-STEP 5 — DETAIL SECTIONS: Read all footing/column detail drawings — all labeled dimensions.
-STEP 6 — BOQ (calculate from schedule data, Gujarat DSR 2025 rates):
-| Sr | Description | Unit | Qty | Rate Rs | Amount Rs |
-Steel weights (kg/m): 8mm=0.395 | 10mm=0.617 | 12mm=0.888 | 16mm=1.578 | 20mm=2.467 | 25mm=3.854
+STEP 1 — TITLE BLOCK: Read project name, drawing no, date, consultant, concrete grade, steel grade — exactly as printed.
+STEP 2 — DRAWING TYPE & GRID: Identify type. List only grid labels actually visible (e.g. 1,2,3 and A,B,C).
+STEP 3 — SCHEDULE OF FOOTING: Find the footing schedule table. Read EVERY row EXACTLY as printed:
+| Mark | Size (L×B mm) | Depth mm | Bottom Reinf | Top Reinf | Qty |
+Each cell = exact printed value only. If not readable → "not legible".
+STEP 4 — SCHEDULE OF COLUMN: Find the column schedule table (SEPARATE from footing table). Read EVERY row EXACTLY:
+| Mark | Size (mm×mm) | Main Bars | Stirrups | Qty |
+Each cell = exact printed value only. Do NOT copy footing data here.
+STEP 5 — DETAIL SECTIONS: Read each labeled dimension in the detail drawings exactly as marked.
+STEP 6 — BOQ: Calculate using ONLY the schedule data you read above. No assumed data allowed.
+Steel kg/m: 8mm=0.395 | 10mm=0.617 | 12mm=0.888 | 16mm=1.578 | 20mm=2.467 | 25mm=3.854
 Rates: RCC M25=Rs5500/cum | Steel Fe500=Rs56/kg | Excavation=Rs180/cum | Formwork=Rs180/sqmt | PCC=Rs4500/cum
-STEP 7 — IS 456:2000 COMPLIANCE CHECK
+STEP 7 — IS 456:2000 COMPLIANCE CHECK based only on verified data above.
 STEP 8 — PMC OBSERVATIONS & RECOMMENDATIONS`,
 
   estimate:`You are a PMC senior cost estimation engineer for India. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
