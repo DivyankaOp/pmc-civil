@@ -15,7 +15,7 @@ async function callClaudeAPI({ system, messages, maxTokens = 8192, thinking = fa
   if (!key) throw new Error('CLAUDE_API_KEY not set');
 
   const body = {
-    model: 'claude-sonnet-4-5',
+    model: 'claude-sonnet-4-5-20251001',
     max_tokens: thinking ? Math.max(maxTokens, thinkingBudget + 4000) : maxTokens,
     system,
     messages,
