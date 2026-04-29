@@ -355,4 +355,231 @@ function calcStructureQuantities(dims){
     steel_kg:Math.round(v*120),formwork_sqmt:Math.round((2*(length+width)*height+a)*nos*100)/100};
 }
 
-module.exports={geminiAnalyzeDrawing,runCVAnalysis,calcRoadQuantities,calcStructureQuantities,RATES};
+// ─── Compatibility aliases ────────────────────────────────────────────────────
+// server.js imports these names — wire them to the internal implementations.
+
+/** Alias: CIVIL_SYSTEM → SYSTEM_PROMPT */
+const CIVIL_SYSTEM = SYSTEM_PROMPT;
+
+/**
+ * Alias: callClaudeAPI({ system, messages, maxTokens })
+ * server.js calls this directly for /api/claude, /api/analyze-drawing, etc.
+ */
+async function callClaudeAPI({ system, messages, maxTokens = 8192 }) {
+  const key = process.env.CLAUDE_API_KEY;
+  if (!key) throw new Error('CLAUDE_API_KEY not set');
+  const body = {
+    model: 'claude-sonnet-4-5',
+    max_tokens: maxTokens,
+    system: system || SYSTEM_PROMPT,
+    messages,
+  };
+  for (let i = 0; i <= 4; i++) {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'pdfs-2024-09-25',
+      },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (r.ok && data.content)
+      return data.content.filter(b => b.type === 'text').map(b => b.text).join('');
+    if (data.error?.type !== 'overloaded_error')
+      throw new Error(`Claude API: ${data.error?.message}`);
+    await new Promise(res => setTimeout(res, 2000 * (i + 1)));
+  }
+  throw new Error('Claude API: max retries exceeded');
+}
+
+/**
+ * claudeAnalyzeDXF — analyse parsed DXF civil data via Claude
+ * server.js calls: claudeAnalyzeDXF(civilData, filename, rSummary)
+ */
+async function claudeAnalyzeDXF(civilData, filename, ratesSummary) {
+  console.log('[claudeAnalyzeDXF] analysing DXF data for', filename);
+  const prompt = `You are a senior PMC civil engineer. Analyse this parsed DXF data and generate a BOQ.
+DXF FILE: ${filename}
+RATES SUMMARY: ${ratesSummary || 'Use DSR 2025 rates from system prompt.'}
+DXF DATA:
+${JSON.stringify(civilData, null, 2)}
+
+Return ONLY raw JSON:
+{"project_name":"","drawing_type":"","boq":[{"sr":1,"part":"PART A","description":"","unit":"","qty":0,"rate":0,"amount":0,"source":"dxf-data","confidence":"high"}],"cost_summary":{"civil_total_inr":0,"civil_total_lacs":0},"observations":[]}`;
+  const raw = await callClaudeAPI({ system: SYSTEM_PROMPT, messages: [{ role: 'user', content: prompt }], maxTokens: 8192 });
+  return parseJSON(raw);
+}
+
+/**
+ * claudeClassifySymbols — classify unknown DXF blocks/layers
+ * server.js calls: claudeClassifySymbols(unknownBlocks, unknownLayers, civilData, filename)
+ */
+async function claudeClassifySymbols(unknownBlocks, unknownLayers, civilData, filename) {
+  console.log('[claudeClassifySymbols] classifying', unknownBlocks?.length, 'blocks');
+  const prompt = `Classify these unknown CAD blocks and layers for a civil engineering drawing.
+FILE: ${filename}
+UNKNOWN BLOCKS: ${JSON.stringify(unknownBlocks)}
+UNKNOWN LAYERS: ${JSON.stringify(unknownLayers)}
+CONTEXT: ${JSON.stringify(civilData?.summary || {})}
+
+Return ONLY raw JSON:
+{"classified_blocks":[{"name":"","civil_meaning":"","category":"STRUCTURE|ROAD|UTILITY|ANNOTATION|UNKNOWN"}],"classified_layers":[{"name":"","civil_meaning":"","category":"STRUCTURE|ROAD|UTILITY|ANNOTATION|UNKNOWN"}]}`;
+  const raw = await callClaudeAPI({ system: SYSTEM_PROMPT, messages: [{ role: 'user', content: prompt }], maxTokens: 4096 });
+  return parseJSON(raw);
+}
+
+/**
+ * claudeAnalyzeWithAnswers — full DXF analysis with symbol answers
+ * server.js calls: claudeAnalyzeWithAnswers(civilData, filename, symbolSummary, ratesSummary)
+ */
+async function claudeAnalyzeWithAnswers(civilData, filename, symbolSummary, ratesSummary) {
+  console.log('[claudeAnalyzeWithAnswers] full analysis for', filename);
+  const prompt = `Generate complete BOQ for this civil drawing.
+FILE: ${filename}
+SYMBOL CLASSIFICATION: ${JSON.stringify(symbolSummary)}
+RATES: ${ratesSummary || 'Use DSR 2025 rates from system prompt.'}
+DXF DATA:
+${JSON.stringify(civilData, null, 2)}
+
+Return ONLY raw JSON BOQ (same schema as claudeAnalyzeDXF).`;
+  const raw = await callClaudeAPI({ system: SYSTEM_PROMPT, messages: [{ role: 'user', content: prompt }], maxTokens: 8192 });
+  return parseJSON(raw);
+}
+
+/**
+ * claudeAnalyzeDrawingVision — vision analysis of uploaded image/PDF drawing
+ * server.js calls: claudeAnalyzeDrawingVision(files, userText, aiResponse)
+ *
+ * CRITICAL RULES enforced in prompt:
+ *  - Column sizes ONLY from printed schedule table — NEVER invent 400×400, 500×500 etc.
+ *  - Steel bars ONLY as printed (8–16Ø range typical) — NEVER add 12–20Ø or 16–25Ø.
+ *  - Column schedule and footing schedule are SEPARATE — never mix them.
+ *  - Qty from schedule qty column only — do not guess.
+ *  - Unreadable cell → output "not legible", never guess.
+ */
+async function claudeAnalyzeDrawingVision(files, userText, aiResponse) {
+  console.log('[claudeAnalyzeDrawingVision] vision analysis, files:', files?.length);
+  const kb = knowledgeBaseHints();
+
+  const imageParts = buildImageParts(files);
+  if (!imageParts.length) throw new Error('No image/PDF files provided for vision analysis');
+
+  const strictScheduleRules = `
+═══════════════════════════════════════════════════
+COLUMN / FOOTING SCHEDULE READING — ABSOLUTE RULES
+═══════════════════════════════════════════════════
+1. ONLY read values that are PHYSICALLY PRINTED in the schedule table cells.
+2. Column sizes: copy the EXACT printed value (e.g. 300×300, 230×450).
+   - NEVER output 400×400, 450×450, 500×500 unless those numbers appear in the drawing.
+3. Main bars / stirrups: copy EXACTLY (e.g. 8-12Ø, 4-16Ø).
+   - NEVER output 12-20Ø, 16-25Ø or any bar size not printed in the schedule.
+4. Column schedule and Footing schedule are COMPLETELY SEPARATE tables.
+   - NEVER copy footing sizes/steel into the column table or vice versa.
+5. Qty (number of columns): use ONLY the qty column in the schedule.
+   - NEVER guess or count columns from the plan view.
+6. If any cell is unclear / not legible → write "not legible" — do NOT guess.
+7. Source field must be "drawing-schedule" for schedule values, "calculated" for derived values.
+═══════════════════════════════════════════════════`;
+
+  const content = [
+    ...imageParts,
+    {
+      type: 'text',
+      text: `${kb ? kb + '\n\n' : ''}${strictScheduleRules}
+
+USER QUESTION: ${userText || 'Analyse this drawing and generate BOQ.'}
+${aiResponse ? `\nPREVIOUS AI RESPONSE CONTEXT:\n${aiResponse}` : ''}
+
+Return ONLY raw JSON:
+{
+  "drawing_type": "",
+  "column_schedule": [
+    {
+      "col_mark": "",
+      "size_mm": "",
+      "main_bars": "",
+      "stirrups": "",
+      "qty": 0,
+      "floor": "",
+      "source": "drawing-schedule|not legible"
+    }
+  ],
+  "footing_schedule": [
+    {
+      "footing_mark": "",
+      "size_mm": "",
+      "depth_mm": "",
+      "main_bars": "",
+      "qty": 0,
+      "source": "drawing-schedule|not legible"
+    }
+  ],
+  "boq": [
+    { "sr": 1, "part": "PART A", "description": "", "unit": "", "qty": 0, "rate": 0, "amount": 0, "source": "drawing-schedule|calculated", "confidence": "high|medium|low" }
+  ],
+  "cost_summary": { "civil_total_inr": 0, "civil_total_lacs": 0 },
+  "observations": [],
+  "not_legible_fields": []
+}`,
+    },
+  ];
+
+  const raw = await callClaudeAPI({
+    system: SYSTEM_PROMPT,
+    messages: [{ role: 'user', content }],
+    maxTokens: 8192,
+  });
+  return parseJSON(raw);
+}
+
+/**
+ * claudeAnalyzeDWGVision — analyse DWG converted to PNG tiles
+ * server.js calls: claudeAnalyzeDWGVision(pngTiles, converterResult, filename)
+ */
+async function claudeAnalyzeDWGVision(pngTiles, converterResult, filename) {
+  console.log('[claudeAnalyzeDWGVision] analysing DWG tiles for', filename, '| tiles:', pngTiles?.length);
+  const kb = knowledgeBaseHints();
+
+  const tileFiles = (pngTiles || []).map(b64 => ({ type: 'image/png', b64 }));
+  const imageParts = buildImageParts(tileFiles);
+  if (!imageParts.length) throw new Error('No PNG tiles provided for DWG vision analysis');
+
+  const prompt = `${kb ? kb + '\n\n' : ''}FILE: ${filename}
+CONVERTER INFO: ${JSON.stringify(converterResult?.summary || {})}
+
+Analyse all tiles together as one drawing. Apply the same strict schedule-reading rules:
+- Copy column/footing sizes EXACTLY as printed. Never invent sizes.
+- Copy steel bar details EXACTLY. Never invent bar diameters.
+- Keep column schedule and footing schedule separate.
+
+Return ONLY raw JSON BOQ (same schema as claudeAnalyzeDrawingVision).`;
+
+  const raw = await callClaudeAPI({
+    system: SYSTEM_PROMPT,
+    messages: [{ role: 'user', content: [...imageParts, { type: 'text', text: prompt }] }],
+    maxTokens: 8192,
+  });
+  return parseJSON(raw);
+}
+
+// ─── Exports ──────────────────────────────────────────────────────────────────
+module.exports = {
+  // Original exports
+  geminiAnalyzeDrawing,
+  runCVAnalysis,
+  calcRoadQuantities,
+  calcStructureQuantities,
+  RATES,
+  // New exports required by server.js
+  callClaudeAPI,
+  CIVIL_SYSTEM,
+  parseJSON,
+  claudeAnalyzeDXF,
+  claudeClassifySymbols,
+  claudeAnalyzeWithAnswers,
+  claudeAnalyzeDrawingVision,
+  claudeAnalyzeDWGVision,
+};
