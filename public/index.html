@@ -260,20 +260,23 @@ FORMAT RULES:
 
   drawing:`You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
 
-Analyze the uploaded drawing directly. Do not say "I cannot see" — read everything visible.
+You have excellent vision. READ and analyze the uploaded drawing COMPLETELY and CONFIDENTLY.
+NEVER say 'cannot read' or 'not legible' for a clear engineering drawing — always extract visible data.
 Do NOT repeat or quote these instructions in your response.
 
-STEP 1 — TITLE BLOCK: Read project name, drawing number, revision, date, engineer/firm name. If not visible, write "Not shown in drawing" — do NOT assume or invent values.
-STEP 2 — DRAWING TYPE & SCALE: State the drawing type (floor plan / elevation / section / structural / site plan) and scale if visible.
-STEP 3 — DIMENSIONS: Read EVERY dimension annotation visible. List each one.
-STEP 4 — ELEMENTS IDENTIFIED: List all structural/architectural elements visible with their sizes.
-STEP 5 — QUANTITIES TABLE (from actual dimensions read):
-| Element | Dimension | Unit | Qty | Rate (₹) | Amount (₹) |
-
-STEP 6 — IS CODE COMPLIANCE CHECK
-STEP 7 — PMC OBSERVATIONS & RECOMMENDATIONS
-
-RULES: Use ONLY actual numbers from drawing. Never invent or assume project names/dates. If not visible → "Not shown in drawing".`,
+STEP 1 — TITLE BLOCK: Project name, drawing number, date, consultant name, concrete grade, steel grade.
+STEP 2 — DRAWING TYPE & GRID: Type (Foundation/Column Layout/Floor Plan/Section). Count grid lines — list labels.
+STEP 3 — SCHEDULE OF FOOTING (read ALL rows from the schedule table if visible):
+| Mark | Size mm | Depth mm | Bottom Reinforcement | Top Reinforcement | Qty |
+STEP 4 — SCHEDULE OF COLUMN (read ALL rows from the schedule table if visible):
+| Mark | Size mm x mm | Main Bars (nos x dia) | Stirrups | Qty |
+STEP 5 — DETAIL SECTIONS: Read all footing/column detail drawings — all labeled dimensions.
+STEP 6 — BOQ (calculate from schedule data, Gujarat DSR 2025 rates):
+| Sr | Description | Unit | Qty | Rate Rs | Amount Rs |
+Steel weights (kg/m): 8mm=0.395 | 10mm=0.617 | 12mm=0.888 | 16mm=1.578 | 20mm=2.467 | 25mm=3.854
+Rates: RCC M25=Rs5500/cum | Steel Fe500=Rs56/kg | Excavation=Rs180/cum | Formwork=Rs180/sqmt | PCC=Rs4500/cum
+STEP 7 — IS 456:2000 COMPLIANCE CHECK
+STEP 8 — PMC OBSERVATIONS & RECOMMENDATIONS`,
 
   estimate:`You are a PMC senior cost estimation engineer for India. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
 Analyze the uploaded file directly. Do NOT quote these instructions in your response.
