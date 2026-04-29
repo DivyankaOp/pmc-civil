@@ -138,6 +138,13 @@ textarea.tin::placeholder{color:var(--tx3)}
 .hint kbd{background:var(--sur);border:1px solid var(--bor);border-radius:3px;padding:1px 4px;font-size:9px}
 #fi{display:none}
 @media(max-width:768px){.sb{display:none}.qgrid{grid-template-columns:repeat(2,1fr)}.chat{padding:12px 14px}.iarea{padding:10px 14px 13px}.topbar{padding:0 14px}}
+
+.json-section{margin:8px 0;padding:8px 10px;background:#f8faff;border-left:3px solid #3B7BF6;border-radius:0 6px 6px 0;}
+.json-head{font-size:12px;font-weight:600;color:#1a3a6b;margin:4px 0 6px;text-transform:uppercase;letter-spacing:.5px;}
+.json-kv{display:flex;gap:6px;padding:2px 0;font-size:12px;border-bottom:1px solid #eef1f8;flex-wrap:wrap;}
+.json-key{font-weight:600;color:#374151;min-width:120px;flex-shrink:0;}
+.json-val{color:#1d4ed8;word-break:break-word;}
+.code-block{background:#1e293b;color:#e2e8f0;padding:10px 14px;border-radius:8px;font-size:11px;overflow-x:auto;white-space:pre-wrap;margin:6px 0;}
 </style>
 </head>
 <body>
@@ -617,7 +624,73 @@ function addLoad(){hw();const chat=document.getElementById('chat');const row=doc
 function rmLoad(){const r=document.getElementById('lr');if(r)r.remove();}
 
 // ── MARKDOWN ──────────────────────────────────────────────
-function mdt(t){return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>').replace(/^### (.+)$/gm,'<h3>$1</h3>').replace(/^## (.+)$/gm,'<h2>$1</h2>').replace(/^# (.+)$/gm,'<h2>$1</h2>').replace(/^---+$/gm,'<hr>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/^\|(.+)\|$/gm,(_,row)=>{const cells=row.split('|').map(c=>c.trim());if(cells.every(c=>/^[-:]+$/.test(c)))return'';return'<tr>'+cells.map(c=>`<td>${c}</td>`).join('')+'</tr>';}).replace(/(<tr>[\s\S]*?<\/tr>\n?)+/g,m=>{const rows=m.match(/<tr>[\s\S]*?<\/tr>/g)||[];if(!rows.length)return m;const[first,...rest]=rows;const h=first.replace(/<td>/g,'<th>').replace(/<\/td>/g,'</th>');return`<table><thead>${h}</thead><tbody>${rest.join('')}</tbody></table>`;}).replace(/^[-*] (.+)$/gm,'<li>$1</li>').replace(/(<li>[\s\S]*?<\/li>\n?)+/g,m=>`<ul>${m}</ul>`).replace(/\n{2,}/g,'<br><br>').replace(/\n/g,'<br>');}
+function mdt(t){
+  // Step 1: Convert raw JSON blocks (```json ... ```) into human-readable HTML tables
+  t = t.replace(/```json([\s\S]*?)```/gi, function(_, raw) {
+    try {
+      const obj = JSON.parse(raw.trim());
+      return jsonToHtml(obj);
+    } catch(e) {
+      return '<pre class="code-block">' + raw.trim().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>';
+    }
+  });
+  // Step 2: Other code blocks
+  t = t.replace(/```[\w]*([\s\S]*?)```/g, function(_, code) {
+    return '<pre class="code-block">' + code.trim().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>';
+  });
+  // Step 3: Standard markdown
+  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>')
+    .replace(/^### (.+)$/gm,'<h3>$1</h3>')
+    .replace(/^## (.+)$/gm,'<h2>$1</h2>')
+    .replace(/^# (.+)$/gm,'<h2>$1</h2>')
+    .replace(/^---+$/gm,'<hr>')
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/^\|(.+)\|$/gm,(_,row)=>{const cells=row.split('|').map(c=>c.trim());if(cells.every(c=>/^[-:]+$/.test(c)))return'';return'<tr>'+cells.map(c=>'<td>'+c+'</td>').join('')+'</tr>';})
+    .replace(/(<tr>[\s\S]*?<\/tr>
+?)+/g,m=>{const rows=m.match(/<tr>[\s\S]*?<\/tr>/g)||[];if(!rows.length)return m;const[first,...rest]=rows;const h=first.replace(/<td>/g,'<th>').replace(/<\/td>/g,'</th>');return'<table><thead>'+h+'</thead><tbody>'+rest.join('')+'</tbody></table>';})
+    .replace(/^[-*] (.+)$/gm,'<li>$1</li>')
+    .replace(/(<li>[\s\S]*?<\/li>
+?)+/g,m=>'<ul>'+m+'</ul>')
+    .replace(/
+{2,}/g,'<br><br>')
+    .replace(/
+/g,'<br>');
+}
+
+function jsonToHtml(obj, depth) {
+  depth = depth || 0;
+  if (Array.isArray(obj)) {
+    if (!obj.length) return '<em>(empty)</em>';
+    // Check if array of objects (like BOQ items) → render as table
+    if (typeof obj[0] === 'object' && obj[0] !== null) {
+      const keys = Object.keys(obj[0]);
+      let html = '<div class="json-section"><table><thead><tr>' + keys.map(k=>'<th>'+k+'</th>').join('') + '</tr></thead><tbody>';
+      for (const row of obj) {
+        html += '<tr>' + keys.map(k=>'<td>'+(row[k]!==undefined?String(row[k]):'')+'</td>').join('') + '</tr>';
+      }
+      return html + '</tbody></table></div>';
+    }
+    return '<ul>' + obj.map(v=>'<li>'+jsonToHtml(v, depth+1)+'</li>').join('') + '</ul>';
+  }
+  if (typeof obj === 'object' && obj !== null) {
+    let html = depth===0 ? '' : '';
+    for (const [key, val] of Object.entries(obj)) {
+      const label = key.replace(/_/g,' ').replace(/\w/g,c=>c.toUpperCase());
+      if (Array.isArray(val) && val.length && typeof val[0]==='object') {
+        html += '<div class="json-section"><h3 class="json-head">'+label+'</h3>'+jsonToHtml(val, depth+1)+'</div>';
+      } else if (typeof val === 'object' && val !== null && !Array.isArray(val)) {
+        html += '<div class="json-section"><h3 class="json-head">'+label+'</h3>'+jsonToHtml(val, depth+1)+'</div>';
+      } else if (Array.isArray(val)) {
+        html += '<div class="json-kv"><span class="json-key">'+label+':</span> <span class="json-val">'+(val.join(', ') || '—')+'</span></div>';
+      } else {
+        html += '<div class="json-kv"><span class="json-key">'+label+':</span> <span class="json-val">'+(val!==null&&val!==undefined?String(val):'—')+'</span></div>';
+      }
+    }
+    return html;
+  }
+  return String(obj);
+}
 
 // ── SEND ───────────────────────────────────────────────────
 async function send(){
