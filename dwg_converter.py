@@ -1,39 +1,34 @@
 #!/usr/bin/env python3
 """
-PMC Civil — DWG/DXF Converter (v4)
-Strategy (in order, first that works wins for PNG):
-  1. DXF -> PNG via ezdxf + matplotlib  (no external binary required)
-  2. DXF/DWG -> PNG via LibreOffice --headless  (if installed)
-  3. DWG -> DXF via ezdxf.addons.odafc   (if ODA File Converter installed)
-  4. [NEW] DWG AC1032 -> text extraction from binary (no converter needed)
-     Extracts UTF-16LE strings + ASCII strings → sends to Gemini as text context
+PMC Civil — DWG/DXF Converter (v5 — ZWCAD + Multi-Sheet)
+Strategy (first-that-works wins for PNG):
+  1. DXF -> PNG via ezdxf + matplotlib (ALL layouts/sheets)
+  2. DXF/DWG -> PNG via LibreOffice --headless
+  3. DWG binary text extraction (ZWCAD AC1032 fallback — text-only mode)
 
-Usage: python3 dwg_converter.py <input_file> <output_png> [dpi] [tiled]
+New in v5:
+  - Multi-sheet: renders all paperspace layouts, not just modelspace
+  - XREF expansion: text inside INSERT blocks is extracted too
+  - ZWCAD text-only mode: rich text context when PNG render fails
+  - Sheet names + XREF references returned for Claude context
 """
 import sys, json, os, traceback, subprocess, tempfile, shutil, re, struct
 
-# ── NEW: Binary DWG text extractor (works on AC1027, AC1032, any version) ──
 def extract_text_from_dwg_binary(dwg_path):
-    """
-    Extract readable text directly from DWG binary.
-    Works on ALL DWG versions including AC1032 (R2018) without ODA.
-    Extracts ASCII + UTF-16LE strings — catches annotations, layer names,
-    dimension text, notes, schedule tables, column IDs, everything.
-    """
+    """Extract ALL readable strings from DWG binary — ZWCAD + AutoCAD compatible."""
     try:
         with open(dwg_path, "rb") as f:
             data = f.read()
     except Exception as e:
-        return {"texts": [], "layers": [], "error": str(e)}
+        return {"texts": [], "layers": [], "dims": [], "sheets": [], "xrefs": [], "error": str(e)}
 
     version = data[:6].decode("ascii", errors="replace")
-    results = {"version": version, "texts": [], "layers": [], "dims": []}
+    results = {"version": version, "texts": [], "layers": [], "dims": [], "sheets": [], "xrefs": []}
 
-    # ── Pass 1: UTF-16LE strings (AutoCAD R2013+ stores text as UTF-16LE) ──
+    # UTF-16LE strings (ZWCAD/AutoCAD R2013+ encoding)
     utf16_strings = []
     i = 0
     while i < len(data) - 3:
-        # Detect UTF-16LE pattern: ASCII char followed by null byte
         if 32 <= data[i] <= 126 and data[i + 1] == 0:
             j = i
             chars = []
@@ -48,7 +43,7 @@ def extract_text_from_dwg_binary(dwg_path):
         else:
             i += 1
 
-    # ── Pass 2: ASCII strings (older style, layer names, file metadata) ──
+    # ASCII strings
     ascii_strings = []
     i = 0
     current = []
@@ -64,70 +59,71 @@ def extract_text_from_dwg_binary(dwg_path):
             current = []
         i += 1
 
-    # ── Filter: keep only engineering-relevant strings ──
-    all_strings = list(dict.fromkeys(utf16_strings + ascii_strings))  # deduplicate, preserve order
+    all_strings = list(dict.fromkeys(utf16_strings + ascii_strings))
 
-    # Layer names: usually short, uppercase, no spaces
-    layer_patterns = re.compile(
-        r'^[A-Z0-9_\-\.]{2,30}$'
-    )
-    # Engineering text patterns
-    eng_patterns = re.compile(
+    layer_pat = re.compile(r'^[A-Z0-9_\-\.]{2,30}$')
+    eng_pat = re.compile(
         r'(FOOTING|COLUMN|COL|BEAM|SLAB|RCC|GRID|LEVEL|FLOOR|WALL|'
         r'SECTION|DETAIL|PLAN|ELEVATION|SCHEDULE|REINFORCEMENT|'
-        r'STIRRUP|MAIN BAR|TIE|LINK|DIA|THK|WIDTH|DEPTH|HEIGHT|'
+        r'STIRRUP|MAIN.?BAR|TIE|LINK|DIA|THK|WIDTH|DEPTH|HEIGHT|'
         r'FOUNDATION|PILE|RAFT|GRADE|M\d0|Fe\d{3}|'
         r'NOTES?|SPEC|DESCRIPTION|DRAWING|TITLE|PROJECT|'
-        r'ITALVA|BHARUCH|SURAT|PMC|'  # project-specific
-        r'\d+[xX]\d+|\d+mm|\d+\.\d+m)',
+        r'ROAD|GSB|WMM|PQC|KERB|DRAIN|CULVERT|BRIDGE|'
+        r'PLINTH|LINTEL|PARAPET|STAIRCASE|LIFT|RAMP|'
+        r'\d+[xX]\d+|\d+mm|\d+\.\d+m|\d+ MM)',
         re.IGNORECASE
     )
-    # Dimension values: numbers with units
-    dim_patterns = re.compile(r'^\d+(\.\d+)?$|^\d+[xX]\d+$')
+    dim_pat = re.compile(r'^\d+(\.\d+)?$|^\d+[xX]\d+$')
+    sheet_pat = re.compile(
+        r'^(Layout\s*\d+|Sheet[\-\s]*\d+|Model|Plan[\-\s]*\d+|Drawing[\-\s]*\d+|'
+        r'GF|FF|SF|TF|RF|Basement|Ground\s*Floor|First\s*Floor|Site\s*Plan|'
+        r'[A-Z]{1,3}-\d{1,4})$',
+        re.IGNORECASE
+    )
 
     for s in all_strings:
         s = s.strip()
         if not s or len(s) < 2:
             continue
-        # Skip obvious binary noise
         if re.search(r'[^\x20-\x7E]', s):
             continue
-        # Skip file paths, GUIDs, base64-like noise
-        if re.search(r'[\\\/].*[\\\/]|[A-F0-9]{8}-[A-F0-9]{4}', s):
+        if re.search(r'[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}', s):
             continue
-
-        if eng_patterns.search(s):
+        if re.search(r'\\.*\.(dwg|dxf)', s, re.IGNORECASE):
+            results["xrefs"].append(s.split("\\")[-1])
+            continue
+        if sheet_pat.match(s):
+            results["sheets"].append(s)
+        elif eng_pat.search(s):
             results["texts"].append({"text": s, "source": "binary_extract"})
-        elif layer_patterns.match(s) and len(s) >= 3:
+        elif layer_pat.match(s) and len(s) >= 3:
             results["layers"].append(s)
-        elif dim_patterns.match(s):
+        elif dim_pat.match(s):
             results["dims"].append(s)
 
-    # Also extract ALL utf16 strings that are >= 3 chars and look readable
-    # (catches column IDs like "C1", "F1", text that didn't match above)
     for s in utf16_strings:
         s = s.strip()
         if len(s) >= 2 and not any(t["text"] == s for t in results["texts"]):
-            # Include anything that looks like it could be a label
             if re.match(r'^[A-Z][0-9A-Z\-_\.]+$', s) and len(s) <= 20:
                 results["texts"].append({"text": s, "source": "utf16_label"})
 
-    # Deduplicate texts
     seen = set()
     unique_texts = []
     for t in results["texts"]:
         if t["text"] not in seen:
             seen.add(t["text"])
             unique_texts.append(t)
-    results["texts"] = unique_texts[:300]
-    results["layers"] = list(dict.fromkeys(results["layers"]))[:100]
-    results["dims"] = list(dict.fromkeys(results["dims"]))[:100]
 
+    results["texts"] = unique_texts[:400]
+    results["layers"] = list(dict.fromkeys(results["layers"]))[:120]
+    results["dims"] = list(dict.fromkeys(results["dims"]))[:120]
+    results["sheets"] = list(dict.fromkeys(results["sheets"]))[:50]
+    results["xrefs"] = list(dict.fromkeys(results["xrefs"]))[:20]
     return results
 
 
 def render_dxf_to_png(dxf_path, png_path, dpi=120, tiled=False):
-    """Pure-python DXF -> PNG using ezdxf + matplotlib. No external binary."""
+    """Render DXF → PNG (modelspace + ALL paperspace layouts = multi-sheet support)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -139,48 +135,77 @@ def render_dxf_to_png(dxf_path, png_path, dpi=120, tiled=False):
     try:
         doc, _ = recover.readfile(dxf_path)
     except Exception:
-        doc = ezdxf.readfile(dxf_path)
-    msp = doc.modelspace()
+        try:
+            doc = ezdxf.readfile(dxf_path)
+        except Exception as e:
+            return False, [], []
 
-    fig = plt.figure(figsize=(16, 12), dpi=dpi)
-    ax = fig.add_axes([0, 0, 1, 1])
-    ctx = RenderContext(doc)
-    out = MatplotlibBackend(ax)
-    Frontend(ctx, out).draw_layout(msp, finalize=True)
-    fig.savefig(png_path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
+    layout_images = []
 
-    if not tiled:
-        return os.path.exists(png_path) and os.path.getsize(png_path) > 0, []
+    def render_one(layout, out_path):
+        try:
+            fig = plt.figure(figsize=(16, 12), dpi=dpi)
+            ax = fig.add_axes([0, 0, 1, 1])
+            ctx = RenderContext(doc)
+            out = MatplotlibBackend(ax)
+            Frontend(ctx, out).draw_layout(layout, finalize=True)
+            fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+            plt.close(fig)
+            return os.path.exists(out_path) and os.path.getsize(out_path) > 5000
+        except Exception:
+            plt.close('all')
+            return False
 
-    # Generate tiles for detail mode
+    # Modelspace
+    render_one(doc.modelspace(), png_path)
+    if os.path.exists(png_path) and os.path.getsize(png_path) > 5000:
+        layout_images.append({"name": "ModelSpace", "path": png_path})
+
+    # All paperspace layouts (multi-sheet)
+    base_dir = os.path.dirname(png_path) or tempfile.gettempdir()
+    base_name = os.path.splitext(os.path.basename(png_path))[0]
+    for layout in doc.layouts:
+        if layout.name.upper() == "MODEL":
+            continue
+        sheet_png = os.path.join(base_dir, f"{base_name}_sheet_{re.sub(r'[^A-Za-z0-9]','_',layout.name)}.png")
+        if render_one(layout, sheet_png):
+            layout_images.append({"name": layout.name, "path": sheet_png})
+
+    # If model failed but sheets worked, copy first sheet as main
+    if not (os.path.exists(png_path) and os.path.getsize(png_path) > 5000) and layout_images:
+        shutil.copy(layout_images[0]["path"], png_path)
+
+    main_ok = os.path.exists(png_path) and os.path.getsize(png_path) > 5000
+
+    # Tiles from main PNG
     tiles = []
-    try:
-        from PIL import Image
-        img = Image.open(png_path)
-        W, H = img.size
-        for row in range(2):
-            for col in range(2):
-                x1, y1 = col * W // 2, row * H // 2
-                x2, y2 = (col + 1) * W // 2, (row + 1) * H // 2
-                tile = img.crop((x1, y1, x2, y2))
-                tile_path = png_path.replace(".png", f"_tile_{row}{col}.png")
-                tile.save(tile_path)
-                tiles.append({"path": tile_path, "row": row, "col": col,
-                              "position": f"{'Top' if row==0 else 'Bottom'}-{'Left' if col==0 else 'Right'}"})
-    except Exception as e:
-        pass
+    if tiled and main_ok:
+        try:
+            from PIL import Image
+            img = Image.open(png_path)
+            W, H = img.size
+            for row in range(2):
+                for col in range(2):
+                    x1, y1 = col * W // 2, row * H // 2
+                    x2, y2 = (col+1) * W // 2, (row+1) * H // 2
+                    tile = img.crop((x1, y1, x2, y2))
+                    tp = png_path.replace(".png", f"_tile_{row}{col}.png")
+                    tile.save(tp)
+                    tiles.append({"path": tp, "row": row, "col": col,
+                                  "position": f"{'Top' if row==0 else 'Bottom'}-{'Left' if col==0 else 'Right'}"})
+        except Exception:
+            pass
 
-    return os.path.exists(png_path) and os.path.getsize(png_path) > 0, tiles
+    return main_ok, tiles, layout_images
 
 
 def libreoffice_to_png(input_path, output_png):
     out_dir = os.path.dirname(output_png) or tempfile.gettempdir()
     base = os.path.splitext(os.path.basename(input_path))[0]
     lo_png = os.path.join(out_dir, base + ".png")
-    cmd = ["libreoffice", "--headless", "--convert-to", "png",
-           "--outdir", out_dir, input_path]
-    subprocess.run(cmd, capture_output=True, text=True, timeout=160)
+    subprocess.run(["libreoffice", "--headless", "--convert-to", "png",
+                    "--outdir", out_dir, input_path],
+                   capture_output=True, text=True, timeout=160)
     if os.path.exists(lo_png):
         if lo_png != output_png:
             shutil.move(lo_png, output_png)
@@ -189,7 +214,6 @@ def libreoffice_to_png(input_path, output_png):
 
 
 def dwg_to_dxf_via_oda(dwg_path):
-    """Use ODA File Converter through ezdxf.addons.odafc. Needs ODA installed."""
     try:
         from ezdxf.addons import odafc
         out_dxf = os.path.join(tempfile.gettempdir(),
@@ -203,7 +227,6 @@ def dwg_to_dxf_via_oda(dwg_path):
 def extract_ezdxf_meta(dxf_path):
     import ezdxf
     from ezdxf import recover
-
     try:
         doc, _ = recover.readfile(dxf_path)
     except Exception:
@@ -211,24 +234,42 @@ def extract_ezdxf_meta(dxf_path):
 
     msp = doc.modelspace()
     layers = [l.dxf.name for l in doc.layers if l.dxf.name != "0"]
+    sheet_names = [layout.name for layout in doc.layouts if layout.name.upper() != "MODEL"]
 
     texts = []
-    for e in msp:
-        try:
-            if e.dxftype() in ("TEXT", "ATTDEF", "ATTRIB"):
-                t = e.dxf.text.strip()
-                if t:
-                    texts.append({"text": t, "layer": e.dxf.layer,
-                                  "x": round(e.dxf.insert.x, 3),
-                                  "y": round(e.dxf.insert.y, 3)})
-            elif e.dxftype() == "MTEXT":
-                t = e.plain_mtext().strip()
-                if t:
-                    texts.append({"text": t, "layer": e.dxf.layer,
-                                  "x": round(e.dxf.insert.x, 3),
-                                  "y": round(e.dxf.insert.y, 3)})
-        except Exception:
-            pass
+    visited_blocks = set()
+
+    def collect_texts(entities):
+        for e in entities:
+            try:
+                if e.dxftype() in ("TEXT", "ATTDEF", "ATTRIB"):
+                    t = e.dxf.text.strip()
+                    if t:
+                        pos = e.dxf.insert
+                        texts.append({"text": t, "layer": e.dxf.layer,
+                                      "x": round(pos.x, 3), "y": round(pos.y, 3)})
+                elif e.dxftype() == "MTEXT":
+                    t = e.plain_mtext().strip()
+                    if t:
+                        pos = e.dxf.insert
+                        texts.append({"text": t, "layer": e.dxf.layer,
+                                      "x": round(pos.x, 3), "y": round(pos.y, 3)})
+                elif e.dxftype() == "INSERT":
+                    bname = e.dxf.name
+                    if bname not in visited_blocks:
+                        visited_blocks.add(bname)
+                        try:
+                            collect_texts(doc.blocks[bname])
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    collect_texts(msp)
+    # Collect from all paper-space layouts (multi-sheet)
+    for layout in doc.layouts:
+        if layout.name.upper() != "MODEL":
+            collect_texts(layout)
 
     dims = []
     for e in msp:
@@ -237,12 +278,12 @@ def extract_ezdxf_meta(dxf_path):
                 val = None
                 try:
                     val = round(e.dxf.actual_measurement, 4)
-                except:
+                except Exception:
                     pass
                 txt = ""
                 try:
                     txt = e.dxf.text.strip()
-                except:
+                except Exception:
                     pass
                 dims.append({"value": val, "text": txt, "layer": e.dxf.layer})
         except Exception:
@@ -272,104 +313,110 @@ def extract_ezdxf_meta(dxf_path):
         dtype = "SECTION"
 
     return {"layers": layers, "texts": texts[:300], "dimensions": dims[:200],
-            "scale": scale, "drawing_type": dtype}
+            "scale": scale, "drawing_type": dtype, "sheets": sheet_names}
 
 
 def run(input_path, output_png, dpi=120, tiled=False):
     result = {
-        "success": False,
-        "png_path": None,
-        "tiles": [],
-        "texts": [],
-        "dimensions": [],
-        "layers": [],
-        "drawing_type": "UNKNOWN",
-        "scale": "Not detected",
-        "extents": {},
-        "errors": [],
-        "binary_extract": None,   # NEW: binary text extraction result
+        "success": False, "png_path": None, "tiles": [],
+        "layout_images": [], "texts": [], "dimensions": [],
+        "layers": [], "sheets": [], "xrefs": [],
+        "drawing_type": "UNKNOWN", "scale": "Not detected",
+        "extents": {}, "errors": [], "binary_extract": None,
+        "zwcad_text_mode": False,
     }
 
     ext = os.path.splitext(input_path)[1].lower()
     dxf_for_meta = input_path if ext == ".dxf" else None
 
-    # ── [NEW] STEP 0: Binary text extraction — works on ALL DWG versions ──
-    # Run this first so Gemini always gets some text context even if PNG fails
+    # STEP 0: Binary text extraction (always — ZWCAD fallback context)
     if ext in (".dwg", ".dxf"):
         try:
             bin_result = extract_text_from_dwg_binary(input_path)
             result["binary_extract"] = bin_result
-            # Merge into texts/layers for backward compatibility with server.js
             if bin_result.get("texts"):
                 result["texts"] = bin_result["texts"]
             if bin_result.get("layers"):
                 result["layers"] = bin_result["layers"]
             if bin_result.get("dims"):
                 result["dimensions"] = [{"value": None, "text": d, "layer": "binary"} for d in bin_result["dims"]]
-            print(f"[binary_extract] {len(result['texts'])} texts, {len(result['layers'])} layers found", file=sys.stderr)
+            if bin_result.get("sheets"):
+                result["sheets"] = bin_result["sheets"]
+            if bin_result.get("xrefs"):
+                result["xrefs"] = bin_result["xrefs"]
+            print(f"[binary_extract] texts={len(result['texts'])} layers={len(result['layers'])} "
+                  f"sheets={len(result['sheets'])} xrefs={len(result['xrefs'])}", file=sys.stderr)
         except Exception as e:
             result["errors"].append(f"Binary extract failed: {e}")
 
-    # ── STEP 1: Try ODA conversion for DWG (only if ODA installed) ──
+    # STEP 1: ODA DWG→DXF
     if ext == ".dwg":
         conv = dwg_to_dxf_via_oda(input_path)
         if conv:
             dxf_for_meta = conv
             result["errors"].append("ODA conversion successful")
 
-    # ── STEP 2: DXF -> PNG via ezdxf ──
+    # STEP 2: DXF→PNG (multi-sheet)
     if dxf_for_meta:
         try:
-            ok, tiles = render_dxf_to_png(dxf_for_meta, output_png, dpi=dpi, tiled=tiled)
+            ok, tiles, layout_images = render_dxf_to_png(dxf_for_meta, output_png, dpi=dpi, tiled=tiled)
             if ok:
                 result["png_path"] = output_png
                 result["tiles"] = tiles
+                result["layout_images"] = [{"name": li["name"], "path": li["path"]} for li in layout_images]
                 result["success"] = True
+                if len(layout_images) > 1:
+                    result["errors"].append(
+                        f"Multi-sheet drawing: {len(layout_images)} layouts rendered — "
+                        + ", ".join(li["name"] for li in layout_images))
         except Exception as e:
             result["errors"].append(f"ezdxf render failed: {e}")
 
-    # ── STEP 3: LibreOffice fallback ──
+    # STEP 3: LibreOffice fallback
     if not result["png_path"]:
         try:
             if libreoffice_to_png(input_path, output_png):
                 result["png_path"] = output_png
                 result["success"] = True
         except FileNotFoundError:
-            result["errors"].append("LibreOffice not installed on server")
+            result["errors"].append("LibreOffice not installed")
         except subprocess.TimeoutExpired:
             result["errors"].append("LibreOffice timed out")
         except Exception as e:
             result["errors"].append(f"LibreOffice failed: {e}")
 
-    # ── STEP 4: ezdxf metadata extraction (DXF only) ──
+    # STEP 4: ezdxf metadata
     if dxf_for_meta:
         try:
             meta = extract_ezdxf_meta(dxf_for_meta)
-            # Merge ezdxf texts with binary-extracted texts (ezdxf more accurate for DXF)
             if meta.get("texts"):
-                existing_texts = set(t["text"] for t in result["texts"])
+                existing = set(t["text"] for t in result["texts"])
                 for t in meta["texts"]:
-                    if t["text"] not in existing_texts:
+                    if t["text"] not in existing:
                         result["texts"].append(t)
-                        existing_texts.add(t["text"])
+                        existing.add(t["text"])
             if meta.get("layers"):
-                existing_layers = set(result["layers"])
-                result["layers"] = list(existing_layers | set(meta["layers"]))
+                result["layers"] = list(set(result["layers"]) | set(meta["layers"]))
             if meta.get("dimensions") and not result["dimensions"]:
                 result["dimensions"] = meta["dimensions"]
             result["scale"] = meta.get("scale", result["scale"])
             result["drawing_type"] = meta.get("drawing_type", result["drawing_type"])
+            if meta.get("sheets"):
+                result["sheets"] = list(set(result["sheets"]) | set(meta["sheets"]))
             result["success"] = True
         except Exception as e:
             result["errors"].append(f"ezdxf metadata failed: {e}")
 
-    # ── Mark success if we at least got text from binary ──
+    # STEP 5: ZWCAD text-only mode
     if not result["success"] and (result["texts"] or result["layers"]):
         result["success"] = True
+        result["zwcad_text_mode"] = True
+        sheet_info = (f" Sheets: {', '.join(result['sheets'][:10])}." if result["sheets"] else "")
+        xref_info = (f" XREFs: {', '.join(result['xrefs'][:5])}." if result["xrefs"] else "")
         result["errors"].append(
-            "No PNG rendered (DWG version not supported by ezdxf without ODA). "
-            "Text extracted from binary — Gemini will analyze via text context. "
-            "For best results, export drawing to PDF or PNG from AutoCAD/GstarCAD."
+            f"ZWCAD DWG: PNG render failed (format incompatible with ezdxf without ODA). "
+            f"Extracted {len(result['texts'])} texts, {len(result['layers'])} layers from binary.{sheet_info}{xref_info} "
+            "Claude will analyze via text-context mode. For visual accuracy, export to PDF/PNG from ZWCAD."
         )
 
     print(json.dumps(result))
@@ -377,13 +424,11 @@ def run(input_path, output_png, dpi=120, tiled=False):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print(json.dumps({"error": "Usage: dwg_converter.py <input> <output.png> [dpi] [tiled]",
-                          "success": False}))
+        print(json.dumps({"error": "Usage: dwg_converter.py <input> <output.png> [dpi] [tiled]", "success": False}))
         sys.exit(1)
     try:
         dpi_arg = int(sys.argv[3]) if len(sys.argv) > 3 else 120
         tiled_arg = sys.argv[4].lower() in ("true", "1", "yes") if len(sys.argv) > 4 else False
         run(sys.argv[1], sys.argv[2], dpi=dpi_arg, tiled=tiled_arg)
     except Exception as e:
-        print(json.dumps({"success": False,
-                          "errors": [f"Fatal: {e}", traceback.format_exc()[:1000]]}))
+        print(json.dumps({"success": False, "errors": [f"Fatal: {e}", traceback.format_exc()[:1000]]}))
