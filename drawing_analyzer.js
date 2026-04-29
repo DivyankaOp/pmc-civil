@@ -98,7 +98,7 @@ async function callClaude({ messages, maxTokens = 8192, thinking = false }) {
   const key = process.env.CLAUDE_API_KEY;
   if (!key) throw new Error('CLAUDE_API_KEY not set');
   const body = {
-    model: 'claude-sonnet-4-5-20251001', max_tokens: thinking ? 16000 : maxTokens,
+    model: 'claude-sonnet-4-5', max_tokens: thinking ? 16000 : maxTokens,
     system: SYSTEM_PROMPT, messages,
   };
   if (thinking) body.thinking = { type: 'enabled', budget_tokens: 8000 };
@@ -314,7 +314,7 @@ function buildFinalOutput(boq, quantities, meta, cvData) {
       phase3_elements:quantities?.quantities?.length||0,
       phase4_boq_items:boq.boq?.length||0,
       phase5_warnings:boq.validation_warnings?.length||0,
-      model:'claude-sonnet-4-5-20251001',
+      model:'claude-sonnet-4-5',
     },
   };
 }
