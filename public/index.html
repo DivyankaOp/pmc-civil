@@ -592,7 +592,7 @@ async function dlDrawingExcel(btn, uploadedFiles, userText, aiResponse){
   btn.disabled=true;btn.classList.add('loading');
   btn.querySelector('span:last-child').textContent=' AI analyzing & building Excel...';
   try{
-    const res=await fetch('/drawing-to-excel',{
+    const res=await fetch('/export-drawing',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({files:uploadedFiles,userText,aiResponse,mode})
     });
