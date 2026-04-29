@@ -859,7 +859,7 @@ async function send(){
   try{
     const body={system:SYS[mode],messages:claudeHistory,max_tokens:8192};
     const res=await fetch('/claude',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e?.error?.message||'HTTP '+res.status);}
+    if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e?.error||e?.error?.message||'HTTP '+res.status);}
     const data=await res.json();
 
     // ── Detailed error detection ──────────────────────────────
