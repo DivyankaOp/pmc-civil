@@ -569,7 +569,7 @@ app.post('/analyze-dxf', async (req, res) => {
     // ── Step 3: Claude interprets + fills BOQ (replaces Gemini) ──────────────
     const claudeResp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: { 'Content-Type':'application/json','x-api-key':claudeKey,'anthropic-version':'2023-06-01' },
+      headers: { 'Content-Type':'application/json','x-api-key':claudeKey,'anthropic-version':'2023-06-01','anthropic-beta':'pdfs-2024-09-25' },
       body: JSON.stringify({
         model: 'claude-sonnet-4-5-20251001', max_tokens: 8192,
         system: CIVIL_SYSTEM,
