@@ -106,7 +106,7 @@ async function callClaude({ messages, maxTokens = 8192, thinking = false }) {
   for (let i = 0; i <= 4; i++) {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: { 'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01' },
+      headers: { 'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-beta':'pdfs-2024-09-25' },
       body: JSON.stringify(body),
     });
     const data = await r.json();
@@ -127,9 +127,13 @@ function parseJSON(raw) {
 }
 
 function buildImageParts(files) {
-  return (files||[])
-    .filter(f=>f.type?.startsWith('image/'))
-    .map(f=>({ type:'image', source:{ type:'base64', media_type:f.type||'image/png', data:f.b64 } }));
+  return (files||[]).flatMap(f => {
+    if (f.type?.startsWith('image/'))
+      return [{ type:'image', source:{ type:'base64', media_type:f.type||'image/png', data:f.b64 } }];
+    if (f.type==='application/pdf' || f.name?.match(/\.pdf$/i))
+      return [{ type:'document', source:{ type:'base64', media_type:'application/pdf', data:f.b64 } }];
+    return [];
+  });
 }
 
 // ════════════════════════════════════════════
