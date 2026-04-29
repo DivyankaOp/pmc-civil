@@ -71,6 +71,12 @@ app.post('/gemini', async (req, res) => {
     if (!process.env.CLAUDE_API_KEY) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
     const { body } = req.body;
 
+    // ✅ FIX: Use frontend mode-specific system prompt (drawing/estimate/boq/auto etc.)
+    // Previously CIVIL_SYSTEM was always used — ignoring the detailed drawing-mode prompt
+    // from frontend which has STEP 1-8 instructions for reading schedules, BOQ etc.
+    const frontendSystem = body?.system_instruction?.parts?.[0]?.text;
+    const systemToUse = (frontendSystem && frontendSystem.trim().length > 50) ? frontendSystem : CIVIL_SYSTEM;
+
     // Extract all message parts (text + images/PDFs) from Gemini-format body
     const claudeMessages = [];
     for (const content of (body?.contents || [])) {
@@ -92,7 +98,7 @@ app.post('/gemini', async (req, res) => {
     }
     if (!claudeMessages.length) return res.status(400).json({ error: 'No messages.' });
 
-    const raw = await callClaudeAPI({ system: CIVIL_SYSTEM, messages: claudeMessages, maxTokens: 8192 });
+    const raw = await callClaudeAPI({ system: systemToUse, messages: claudeMessages, maxTokens: 8192 });
     // Auto-learn rates from chat responses (BOQ markdown tables)
     try { learnRatesFromMarkdown(raw, { filename: 'chat', drawing_type: 'GENERAL' }); } catch(e) {}
     // Return in Gemini-compatible format so the frontend doesn't need changes
@@ -548,8 +554,8 @@ app.post('/analyze-dxf', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type':'application/json','x-api-key':claudeKey,'anthropic-version':'2023-06-01' },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-5', max_tokens: 8192,
-        system: 'You are a senior PMC civil engineer. Read DXF drawing data and generate accurate BOQ JSON. Return ONLY raw JSON.',
+        model: 'claude-sonnet-4-5-20251001', max_tokens: 8192,
+        system: CIVIL_SYSTEM,
         messages: [{ role:'user', content: prompt }]
       })
     });
