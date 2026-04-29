@@ -138,13 +138,20 @@ textarea.tin::placeholder{color:var(--tx3)}
 .hint kbd{background:var(--sur);border:1px solid var(--bor);border-radius:3px;padding:1px 4px;font-size:9px}
 #fi{display:none}
 @media(max-width:768px){.sb{display:none}.qgrid{grid-template-columns:repeat(2,1fr)}.chat{padding:12px 14px}.iarea{padding:10px 14px 13px}.topbar{padding:0 14px}}
-
-.json-section{margin:8px 0;padding:8px 10px;background:#f8faff;border-left:3px solid #3B7BF6;border-radius:0 6px 6px 0;}
-.json-head{font-size:12px;font-weight:600;color:#1a3a6b;margin:4px 0 6px;text-transform:uppercase;letter-spacing:.5px;}
-.json-kv{display:flex;gap:6px;padding:2px 0;font-size:12px;border-bottom:1px solid #eef1f8;flex-wrap:wrap;}
-.json-key{font-weight:600;color:#374151;min-width:120px;flex-shrink:0;}
+.json-wrap{font-size:12px;line-height:1.6;}
+.json-section{margin:8px 0;padding:8px 12px;background:#f0f4ff;border-left:3px solid #3B7BF6;border-radius:0 6px 6px 0;}
+.json-section-title{font-weight:700;color:#1a3a6b;font-size:11px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px;}
+.json-kv{display:flex;gap:8px;padding:2px 0;border-bottom:1px solid #e8edf8;flex-wrap:wrap;font-size:12px;}
+.json-key{font-weight:600;color:#374151;min-width:130px;flex-shrink:0;}
 .json-val{color:#1d4ed8;word-break:break-word;}
-.code-block{background:#1e293b;color:#e2e8f0;padding:10px 14px;border-radius:8px;font-size:11px;overflow-x:auto;white-space:pre-wrap;margin:6px 0;}
+.json-table{width:100%;border-collapse:collapse;margin:4px 0;font-size:11px;}
+.json-table th{background:#1a3a6b;color:#fff;padding:5px 8px;text-align:left;font-weight:600;}
+.json-table td{padding:4px 8px;border-bottom:1px solid #e2e8f0;color:#1e293b;}
+.json-table tr:nth-child(even) td{background:#f8faff;}
+.json-table tr:last-child td{font-weight:600;background:#e8f0fe;}
+.code-blk{background:#1e293b;color:#e2e8f0;padding:10px 14px;border-radius:8px;font-size:11px;overflow-x:auto;white-space:pre-wrap;margin:6px 0;font-family:monospace;}
+.amount-cell{text-align:right;font-weight:600;color:#059669;}
+.total-row td{background:#fef3c7!important;font-weight:700;color:#92400e;}
 </style>
 </head>
 <body>
@@ -518,7 +525,7 @@ function addMsgEl(role,text,fnames,badge,msgFiles,msgText,aiResponseText,dxfFile
   if(badge&&role==='ai'){const info=diBadge(text);const b=document.createElement('div');b.className=`dbadge ${info.c}`;b.textContent='🔍 '+info.l;bub.appendChild(b);bub.appendChild(document.createElement('br'));}
   if(fnames&&fnames.length){const fr=document.createElement('div');fr.className='fpills';fnames.forEach(n=>{const p=document.createElement('div');p.className=`fp ${role==='user'?'u':'a'}`;p.textContent=(n.match(/\.pdf$/i)?'📄':'🖼️')+' '+n;fr.appendChild(p);});bub.appendChild(fr);}
   const tx=document.createElement('div');
-  if(role==='ai'){tx.innerHTML=mdt(text);}else{tx.style.whiteSpace='pre-wrap';tx.textContent=text;}
+  if(role==='ai'){tx.innerHTML=renderAIText(text);}else{tx.style.whiteSpace='pre-wrap';tx.textContent=text;}
   bub.appendChild(tx);
   // DXF file → show DXF Excel button
   if(role==='ai'&&dxfFile){
@@ -623,74 +630,99 @@ async function dlDXFExcel(btn,dxfFile){
 function addLoad(){hw();const chat=document.getElementById('chat');const row=document.createElement('div');row.className='msg ai';row.id='lr';const av=document.createElement('div');av.className='av ai';av.textContent='PMC';const bub=document.createElement('div');bub.className='bub';bub.innerHTML='<div class="dots"><span></span><span></span><span></span></div>';row.appendChild(av);row.appendChild(bub);chat.appendChild(row);chat.scrollTop=chat.scrollHeight;}
 function rmLoad(){const r=document.getElementById('lr');if(r)r.remove();}
 
-// ── MARKDOWN ──────────────────────────────────────────────
-function mdt(t){
-  // Step 1: Convert raw JSON blocks (```json ... ```) into human-readable HTML tables
-  t = t.replace(/```json([\s\S]*?)```/gi, function(_, raw) {
-    try {
-      const obj = JSON.parse(raw.trim());
-      return jsonToHtml(obj);
-    } catch(e) {
-      return '<pre class="code-block">' + raw.trim().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>';
-    }
-  });
-  // Step 2: Other code blocks
-  t = t.replace(/```[\w]*([\s\S]*?)```/g, function(_, code) {
-    return '<pre class="code-block">' + code.trim().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>';
-  });
-  // Step 3: Standard markdown
-  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>')
-    .replace(/^### (.+)$/gm,'<h3>$1</h3>')
-    .replace(/^## (.+)$/gm,'<h2>$1</h2>')
-    .replace(/^# (.+)$/gm,'<h2>$1</h2>')
-    .replace(/^---+$/gm,'<hr>')
-    .replace(/`([^`]+)`/g,'<code>$1</code>')
-    .replace(/^\|(.+)\|$/gm,(_,row)=>{const cells=row.split('|').map(c=>c.trim());if(cells.every(c=>/^[-:]+$/.test(c)))return'';return'<tr>'+cells.map(c=>'<td>'+c+'</td>').join('')+'</tr>';})
-    .replace(/(<tr>[\s\S]*?<\/tr>
-?)+/g,m=>{const rows=m.match(/<tr>[\s\S]*?<\/tr>/g)||[];if(!rows.length)return m;const[first,...rest]=rows;const h=first.replace(/<td>/g,'<th>').replace(/<\/td>/g,'</th>');return'<table><thead>'+h+'</thead><tbody>'+rest.join('')+'</tbody></table>';})
-    .replace(/^[-*] (.+)$/gm,'<li>$1</li>')
-    .replace(/(<li>[\s\S]*?<\/li>
-?)+/g,m=>'<ul>'+m+'</ul>')
-    .replace(/
-{2,}/g,'<br><br>')
-    .replace(/
-/g,'<br>');
-}
-
+// ── JSON → HUMAN READABLE HTML ────────────────────────────
 function jsonToHtml(obj, depth) {
   depth = depth || 0;
+  if (obj === null || obj === undefined) return '<span class="json-val">—</span>';
+
   if (Array.isArray(obj)) {
-    if (!obj.length) return '<em>(empty)</em>';
-    // Check if array of objects (like BOQ items) → render as table
+    if (!obj.length) return '<em style="color:#9ca3af">empty</em>';
     if (typeof obj[0] === 'object' && obj[0] !== null) {
-      const keys = Object.keys(obj[0]);
-      let html = '<div class="json-section"><table><thead><tr>' + keys.map(k=>'<th>'+k+'</th>').join('') + '</tr></thead><tbody>';
-      for (const row of obj) {
-        html += '<tr>' + keys.map(k=>'<td>'+(row[k]!==undefined?String(row[k]):'')+'</td>').join('') + '</tr>';
+      var keys = Object.keys(obj[0]);
+      var html = '<table class="json-table"><thead><tr>';
+      for (var k = 0; k < keys.length; k++) {
+        html += '<th>' + keys[k].replace(/_/g,' ') + '</th>';
       }
-      return html + '</tbody></table></div>';
+      html += '</tr></thead><tbody>';
+      var total_amount = 0;
+      for (var r = 0; r < obj.length; r++) {
+        var isTotal = obj[r]['description'] && String(obj[r]['description']).toLowerCase().includes('total');
+        html += isTotal ? '<tr class="total-row">' : '<tr>';
+        for (var k2 = 0; k2 < keys.length; k2++) {
+          var v = obj[r][keys[k2]];
+          var isAmt = keys[k2] === 'amount' || keys[k2] === 'rate' || keys[k2] === 'rate_per_unit';
+          if (v !== undefined && v !== null) {
+            if (isAmt && typeof v === 'number') {
+              html += '<td class="amount-cell">₹' + v.toLocaleString('en-IN') + '</td>';
+            } else {
+              html += '<td>' + String(v) + '</td>';
+            }
+          } else {
+            html += '<td>—</td>';
+          }
+        }
+        html += '</tr>';
+      }
+      html += '</tbody></table>';
+      return html;
     }
-    return '<ul>' + obj.map(v=>'<li>'+jsonToHtml(v, depth+1)+'</li>').join('') + '</ul>';
+    return '<ul>' + obj.map(function(v){ return '<li>' + jsonToHtml(v, depth+1) + '</li>'; }).join('') + '</ul>';
   }
-  if (typeof obj === 'object' && obj !== null) {
-    let html = depth===0 ? '' : '';
-    for (const [key, val] of Object.entries(obj)) {
-      const label = key.replace(/_/g,' ').replace(/\w/g,c=>c.toUpperCase());
-      if (Array.isArray(val) && val.length && typeof val[0]==='object') {
-        html += '<div class="json-section"><h3 class="json-head">'+label+'</h3>'+jsonToHtml(val, depth+1)+'</div>';
+
+  if (typeof obj === 'object') {
+    var BOQ_KEYS = ['boq_items','boq','revised_boq_items','items'];
+    var html2 = depth === 0 ? '<div class="json-wrap">' : '';
+    var entries = Object.entries(obj);
+    for (var i = 0; i < entries.length; i++) {
+      var key = entries[i][0];
+      var val = entries[i][1];
+      var label = key.replace(/_/g,' ').replace(/\b\w/g, function(c){ return c.toUpperCase(); });
+      if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object') {
+        html2 += '<div class="json-section"><div class="json-section-title">' + label + '</div>' + jsonToHtml(val, depth+1) + '</div>';
       } else if (typeof val === 'object' && val !== null && !Array.isArray(val)) {
-        html += '<div class="json-section"><h3 class="json-head">'+label+'</h3>'+jsonToHtml(val, depth+1)+'</div>';
+        html2 += '<div class="json-section"><div class="json-section-title">' + label + '</div>' + jsonToHtml(val, depth+1) + '</div>';
       } else if (Array.isArray(val)) {
-        html += '<div class="json-kv"><span class="json-key">'+label+':</span> <span class="json-val">'+(val.join(', ') || '—')+'</span></div>';
+        html2 += '<div class="json-kv"><span class="json-key">' + label + ':</span><span class="json-val">' + (val.length ? val.join(', ') : '—') + '</span></div>';
       } else {
-        html += '<div class="json-kv"><span class="json-key">'+label+':</span> <span class="json-val">'+(val!==null&&val!==undefined?String(val):'—')+'</span></div>';
+        var disp = (val !== null && val !== undefined) ? String(val) : '—';
+        if (typeof val === 'number' && (key === 'amount' || key.includes('cost') || key.includes('total') || key.includes('rate'))) {
+          disp = '₹' + val.toLocaleString('en-IN');
+        }
+        html2 += '<div class="json-kv"><span class="json-key">' + label + ':</span><span class="json-val">' + disp + '</span></div>';
       }
     }
-    return html;
+    if (depth === 0) html2 += '</div>';
+    return html2;
   }
   return String(obj);
 }
+
+function renderAIText(text) {
+  // Extract and render JSON code blocks specially
+  var parts = text.split(/(```json[\s\S]*?```|```[\s\S]*?```)/gi);
+  var out = '';
+  for (var i = 0; i < parts.length; i++) {
+    var part = parts[i];
+    if (/^```json/i.test(part)) {
+      var raw = part.replace(/^```json\s*/i,'').replace(/```\s*$/,'').trim();
+      try {
+        var parsed = JSON.parse(raw);
+        out += jsonToHtml(parsed, 0);
+      } catch(e) {
+        out += '<pre class="code-blk">' + raw.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>';
+      }
+    } else if (/^```/.test(part)) {
+      var raw2 = part.replace(/^```\w*\s*/,'').replace(/```\s*$/,'').trim();
+      out += '<pre class="code-blk">' + raw2.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>';
+    } else {
+      out += mdt(part);
+    }
+  }
+  return out;
+}
+
+// ── MARKDOWN ──────────────────────────────────────────────
+function mdt(t){return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>').replace(/^### (.+)$/gm,'<h3>$1</h3>').replace(/^## (.+)$/gm,'<h2>$1</h2>').replace(/^# (.+)$/gm,'<h2>$1</h2>').replace(/^---+$/gm,'<hr>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/^\|(.+)\|$/gm,(_,row)=>{const cells=row.split('|').map(c=>c.trim());if(cells.every(c=>/^[-:]+$/.test(c)))return'';return'<tr>'+cells.map(c=>`<td>${c}</td>`).join('')+'</tr>';}).replace(/(<tr>[\s\S]*?<\/tr>\n?)+/g,m=>{const rows=m.match(/<tr>[\s\S]*?<\/tr>/g)||[];if(!rows.length)return m;const[first,...rest]=rows;const h=first.replace(/<td>/g,'<th>').replace(/<\/td>/g,'</th>');return`<table><thead>${h}</thead><tbody>${rest.join('')}</tbody></table>`;}).replace(/^[-*] (.+)$/gm,'<li>$1</li>').replace(/(<li>[\s\S]*?<\/li>\n?)+/g,m=>`<ul>${m}</ul>`).replace(/\n{2,}/g,'<br><br>').replace(/\n/g,'<br>');}
 
 // ── SEND ───────────────────────────────────────────────────
 async function send(){
