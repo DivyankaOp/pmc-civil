@@ -858,27 +858,23 @@ async function send(){
     const data=await res.json();
 
     // ── Detailed error detection ──────────────────────────────
-    // Case 1: Gemini API-level error (e.g. GEMINI_API_KEY wrong, quota exceeded)
+    // Case 1: Claude API-level error
     if(data?.error){
       const code=data.error.code||'';
-      const msg=data.error.message||'Gemini API error';
-      if(code===429||msg.includes('429')||msg.toLowerCase().includes('quota'))
+      const msg=data.error.message||'Claude API error';
+      if(code===429||msg.includes('429')||msg.toLowerCase().includes('quota')||msg.toLowerCase().includes('overload'))
         throw new Error('Rate limit / quota exceeded. Thodi der baad try karo.');
-      if(code===400||msg.toLowerCase().includes('api key'))
-        throw new Error('GEMINI_API_KEY invalid hai. Server pe check karo.');
-      throw new Error(`Gemini Error ${code}: ${msg}`);
+      if(code===400||msg.toLowerCase().includes('api key')||msg.toLowerCase().includes('auth'))
+        throw new Error('CLAUDE_API_KEY invalid hai. Server pe check karo.');
+      throw new Error(`Claude Error ${code}: ${msg}`);
     }
-    // Case 2: Response blocked by safety filters
-    const finishReason=data?.candidates?.[0]?.finishReason||'';
-    if(finishReason==='SAFETY'||finishReason==='RECITATION')
-      throw new Error(`Response blocked by Gemini safety filters (${finishReason}). Doosri file try karo.`);
-    // Case 3: No candidates at all
+    // Case 2: No candidates at all
     if(!data?.candidates?.length)
-      throw new Error('Gemini ne koi response nahi diya. File format check karo — PDF 20MB se chhoti honi chahiye.');
-    // Case 4: Empty text in response
+      throw new Error('Claude ne koi response nahi diya. File format check karo — PDF 20MB se chhoti honi chahiye.');
+    // Case 3: Empty text in response
     const aiText=data?.candidates?.[0]?.content?.parts?.[0]?.text||'';
     if(!aiText.trim())
-      throw new Error('Gemini response empty aaya. PDF/image dobara upload karo ya file size check karo.');
+      throw new Error('Claude response empty aaya. PDF/image dobara upload karo ya file size check karo.');
     // ── Success ───────────────────────────────────────────────
     hist=hist.filter(m=>m.role!=='user_parts');
     // Keep only text in hist — b64 files are too large for localStorage
@@ -894,7 +890,7 @@ async function send(){
     let msg=err.message;
     if(msg.includes('429'))msg='⚠️ Rate limit — thodi der baad try karo.';
     if(msg.includes('fetch'))msg='❌ Server se connection nahi hua. Render service check karo.';
-    addMsgEl('ai',`**Error:** ${msg}\n\n_Agar PDF hai toh file size 20MB se kam rakho. Agar baar baar aata hai toh Gemini API key aur quota check karo._`);
+    addMsgEl('ai',`**Error:** ${msg}\n\n_Agar PDF hai toh file size 20MB se kam rakho. Agar baar baar aata hai toh CLAUDE_API_KEY aur server logs check karo._`);
   }
   busy=false;document.getElementById('sbtn').disabled=false;
 }
@@ -1061,7 +1057,7 @@ async function runFinalAnalysis(){
   const sess=window.dxfSession;
   if(!sess) return;
 
-  const waitMsg='### ⚙️ Generating Complete BOQ...\n\nSab symbols confirm ho gaye. Ab Gemini complete BOQ bana raha hai — thodi der ruko...';
+  const waitMsg='### ⚙️ Generating Complete BOQ...\n\nSab symbols confirm ho gaye. Ab Claude complete BOQ bana raha hai — thodi der ruko...';
   addMsgEl('ai',waitMsg,[],false,null,'','');
   hist.push({role:'assistant',content:waitMsg});
   addLoad();
