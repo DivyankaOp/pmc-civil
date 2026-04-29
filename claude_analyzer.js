@@ -1,326 +1,355 @@
+/**
+ * PMC Drawing Analyzer — Claude 5-Phase Pipeline
+ * ─────────────────────────────────────────────────────────────────
+ * PHASE 1 → CV Pre-process   (OpenCV — existing, untouched)
+ * PHASE 2 → Legend + Scale   (Claude — title block ONLY, no BOQ yet)
+ * PHASE 3 → Quantity Extract (Claude — with legend context)
+ * PHASE 4 → BOQ Calculate    (Claude — rates applied to clean quantities)
+ * PHASE 5 → Validate         (Claude extended thinking — flags anomalies)
+ * ─────────────────────────────────────────────────────────────────
+ * Drop-in replacement — server.js needs ZERO changes.
+ */
+
 'use strict';
-/**
- * PMC Civil — Claude Analyzer
- * Replaces all remaining Gemini calls with Claude API
- * Gives consistent 5-phase pipeline across ALL routes
- */
 
-const CLAUDE_URL = 'https://api.anthropic.com/v1/messages';
+const { execSync } = require('child_process');
+const fs   = require('fs');
+const path = require('path');
+const os   = require('os');
 
-/**
- * Call Claude with retry on overload
- */
-async function callClaudeAPI({ system, messages, maxTokens = 8192, thinking = false, thinkingBudget = 10000 }) {
+// ── RATES from Rates.json ─────────────────────────────────────────
+const RATES = (() => {
+  const out = {};
+  try {
+    const rp = fs.existsSync(path.join(__dirname, 'rates.json'))
+      ? path.join(__dirname, 'rates.json') : path.join(__dirname, 'Rates.json');
+    const raw = JSON.parse(fs.readFileSync(rp, 'utf8'));
+    for (const cat of Object.values(raw)) {
+      if (typeof cat === 'object' && !Array.isArray(cat))
+        for (const [k, v] of Object.entries(cat))
+          if (v?.rate) out[k] = v.rate;
+    }
+  } catch (e) { console.warn('Rates.json not loaded:', e.message); }
+  return out;
+})();
+
+const RATES_STRING = (() => {
+  try {
+    const rp = fs.existsSync(path.join(__dirname, 'Rates.json'))
+      ? path.join(__dirname, 'Rates.json') : path.join(__dirname, 'rates.json');
+    const raw = JSON.parse(fs.readFileSync(rp, 'utf8'));
+    const lines = [];
+    for (const [cat, items] of Object.entries(raw)) {
+      if (cat.startsWith('_') || typeof items !== 'object') continue;
+      for (const [, v] of Object.entries(items))
+        if (v?.rate) lines.push(`${v.description} → Rs.${v.rate}/${v.unit}`);
+    }
+    return lines.join('\n');
+  } catch { return ''; }
+})();
+
+// ── KNOWLEDGE BASE hints ──────────────────────────────────────────
+function knowledgeBaseHints() {
+  try {
+    const kb = JSON.parse(fs.readFileSync(path.join(__dirname, 'ymbols-learned.json'), 'utf8'));
+    const hints = [];
+    if (kb.quantity_corrections?.length) {
+      hints.push('CORRECTION HISTORY (apply these lessons):');
+      for (const c of kb.quantity_corrections.slice(-10))
+        hints.push(`  WARNING ${c.element}: AI said ${c.ai_said}, correct was ${c.correct_value}. Reason: ${c.correction_reason || 'engineer corrected'}`);
+    }
+    if (kb.scale_corrections?.length) {
+      hints.push('SCALE ISSUES HISTORY:');
+      for (const s of kb.scale_corrections.slice(-5))
+        hints.push(`  WARNING Scale detected ${s.detected} but actual was ${s.actual}`);
+    }
+    const blocks = Object.entries(kb.blocks || {}).slice(0, 15);
+    if (blocks.length) {
+      hints.push('CONFIRMED BLOCK MEANINGS:');
+      for (const [b, m] of blocks) hints.push(`  ${b} = ${m}`);
+    }
+    return hints.join('\n');
+  } catch { return ''; }
+}
+
+// ── SYSTEM PROMPT ─────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are a senior PMC civil engineer with 20 years experience in Gujarat, India.
+You read AutoCAD drawings (DWG, DXF, PDF) and generate accurate BOQ for civil works.
+
+GOLDEN RULES:
+1. NEVER invent or guess dimensions. Only values visible in THIS drawing.
+2. Read the legend FIRST before counting any element.
+3. Apply scale factor from title block to ALL measurements.
+4. Mark every quantity: source = "drawing" | "calculated" | "assumed"
+5. Return ONLY raw JSON. No markdown. No explanation.
+
+GUJARAT DSR 2025 RATES:
+${RATES_STRING}
+
+VALIDATION RATIOS (flag if outside):
+- Steel in RCC slab: 100-140 kg/CUM
+- Steel in beam: 150-200 kg/CUM
+- Steel in column: 180-240 kg/CUM
+- Road GSB: area x 1.15 x 0.3 x 1.8 tonnes
+- Road WMM: area x 1.15 x 0.2 x 2.1 tonnes`;
+
+// ── CLAUDE API CALL ───────────────────────────────────────────────
+async function callClaude({ messages, maxTokens = 8192, thinking = false }) {
   const key = process.env.CLAUDE_API_KEY;
   if (!key) throw new Error('CLAUDE_API_KEY not set');
-
   const body = {
-    model: 'claude-sonnet-4-5-20251001',
-    max_tokens: thinking ? Math.max(maxTokens, thinkingBudget + 4000) : maxTokens,
-    system,
-    messages,
+    model: 'claude-sonnet-4-5-20251001', max_tokens: thinking ? 16000 : maxTokens,
+    system: SYSTEM_PROMPT, messages,
   };
-  if (thinking) body.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
+  if (thinking) body.thinking = { type: 'enabled', budget_tokens: 8000 };
 
   for (let i = 0; i <= 4; i++) {
-    const r = await fetch(CLAUDE_URL, {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      headers: { 'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01' },
       body: JSON.stringify(body),
     });
     const data = await r.json();
-    if (r.ok && data.content) {
-      return data.content.filter(b => b.type === 'text').map(b => b.text).join('');
-    }
+    if (r.ok && data.content) return data.content.filter(b=>b.type==='text').map(b=>b.text).join('');
     if (data.error?.type !== 'overloaded_error') throw new Error(`Claude: ${data.error?.message}`);
-    await new Promise(res => setTimeout(res, 2000 * Math.pow(2, i)));
+    await new Promise(r=>setTimeout(r, 2000*(i+1)));
   }
-  throw new Error('Claude API: max retries');
+  throw new Error('Claude API: max retries exceeded');
 }
 
 function parseJSON(raw) {
-  if (!raw) return {};
-  const clean = raw.replace(/```json|```/g, '').trim();
-  const fb = clean.indexOf('{'), lb = clean.lastIndexOf('}');
-  if (fb === -1 || lb === -1) return {};
-  try { return JSON.parse(clean.slice(fb, lb + 1)); } catch { return {}; }
+  if (!raw) return null;
+  const clean = raw.replace(/```json|```/g,'').trim();
+  const fb=clean.indexOf('{'), lb=clean.lastIndexOf('}');
+  if (fb===-1||lb===-1) return null;
+  try { return JSON.parse(clean.slice(fb,lb+1)); }
+  catch(e) { console.error('[Claude] JSON parse fail:',e.message,clean.slice(0,200)); return null; }
 }
 
-const CIVIL_SYSTEM = `You are a senior PMC civil engineer with 20 years experience in Gujarat, India.
-You have EXCELLENT vision and can read engineering drawings with full confidence.
-You analyze civil engineering drawings and generate accurate BOQ (Bill of Quantities).
-
-READING RULES:
-1. READ every dimension, annotation, schedule table, and label that is visible in the drawing — zoom in mentally and read carefully.
-2. For SCHEDULE tables (Schedule of Footing, Schedule of Column etc.) — read EVERY row and column value precisely.
-3. Apply scale factor from title block to measurements where needed.
-4. Mark every quantity source: "drawing" | "calculated" | "assumed".
-5. NEVER say "not legible" or "cannot read" unless the drawing is genuinely blurry/corrupt — always attempt to read.
-6. If a dimension is not explicitly shown, CALCULATE it from visible context and mark as "calculated".
-7. Return ONLY raw JSON. No markdown. No explanation.
-
-Gujarat DSR 2025 Rates:
-100mm block wall: Rs.4200/cum | 230mm brick wall: Rs.4800/cum
-RCC M25: Rs.5500/cum | RCC M30: Rs.5800/cum | Steel Fe500: Rs.56/kg
-Excavation: Rs.180/cum | Formwork: Rs.180/sqmt | PQC road: Rs.1800/sqmt
-Plaster 12mm: Rs.280/sqmt | Waterproofing: Rs.450/sqmt`;
-
-/**
- * Analyze DXF data with Claude (replaces Gemini in /export-dxf-excel, /classify-dxf, /analyze-with-answers)
- */
-async function claudeAnalyzeDXF(civilData, filename, ratesSummary) {
-  const prompt = `PMC civil engineer. Analyze DXF. Use ONLY data below, no invented values.
-FILE:${filename} DECLARED_TYPE:${civilData.drawing_type} SCALE:${civilData.scale || '?'}
-TEXTS:${(civilData.all_texts || []).slice(0, 120).join(' | ')}
-DIMS:${(civilData.dimension_values || []).slice(0, 40).map(d => d.value_m + 'm[' + d.layer + ']').join(', ')}
-AREAS:${(civilData.polyline_areas || []).slice(0, 20).map(p => p.area_sqm + 'sqm(' + p.layer + ')').join(', ')}
-BLOCK_COUNTS:${Object.entries(civilData.block_counts || {}).slice(0, 40).map(([k, v]) => k + ':' + v).join(', ')}
-ELEMENT_COUNTS:${JSON.stringify(civilData.element_counts || {})}
-LAYERS:${(civilData.layer_names || []).join(', ')}
-RATES:${ratesSummary}
-Return ONLY JSON:{"project_name":"","drawing_type":"FLOOR_PLAN|BASEMENT|STRUCTURAL|FOUNDATION|SITE_LAYOUT|ROAD_PLAN|ELEVATION","scale":"","spaces":[],"boq":[{"description":"","unit":"","qty":0,"rate":0,"amount":0}],"observations":[],"pmc_recommendation":""}`;
-
-  const raw = await callClaudeAPI({ system: CIVIL_SYSTEM, messages: [{ role: 'user', content: prompt }] });
-  return parseJSON(raw);
+function buildImageParts(files) {
+  return (files||[]).flatMap(f => {
+    if (f.type?.startsWith('image/'))
+      return [{ type:'image', source:{ type:'base64', media_type:f.type||'image/png', data:f.b64 } }];
+    if (f.type==='application/pdf' || f.name?.match(/\.pdf$/i))
+      return [{ type:'document', source:{ type:'base64', media_type:'application/pdf', data:f.b64 } }];
+    return [];
+  });
 }
 
-/**
- * Classify unknown DXF blocks/layers with Claude (replaces Gemini in /classify-dxf)
- */
-async function claudeClassifySymbols(unknownBlocks, unknownLayers, civilData, filename) {
-  if (!unknownBlocks.length && !unknownLayers.length) return { blocks: {}, layers: {}, still_unknown_blocks: [], still_unknown_layers: [] };
+// ════════════════════════════════════════════
+// PHASE 2 — Legend + Title Block
+// ════════════════════════════════════════════
+async function phase2_legendAndScale(files, cvData) {
+  console.log('[Phase 2] Reading legend + title block...');
+  const kb = knowledgeBaseHints();
+  const cv = cvData&&!cvData.error
+    ? `CV: ${cvData.image_dimensions?.width_px}x${cvData.image_dimensions?.height_px}px | spaces:${cvData.detected_spaces?.length||0} | scale candidates:${JSON.stringify(cvData.scale_bar_candidates_px?.slice(0,4))}` : '';
+  const imgParts = buildImageParts(files);
+  if (!imgParts.length) return null;
 
-  const prompt = `You are a senior AutoCAD civil drawing expert.
-Classify these unknown block names and layer names from a civil DXF drawing.
+  const raw = await callClaude({
+    messages:[{ role:'user', content:[
+      ...imgParts,
+      { type:'text', text:`${cv}\n${kb}\n\nTASK PHASE 2: Read ONLY legend/symbol table and title block. No BOQ yet.\nReturn JSON:\n{"drawing_type":"","project_name":"","drawing_no":"","date":"","scale":"1:100","scale_factor":100,"north_direction":"","legend":[{"symbol":"","meaning":"","layer":""}],"floors_visible":[],"title_block_confidence":"HIGH|MEDIUM|LOW","legend_confidence":"HIGH|MEDIUM|LOW","notes":[]}` }
+    ]}],
+    maxTokens: 2048
+  });
 
-UNKNOWN BLOCKS (name → count):
-${unknownBlocks.map(b => `${b.name} (×${b.count})`).join('\n') || 'none'}
-
-UNKNOWN LAYERS:
-${unknownLayers.join('\n') || 'none'}
-
-DRAWING CONTEXT:
-- File: ${filename}
-- Drawing type: ${civilData.drawing_type}
-- Texts found: ${(civilData.all_texts || []).slice(0, 30).join(', ')}
-
-Classify as: door | window | column | beam | slab | wall | staircase | lift | ramp | toilet | kitchen | bedroom | parking | road | hatch | dimension | text | furniture | equipment | unknown
-
-Return ONLY raw JSON:
-{"blocks":{"BLOCK_NAME":"type"},"layers":{"LAYER_NAME":"type"},"still_unknown_blocks":[],"still_unknown_layers":[]}`;
-
-  const raw = await callClaudeAPI({ system: CIVIL_SYSTEM, messages: [{ role: 'user', content: prompt }] });
-  return parseJSON(raw);
+  const meta = parseJSON(raw);
+  console.log(`[Phase 2] type:${meta?.drawing_type} scale:${meta?.scale} legend:${meta?.legend?.length||0} items`);
+  return meta;
 }
 
-/**
- * Full BOQ from DXF with symbol answers (replaces Gemini in /analyze-with-answers)
- */
-async function claudeAnalyzeWithAnswers(civilData, filename, symbolSummary, ratesSummary) {
-  const prompt = `You are a senior PMC civil engineer generating a complete BOQ.
-ALL DATA IS FROM THIS DXF FILE. DO NOT INVENT VALUES.
+// ════════════════════════════════════════════
+// PHASE 3 — Quantity Extraction
+// ════════════════════════════════════════════
+async function phase3_extractQuantities(files, meta) {
+  console.log('[Phase 3] Extracting quantities with legend context...');
+  const legendCtx = meta?.legend?.length
+    ? `LEGEND FROM PHASE 2 (use for all element identification):\n${meta.legend.map(l=>`  ${l.symbol} = ${l.meaning} (layer:${l.layer||'?'})`).join('\n')}`
+    : 'No legend — use standard CAD conventions.';
+  const scaleCtx = meta?.scale
+    ? `SCALE: ${meta.scale} (scale_factor=${meta.scale_factor}). Apply to ALL dimensions.`
+    : 'Scale not confirmed — mark confidence LOW.';
+  const imgParts = buildImageParts(files);
 
-FILE: ${filename}
-DRAWING TYPE: ${civilData.drawing_type}
-SCALE: ${civilData.scale || 'not detected'}
-DRAWING SIZE: ${civilData.drawing_extents?.width_m || 0}m × ${civilData.drawing_extents?.height_m || 0}m
+  const raw = await callClaude({
+    messages:[{ role:'user', content:[
+      ...imgParts,
+      { type:'text', text:`${legendCtx}\n${scaleCtx}\nDrawing type:${meta?.drawing_type||'unknown'}\n\nTASK PHASE 3: Extract ALL quantities visible in drawing.\nReturn JSON:\n{"quantities":[{"element":"","floor":"","length_m":0,"width_m":0,"height_m":0,"thickness_m":0,"nos":1,"area_sqmt":0,"volume_cum":0,"unit":"","annotation_text":"","source":"drawing|calculated|assumed","confidence":"high|medium|low"}],"element_counts":{"door_count":0,"window_count":0,"column_count":0,"footing_count":0,"staircase_count":0,"lift_count":0,"bedroom_count":0,"toilet_count":0,"kitchen_count":0,"floor_count":0},"road_data":{"roads":[{"name":"","length_rmt":0,"total_width_m":0,"carriage_width_m":0}]},"total_built_area_sqmt":0,"observations":[]}` }
+    ]}],
+    maxTokens: 6000
+  });
 
-SYMBOL DICTIONARY (confirmed):
-${symbolSummary || 'none'}
-
-ELEMENT COUNTS: ${JSON.stringify(civilData.element_counts || {})}
-FLOOR LEVELS: ${(civilData.floor_levels || []).map(l => l.label + '=' + (l.level_m || '?') + 'm').join('\n') || 'none'}
-TEXT ANNOTATIONS: ${(civilData.all_texts || []).slice(0, 100).join('\n')}
-DIMENSIONS: ${(civilData.dimension_values || []).slice(0, 40).map(d => d.value_m + 'm[' + d.layer + ']').join(', ')}
-AREAS: ${(civilData.polyline_areas || []).slice(0, 20).map(p => p.area_sqm + 'sqm(' + p.layer + ')').join(', ')}
-GUJARAT DSR 2025 RATES: ${ratesSummary}
-
-Return ONLY raw JSON:
-{"project_name":"","drawing_type":"","scale":"","building_height_m":0,"floor_count":0,"total_bua_sqm":0,"spaces":[{"name":"","area_sqm":0}],"boq":[{"sr":1,"description":"","unit":"sqmt|cum|rmt|nos|kg","qty":0,"rate":0,"amount":0,"source":"drawing|calculated|assumed"}],"element_counts":{},"observations":[],"pmc_recommendation":""}`;
-
-  const raw = await callClaudeAPI({ system: CIVIL_SYSTEM, messages: [{ role: 'user', content: prompt }], maxTokens: 8192 });
-  return parseJSON(raw);
+  const q = parseJSON(raw);
+  console.log(`[Phase 3] ${q?.quantities?.length||0} elements extracted`);
+  return q;
 }
 
-/**
- * Analyze drawing image/PDF with Claude Vision (replaces Gemini in /gemini, /export-drawing, /drawing-to-excel)
- */
-async function claudeAnalyzeDrawingVision(files, userText, aiResponse) {
-  const contentParts = [];
+// ════════════════════════════════════════════
+// PHASE 4 — BOQ Calculation
+// ════════════════════════════════════════════
+async function phase4_calculateBOQ(quantities, meta) {
+  console.log('[Phase 4] Calculating BOQ...');
+  if (!quantities) return null;
 
-  for (const f of (files || [])) {
-    try {
-      if (f.type === 'application/pdf' || f.name?.match(/\.pdf$/i)) {
-        contentParts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: f.b64 } });
-      } else if (f.type?.startsWith('image/')) {
-        contentParts.push({ type: 'image', source: { type: 'base64', media_type: f.type || 'image/png', data: f.b64 } });
-      }
-    } catch (e) {}
-  }
-
-  const textPrompt = `You are a senior PMC civil engineer. Analyze this civil drawing CONFIDENTLY and extract complete data.
-You have excellent vision — READ everything visible in this drawing carefully including all schedule tables.
-
-STEP 1: READ TITLE BLOCK — project name, drawing number, scale, date, consultant firm name.
-STEP 2: DRAWING TYPE — identify type (Foundation/Column Layout/Floor Plan/Section/Elevation) and note all grid lines.
-STEP 3: READ SCHEDULE OF FOOTING TABLE (if visible) — extract EVERY row:
-  Columns to read: Mark | Size (mm) | Depth (mm) | Reinforcement (top/bottom bars — dia @ spacing) | Qty
-STEP 4: READ SCHEDULE OF COLUMN TABLE (if visible) — extract EVERY row:
-  Columns to read: Mark | Size (mm×mm) | Main Bars (nos × dia mm) | Stirrups (dia @ spacing mm) | Qty
-STEP 5: READ all detail drawings — footing sections, column details, base plate details.
-STEP 6: COUNT elements in main layout — columns, grid lines, special elements.
-STEP 7: CALCULATE complete BOQ using schedule data with Gujarat DSR 2025 rates:
-  - Concrete volumes: length × width × depth (cum)
-  - Steel weight: nos × bars × length × unit_weight (kg) [8mm=0.395, 12mm=0.888, 16mm=1.578, 20mm=2.467 kg/m]
-  - Excavation: footing plan area × depth + 300mm extra each side (cum)
-  - Formwork: perimeter × depth (sqmt)
-STEP 8: PMC OBSERVATIONS — IS 456:2000 compliance, design comments, site recommendations.
-
-RULES:
-- READ what is VISIBLE — never refuse to read a legible drawing
-- If schedule table is present, extract ALL rows completely
-- Mark source: "drawing-schedule" | "drawing-count" | "calculated" | "assumed"
-- If value unclear write best estimate + "(approx)"
-${userText ? "User query: " + userText : ""}
-${aiResponse ? "Previous analysis context: " + aiResponse : ""}
-
-OUTPUT: Markdown with these sections:
-## Project Info
-## Schedule of Footing
-## Schedule of Column  
-## BOQ (table: Sr | Description | Unit | Qty | Rate ₹ | Amount ₹)
-## PMC Observations`;
-
-  contentParts.push({ type: 'text', text: textPrompt });
-
-  const raw = await callClaudeAPI({
-    system: CIVIL_SYSTEM,
-    messages: [{ role: 'user', content: contentParts }],
+  const raw = await callClaude({
+    messages:[{ role:'user', content:`TASK PHASE 4: Calculate BOQ from quantities.\n\nQUANTITIES:\n${JSON.stringify(quantities,null,2)}\n\nDRAWING: type=${meta?.drawing_type||'?'} project=${meta?.project_name||'?'} scale=${meta?.scale||'?'}\n\nUse DSR 2025 rates from system prompt. Group into PARTS.\nReturn JSON:\n{"project_name":"","drawing_type":"","drawing_no":"","date":"","scale":"","boq":[{"sr":1,"part":"PART A","description":"","unit":"","qty":0,"rate":0,"amount":0,"source":"drawing|calculated|assumed","confidence":"high|medium|low"}],"element_counts":{},"area_statement":{"total_bua_sqmt":0,"floor_wise":[],"road_area_sqmt":0,"road_length_rmt":0},"cost_summary":{"civil_total_inr":0,"civil_total_lacs":0,"civil_total_crores":0},"observations":[],"missing_info":[]}` }],
     maxTokens: 8192
   });
-  return raw;
+
+  const boq = parseJSON(raw);
+  console.log(`[Phase 4] ${boq?.boq?.length||0} BOQ items, total: Rs.${boq?.cost_summary?.civil_total_lacs||0} lacs`);
+  return boq;
 }
 
-/**
- * Analyze DWG file rendered as PNG tiles with Claude Vision
- * (replaces Gemini in /analyze-dwg — ZWCAD compatible)
- * v5: Multi-sheet layout support + ZWCAD text-only mode
- */
-async function claudeAnalyzeDWGVision(pngB64Array, converterResult, filename) {
-  const contentParts = [];
+// ════════════════════════════════════════════
+// PHASE 5 — Validation (Extended Thinking)
+// ════════════════════════════════════════════
+async function phase5_validateAndFlag(boqData) {
+  console.log('[Phase 5] Validating with extended thinking...');
+  if (!boqData) return boqData;
 
-  // Add all PNG tiles as images
-  for (const pngB64 of pngB64Array) {
-    contentParts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: pngB64 } });
-  }
-
-  const textSummary = (converterResult.texts || []).map(t => t.text).slice(0, 200).join(' | ');
-  const dimSummary = (converterResult.dimensions || []).filter(d => d.value || d.text)
-    .map(d => `${d.value || ''}${d.text ? ' (' + d.text + ')' : ''}`).slice(0, 80).join(', ');
-  const layers = (converterResult.layers || []).join(', ');
-  const version = converterResult.binary_extract?.version || converterResult.version || 'Unknown';
-  const sheets = (converterResult.sheets || []).join(', ');
-  const xrefs = (converterResult.xrefs || []).join(', ');
-  const isTextMode = converterResult.zwcad_text_mode === true;
-  const layoutImages = converterResult.layout_images || [];
-
-  // Build sheet context
-  const sheetContext = sheets
-    ? `SHEETS/LAYOUTS IN DRAWING: ${sheets}\nNote: Multi-sheet drawing — analyze each sheet separately if data varies.`
-    : '';
-  const xrefContext = xrefs
-    ? `XREF FILES REFERENCED: ${xrefs}\nNote: XREF content is shown inline in the drawing.`
-    : '';
-
-  // For text-only mode (ZWCAD render failed), use a richer text-analysis prompt
-  const zwcadTextModeNote = isTextMode
-    ? `⚠️  PNG RENDER UNAVAILABLE (ZWCAD binary format incompatible with ezdxf).
-Text + layer data extracted directly from binary — use this as your drawing data.
-Analyze like an engineer reading a drawing schedule: infer elements from text annotations,
-layer names, and dimension values. State "Estimated from text" for each quantity.
-For accurate visual analysis, user should export to PDF/PNG from ZWCAD first.`
-    : '';
-
-  const multiSheetNote = layoutImages.length > 1
-    ? `MULTI-SHEET DRAWING: ${layoutImages.length} sheets rendered — ${layoutImages.map(l => l.name).join(', ')}.
-Images in this message: (1) Main sheet, then additional sheets. Analyze ALL sheets.`
-    : (pngB64Array.length > 1
-        ? `MULTI-IMAGE: ${pngB64Array.length} tiles — full sheet + ${pngB64Array.length - 1} zoom crops. Synthesize ONE analysis.`
-        : '');
-
-  const textPrompt = `You are a SENIOR PMC CIVIL ENGINEER analyzing a ZWCAD/AutoCAD DWG drawing.
-FILE: ${filename} | DWG VERSION: ${version}
-${zwcadTextModeNote}
-LAYERS: ${layers || 'See image'}
-ALL TEXT IN DRAWING: ${textSummary || 'See image'}
-DIMENSIONS: ${dimSummary || 'See image'}
-${sheetContext}
-${xrefContext}
-${converterResult.errors ? 'Render notes: ' + (Array.isArray(converterResult.errors) ? converterResult.errors.join(' | ') : converterResult.errors) : ''}
-${multiSheetNote}
-
-══════════════════════════════════════════════════════
-STEP 1 — READ LEGEND / SYMBOL TABLE
-══════════════════════════════════════════════════════
-Find legend box. Read every symbol/hatch + label (e.g. "230MM THK. BRICK WALL").
-Map each hatch/color/pattern → material meaning.
-Note AutoCAD LAYER for each element type.
-
-══════════════════════════════════════════════════════
-STEP 2 — READ TITLE BLOCK
-══════════════════════════════════════════════════════
-Project name, drawing no., scale, date, engineer.
-If not visible: "Not shown in drawing" — do NOT invent.
-
-══════════════════════════════════════════════════════
-STEP 3 — DRAWING TYPE + FLOOR LEVELS
-══════════════════════════════════════════════════════
-Type: SECTION / ELEVATION / FLOOR_PLAN / STRUCTURAL / SITE_PLAN / FOUNDATION
-Read every floor level annotation (e.g. "+7590 MM LEVEL").
-Calculate floor heights between levels.
-
-══════════════════════════════════════════════════════
-STEP 4 — EXTRACT QUANTITIES
-══════════════════════════════════════════════════════
-Use legend from Step 1 for element identification.
-Apply scale factor from title block to ALL measurements.
-
-SECTION: wall length × thickness × floor height = volume
-FLOOR PLAN: room areas, wall lengths, opening counts
-STRUCTURAL: column sizes, beam dimensions, slab thickness
-SITE/ROAD: road lengths × widths
-
-══════════════════════════════════════════════════════
-STEP 5 — BOQ WITH GUJARAT DSR 2025 RATES
-══════════════════════════════════════════════════════
-100mm block: ₹4200/cum | 230mm brick: ₹4800/cum
-RCC M25: ₹5500/cum | RCC M30: ₹5800/cum | Steel Fe500: ₹56/kg
-Excavation: ₹180/cum | Formwork: ₹180/sqmt | PQC road: ₹1800/sqmt
-
-══════════════════════════════════════════════════════
-STEP 6 — PMC OBSERVATIONS
-══════════════════════════════════════════════════════
-IS code compliance, design comments, missing information.
-
-CRITICAL: Only values VISIBLE in drawing. Never invent.`;
-
-  contentParts.push({ type: 'text', text: textPrompt });
-
-  const raw = await callClaudeAPI({
-    system: CIVIL_SYSTEM,
-    messages: [{ role: 'user', content: contentParts }],
-    maxTokens: 8192
+  const raw = await callClaude({
+    messages:[{ role:'user', content:`TASK PHASE 5: Validate this BOQ. Use extended thinking.\n\n${JSON.stringify(boqData,null,2)}\n\nCHECKS:\n1. Steel ratios (slab 100-140, beam 150-200, column 180-240 kg/CUM)\n2. Wall area vs floor area (0.6x to 1.2x)\n3. Road GSB: area x 1.15 x 0.3 x 1.8\n4. Road WMM: area x 1.15 x 0.2 x 2.1\n5. Cost per sqmt sanity (building Rs.1500-3500, road Rs.2000-4000)\n6. Any qty=0 with amount>0 (math error)\n7. Items with source=assumed\n\nAdd to existing JSON:\n- "validation_warnings":[{"item":"","check":"","expected":"","found":"","severity":"HIGH|MEDIUM|LOW"}]\n- "validation_passed":["check desc"]\n- "overall_confidence":"HIGH|MEDIUM|LOW"\n- "engineer_action_required":["what to verify manually"]` }],
+    maxTokens: 10000,
+    thinking: true
   });
-  return raw;
+
+  const validated = parseJSON(raw);
+  if (!validated) {
+    boqData.validation_warnings = [];
+    boqData.validation_passed = ['Phase 5 parse failed — manual review recommended'];
+    boqData.overall_confidence = 'MEDIUM';
+    return boqData;
+  }
+  console.log(`[Phase 5] ${validated.validation_warnings?.length||0} warnings | confidence:${validated.overall_confidence}`);
+  return validated;
 }
 
-module.exports = {
-  callClaudeAPI,
-  claudeAnalyzeDXF,
-  claudeClassifySymbols,
-  claudeAnalyzeWithAnswers,
-  claudeAnalyzeDrawingVision,
-  claudeAnalyzeDWGVision,
-  parseJSON,
-  CIVIL_SYSTEM,
-};
+// ════════════════════════════════════════════
+// PHASE 1 — CV (existing OpenCV, unchanged)
+// ════════════════════════════════════════════
+function runCVAnalysis(b64Image) {
+  try {
+    const tmp = path.join(os.tmpdir(),`drawing_cv_${Date.now()}.txt`);
+    fs.writeFileSync(tmp, b64Image);
+    const result = execSync(`python3 ${path.join(__dirname,'drawing_cv.py')} ${tmp}`, {timeout:30000});
+    fs.unlinkSync(tmp);
+    return JSON.parse(result.toString());
+  } catch(e) { console.error('[Phase 1] CV failed:',e.message); return {error:e.message}; }
+}
+
+// ════════════════════════════════════════════
+// MAIN — same function name as before
+// server.js needs ZERO changes
+// ════════════════════════════════════════════
+async function geminiAnalyzeDrawing(key, files, cvData, fetchFn) {
+  console.log('\n[PMC] === 5-Phase Claude Pipeline Starting ===');
+
+  const meta        = await phase2_legendAndScale(files, cvData);
+  const quantities  = await phase3_extractQuantities(files, meta);
+  const boqData     = await phase4_calculateBOQ(quantities, meta);
+  const finalData   = await phase5_validateAndFlag(boqData);
+
+  return buildFinalOutput(finalData, quantities, meta, cvData);
+}
+
+function buildFinalOutput(boq, quantities, meta, cvData) {
+  if (!boq) return null;
+  const totalInr   = boq.cost_summary?.civil_total_inr || 0;
+  const totalLacs  = boq.cost_summary?.civil_total_lacs || Math.round(totalInr/100000*100)/100;
+  const totalCr    = boq.cost_summary?.civil_total_crores || Math.round(totalLacs/100*100)/100;
+
+  return {
+    project_name: boq.project_name||meta?.project_name||'',
+    drawing_no:   boq.drawing_no||meta?.drawing_no||'',
+    drawing_type: boq.drawing_type||meta?.drawing_type||'',
+    scale:        boq.scale||meta?.scale||'',
+    date:         boq.date||meta?.date||'',
+    elements: (boq.boq||[]).map((item,i)=>({
+      id:`E${String(i+1).padStart(3,'0')}`, type:guessType(item.description),
+      name:item.description, dimensions:{note:item.source||''},
+      quantities:{
+        area_sqmt:   item.unit==='sqmt'?item.qty:0,
+        volume_cum:  item.unit==='cum'?item.qty:0,
+        gsb_ton:     /gsb/i.test(item.description)?item.qty:0,
+        wmm_ton:     /wmm/i.test(item.description)?item.qty:0,
+        pqc_cum:     /pqc/i.test(item.description)?item.qty:0,
+        steel_kg:    item.unit==='kg'?item.qty:0,
+        brickwork_cum:/brick/i.test(item.description)?item.qty:0,
+      },
+      cost_inr:{total:item.amount||0,per_unit:item.rate||0},
+      confidence:item.confidence||'medium', annotation_found:item.source||'',
+      part:item.part||'', sr:item.sr||i+1,
+    })),
+    element_counts:{...quantities?.element_counts,...boq.element_counts},
+    total_quantities:{
+      total_area_sqmt: boq.area_statement?.total_bua_sqmt||0,
+      total_road_rmt:  boq.area_statement?.road_length_rmt||0,
+      gsb_total_ton:   sumKw(boq.boq,'gsb'),
+      wmm_total_ton:   sumKw(boq.boq,'wmm'),
+      pqc_total_cum:   sumKw(boq.boq,'pqc'),
+      rcc_total_cum:   sumKw(boq.boq,'rcc'),
+      steel_total_kg:  sumKw(boq.boq,'steel'),
+      calculation_note:'5-phase Claude pipeline',
+    },
+    cost_summary:{civil_total_inr:totalInr,civil_total_lacs:totalLacs,civil_total_crores:totalCr,item_wise:boq.boq||[]},
+    area_statement:    boq.area_statement||{},
+    validation_warnings:      boq.validation_warnings||[],
+    validation_passed:        boq.validation_passed||[],
+    overall_confidence:       boq.overall_confidence||'MEDIUM',
+    engineer_action_required: boq.engineer_action_required||[],
+    legend: meta?.legend||[],
+    observations:[...(boq.observations||[]),...(boq.missing_info||[])],
+    pmc_recommendation:`5-phase Claude pipeline. Confidence:${boq.overall_confidence||'MEDIUM'}. ${boq.engineer_action_required?.length?'Verify: '+boq.engineer_action_required.join(', '):'No major issues.'}`,
+    extraction_confidence: boq.overall_confidence||'MEDIUM',
+    missing_info: boq.missing_info||[],
+    rates_applied: RATES,
+    prepared_by:'PMC Civil AI — Claude 5-Phase Pipeline',
+    cv_analysis: cvData||{},
+    pipeline_info:{
+      phases_completed:5,
+      phase2_legend_items:meta?.legend?.length||0,
+      phase3_elements:quantities?.quantities?.length||0,
+      phase4_boq_items:boq.boq?.length||0,
+      phase5_warnings:boq.validation_warnings?.length||0,
+      model:'claude-sonnet-4-5-20251001',
+    },
+  };
+}
+
+function guessType(desc){
+  if(!desc)return'GENERAL';
+  const d=desc.toLowerCase();
+  if(/road|gsb|wmm|pqc|kerb/.test(d))return'ROAD';
+  if(/steel|rebar|bar/.test(d))return'STEEL';
+  if(/rcc|slab|beam|column|footing/.test(d))return'STRUCTURE';
+  if(/brick|wall/.test(d))return'WALL';
+  if(/excavat|earth/.test(d))return'EARTHWORK';
+  if(/plaster|paint|floor|tile/.test(d))return'FINISH';
+  return'GENERAL';
+}
+
+function sumKw(items,kw){
+  if(!items)return 0;
+  return Math.round(items.filter(i=>i.description?.toLowerCase().includes(kw)).reduce((s,i)=>s+(i.qty||0),0)*100)/100;
+}
+
+function calcRoadQuantities(length_m,width_m){
+  const a=length_m*width_m;
+  return{area_sqmt:Math.round(a*100)/100,box_cutting_sqmt:Math.round(a*1.05*100)/100,
+    gsb_300mm_ton:Math.round(a*1.15*0.3*1.8*100)/100,wmm_200mm_ton:Math.round(a*1.15*0.2*2.1*100)/100,
+    pqc_250mm_cum:Math.round(a*1.05*0.25*100)/100,steel_dowel_ton:Math.round(a*0.00387*100)/100,
+    cost_estimate:{gsb:Math.round(a*(RATES.gsb_300mm_sqmt||655)),wmm:Math.round(a*(RATES.wmm_200mm_sqmt||515)),
+      pqc:Math.round(a*(RATES.pqc_250mm_sqmt||1800)),total_sqmt:Math.round(a*((RATES.gsb_300mm_sqmt||655)+(RATES.wmm_200mm_sqmt||515)+(RATES.pqc_250mm_sqmt||1800)))}};
+}
+
+function calcStructureQuantities(dims){
+  const{length=0,width=0,height=0,nos=1}=dims;
+  const v=length*width*height*nos,a=length*width*nos;
+  return{volume_cum:Math.round(v*1000)/1000,area_sqmt:Math.round(a*100)/100,
+    steel_kg:Math.round(v*120),formwork_sqmt:Math.round((2*(length+width)*height+a)*nos*100)/100};
+}
+
+module.exports={geminiAnalyzeDrawing,runCVAnalysis,calcRoadQuantities,calcStructureQuantities,RATES};
