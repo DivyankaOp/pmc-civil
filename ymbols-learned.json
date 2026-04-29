@@ -1,5 +1,34 @@
 {
-  "_comment": "Auto-learned symbol dictionary. User answers save here. Never delete — system learns over time.",
+  "_comment": "Auto-learned symbol dictionary. User answers save here. Never delete \u2014 system learns over time.",
   "blocks": {},
-  "layers": {}
+  "layers": {},
+  "quantity_corrections": [],
+  "scale_corrections": [],
+  "validation_rules": [
+    {
+      "rule": "steel_per_rcc_slab",
+      "min_kg_per_cum": 100,
+      "max_kg_per_cum": 140
+    },
+    {
+      "rule": "steel_per_rcc_beam",
+      "min_kg_per_cum": 150,
+      "max_kg_per_cum": 200
+    },
+    {
+      "rule": "steel_per_column",
+      "min_kg_per_cum": 180,
+      "max_kg_per_cum": 240
+    },
+    {
+      "rule": "road_cost_per_sqmt",
+      "min": 2000,
+      "max": 4000
+    },
+    {
+      "rule": "building_cost_per_sqmt",
+      "min": 1500,
+      "max": 3500
+    }
+  ]
 }
