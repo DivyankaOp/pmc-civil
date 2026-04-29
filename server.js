@@ -65,6 +65,23 @@ print(json.dumps(tiles))
   }
 }
 
+// ─── DIRECT CLAUDE CHAT ROUTE (no Gemini wrapper) ────────────────
+app.post('/claude', async (req, res) => {
+  try {
+    if (!process.env.CLAUDE_API_KEY) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
+    const { system, messages, max_tokens } = req.body;
+    if (!messages?.length) return res.status(400).json({ error: 'No messages.' });
+    const systemToUse = (system && system.trim().length > 50) ? system : CIVIL_SYSTEM;
+    const raw = await callClaudeAPI({ system: systemToUse, messages, maxTokens: max_tokens || 8192 });
+    try { learnRatesFromMarkdown(raw, { filename: 'chat', drawing_type: 'GENERAL' }); } catch(e) {}
+    // Return Claude native format
+    return res.json({ content: [{ type: 'text', text: raw }] });
+  } catch (e) {
+    console.error('[/claude]', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/gemini', async (req, res) => {
   // ✅ FULLY CONVERTED TO CLAUDE — handles chat, PDF, images
   try {
