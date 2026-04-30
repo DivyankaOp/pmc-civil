@@ -631,19 +631,34 @@ app.post('/export-dxf-excel', async (req, res) => {
     let geminiResult = {};
     try {
       const rSummary = getRatesSummary({ maxItems: 40 });
-      const specLines = (civilData.material_spec_texts || []).map(m => m.text).slice(0, 50);
-      const prompt = `PMC civil engineer. Analyze DXF. Use ONLY data below, no invented values.
-FILE:${filename} DECLARED_TYPE:${civilData.drawing_type} INFERRED_SHEET_KIND:${civilData.inferred_sheet_kind || '?'} SCALE:${civilData.scale || '?'}
-PARSER_NOTES:${(civilData.extraction_notes || []).join(' | ')}
-TEXTS:${civilData.all_texts.slice(0, 120).join(' | ')}
-MATERIAL_SPECS_FROM_TEXT:${specLines.join(' | ')}
-DIMS:${civilData.dimension_values.slice(0, 40).map(d => (d.count > 1 ? d.value_m + 'm×' + d.count : d.value_m + 'm') + '[' + d.layer + ']').join(', ')}
-AREAS:${civilData.polyline_areas.slice(0, 20).map(p => p.area_sqm + 'sqm(' + p.layer + ')').join(', ')}
+      const specLines = (civilData.material_spec_texts || []).map(m => m.text).slice(0, 60);
+      // FIX: include scale_factor and wall_by_thickness so Claude uses real-world values
+      const wallSummary = Object.entries(civilData.wall_by_thickness || {})
+        .map(([thk, d]) => `${thk}: ${d.sqm}sqm (${d.count} polylines)`).join(', ');
+      const prompt = `PMC civil engineer. Analyze DXF. Use ONLY data below — no invented dimensions or quantities.
+FILE:${filename}
+DRAWING_TYPE:${civilData.drawing_type}
+SCALE:${civilData.scale || 'not detected'} (scale_factor=${civilData.scale_factor || 1})
+NOTE: All areas and dimensions below are ALREADY converted to real-world values using the scale factor.
+TEXTS (first 150):${civilData.all_texts.slice(0, 150).join(' | ')}
+MATERIAL_SPECS:${specLines.join(' | ')}
+DIMENSIONS (real-world):${(civilData.dimension_values || []).slice(0, 50).map(d => d.value_m + 'm[' + d.layer + ']' + (d.dimtext ? '(' + d.dimtext + ')' : '')).join(', ')}
+WALL_AREAS_BY_THICKNESS:${wallSummary || 'none'}
+POLYLINE_AREAS (largest first):${(civilData.polyline_areas || []).slice(0, 30).map(p => p.area_sqm + 'sqm(' + p.layer + ')').join(', ')}
 BLOCK_COUNTS:${Object.entries(civilData.block_counts || {}).slice(0, 40).map(([k, v]) => k + ':' + v).join(', ')}
 ELEMENT_COUNTS:${JSON.stringify(civilData.element_counts || {})}
-LAYERS:${civilData.layer_names.join(', ')}
+FLOOR_LEVELS:${(civilData.floor_levels || []).map(f => f.label).join(' | ')}
+FLOOR_HEIGHTS:${(civilData.floor_heights || []).map(f => f.name + ':' + f.height_m + 'm').join(' | ')}
+HATCH_SUMMARY:${(civilData.hatch_summary || []).slice(0, 20).map(h => h.pattern_name + ':' + h.count + '(' + h.material + ')').join(', ')}
+LAYERS:${(civilData.layer_names || []).join(', ')}
 RATES:${rSummary}
-Return ONLY JSON:{"project_name":"","drawing_type":"FLOOR_PLAN|BASEMENT|PARKING|LIFT_SHAFT|STAIRCASE|STRUCTURAL_SECTION|FOUNDATION|SITE_LAYOUT|ROAD_PLAN|MEP_PLUMBING|MEP_ELECTRICAL|MEP_HVAC|ELEVATION|DETAIL_DRAWING|SECTION_ELEVATION|GENERAL","scale":"","spaces":[],"boq":[{"description":"","unit":"","qty":0,"rate":0,"amount":0}],"observations":[],"pmc_recommendation":"Explain what you used from TEXT vs block symbols vs dimensions; if section/elevation, avoid treating polyline areas as room BUA."}`;
+RULES:
+1. Read column/footing sizes ONLY from schedule table texts — never invent 400x400 or 500x500.
+2. Read steel bars ONLY as printed — never invent 12-20phi or 16-25phi.
+3. Column schedule and footing schedule are SEPARATE — never mix them.
+4. Use qty from schedule qty column only — never guess from plan view.
+5. Unreadable cell → write "not legible". Never guess.
+Return ONLY JSON:{"project_name":"","drawing_type":"FLOOR_PLAN|BASEMENT|PARKING|LIFT_SHAFT|STAIRCASE|STRUCTURAL_SECTION|FOUNDATION|SITE_LAYOUT|ROAD_PLAN|MEP_PLUMBING|MEP_ELECTRICAL|MEP_HVAC|ELEVATION|DETAIL_DRAWING|SECTION_ELEVATION|GENERAL","scale":"","spaces":[],"boq":[{"description":"","unit":"","qty":0,"rate":0,"amount":0,"source":"drawing-schedule|calculated|assumed","confidence":"high|medium|low"}],"observations":[],"pmc_recommendation":""}`;
 
       geminiResult = await claudeAnalyzeDXF(civilData, filename, rSummary);
       console.log('[DXF-Excel] Claude analysis done:', geminiResult.drawing_type);
@@ -669,17 +684,20 @@ app.post('/drawing-to-excel', async (req, res) => {
     if (!process.env.CLAUDE_API_KEY) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
     const { files, userText, aiResponse } = req.body;
 
-    // ✅ FIX: Claude Vision replaces Gemini for drawing-to-excel
+    // FIX BUG-1: claudeAnalyzeDrawingVision() already returns a parsed JS object
+    // (parseJSON is called internally). Never call .replace() on the result.
     let drawingData = {};
     try {
-      const rawAnalysis = await claudeAnalyzeDrawingVision(files, userText, aiResponse);
-      const cleaned = rawAnalysis.replace(/```json|```/g, '').trim();
-      const fb2 = cleaned.indexOf('{'), lb2 = cleaned.lastIndexOf('}');
-      if (fb2 !== -1) {
-        try { drawingData = JSON.parse(cleaned.slice(fb2, lb2+1)); } catch(e2) {}
+      const analysisResult = await claudeAnalyzeDrawingVision(files, userText, aiResponse);
+      if (analysisResult && typeof analysisResult === 'object') {
+        drawingData = analysisResult;
+      } else if (typeof analysisResult === 'string') {
+        // Defensive: if somehow a string comes back, parse it
+        const clean = analysisResult.replace(/```json|```/g, '').trim();
+        const fb2 = clean.indexOf('{'), lb2 = clean.lastIndexOf('}');
+        if (fb2 !== -1) { try { drawingData = JSON.parse(clean.slice(fb2, lb2+1)); } catch(e2) {} }
       }
-      if (!drawingData.project_name) drawingData.raw_analysis = rawAnalysis;
-      console.log('[drawing-to-excel] Claude done');
+      console.log('[drawing-to-excel] Claude done | type:', drawingData.drawing_type || '?', '| boq items:', drawingData.boq?.length || 0);
     } catch(e) { console.log('Claude drawing-to-excel fail:', e.message); }
 
     // Build Excel
