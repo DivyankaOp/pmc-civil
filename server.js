@@ -184,7 +184,7 @@ doc = fitz.open('${pdfPath}')
 tiles = []
 for page_num in range(min(len(doc), 2)):
     page = doc[page_num]
-    mat = fitz.Matrix(3.0, 3.0)  # 300 DPI — needed for rotated text, small dims in schedule tables
+    mat = fitz.Matrix(8.0, 8.0)  # 800 DPI — high-res for schedule table legibility
     pix = page.get_pixmap(matrix=mat)
     tiles.append(base64.b64encode(pix.tobytes('png')).decode())
 doc.close()
@@ -192,7 +192,7 @@ print(json.dumps(tiles))
 `.trim();
     const scriptPath = tmpDir + '/convert.py';
     fs.writeFileSync(scriptPath, script);
-    const out = execSync(`python3 "${scriptPath}"`, { timeout: 60000, maxBuffer: 50 * 1024 * 1024 });
+    const out = execSync(`python3 "${scriptPath}"`, { timeout: 120000, maxBuffer: 200 * 1024 * 1024 });
     return JSON.parse(out.toString());
   } catch(e) {
     console.error('PDF tile error:', e.message);
@@ -220,9 +220,17 @@ app.post('/claude', async (req, res) => {
           // Step 1: Try vector extraction
           const extracted = await extractPdfText(pdfB64);
           if (extracted?.is_vector) {
-            // Vector PDF — Claude reads natively, keep as document
-            console.log('[/claude] Vector PDF detected — sending as document');
+            // Vector PDF — Claude reads natively, keep as document + render PNG for schedules
+            console.log('[/claude] Vector PDF — sending as document + 800 DPI PNG tiles for schedule legibility');
             newParts.push(part);
+            // CRITICAL FIX: Also render high-res PNG tiles so schedule tables are always visually legible
+            const pngTilesVec = await pdfToImageTiles(pdfB64, 2);
+            if (pngTilesVec?.length) {
+              for (const tile of pngTilesVec) {
+                newParts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
+              }
+              console.log('[/claude] Vector PDF → ' + pngTilesVec.length + ' high-res PNG tiles sent for schedule reading');
+            }
           } else {
             // Scanned PDF — convert to PNG tiles so Claude SEES it
             console.log('[/claude] Scanned PDF detected — converting to PNG tiles');
@@ -733,7 +741,22 @@ app.post('/export-drawing', async (req, res) => {
         const allTexts = extracted.pages.flatMap(p => p.texts || []);
         cvData.pdf_extracted_texts = allTexts;
         cvData.pdf_is_vector = true;
-        console.log(`[PDF] Vector PDF detected — extracted ${allTexts.length} texts (no image tokens used)`);
+        console.log(`[PDF] Vector PDF detected — extracted ${allTexts.length} texts`);
+        // CRITICAL FIX: Also render 800 DPI PNG tiles for visual schedule table reading
+        // Vector text extraction alone misses schedule tables with complex cell layouts
+        try {
+          const pngTilesVec = await pdfToImageTiles(pdfFiles[0].b64, 2);
+          if (pngTilesVec?.length) {
+            const pdfIdx = files.findIndex(f => f.type === 'application/pdf' || f.name?.match(/\.pdf$/i));
+            if (pdfIdx >= 0) files.splice(pdfIdx, 1);
+            pngTilesVec.forEach((tile, i) => {
+              files.push({ type: 'image/png', b64: tile, name: `vector_page_${i+1}.png` });
+            });
+            console.log(`[PDF] Vector PDF → ${pngTilesVec.length} high-res PNG tiles added for schedule reading`);
+          }
+        } catch(e) {
+          console.warn('[PDF→PNG vector] Conversion failed, using text extraction only:', e.message);
+        }
       } else {
         // Scanned PDF: use Google Cloud Vision API (table-aware) — do NOT send image to Claude
         console.log('[PDF] Scanned PDF detected — attempting Google Cloud Vision table extraction');
