@@ -67,6 +67,89 @@ print(json.dumps({"pages": pages, "is_vector": any(len(p["texts"])>10 for p in p
   }
 }
 
+// ── SCANNED PDF → Google Cloud Vision (table-aware OCR) ──────────
+// Uses GCV Document AI / Vision API to detect cells, rows, columns.
+// Returns structured JSON that Claude can use to calculate BOQ — we do NOT
+// send the raw image to Claude directly (too many tokens, no table structure).
+// Cost: ~$1.50 per 1000 pages — effectively free for typical usage.
+async function extractScannedPdfWithGCV(pdfBase64) {
+  const gcvKey = process.env.GOOGLE_CLOUD_VISION_API_KEY;
+  if (!gcvKey) {
+    console.warn('[GCV] GOOGLE_CLOUD_VISION_API_KEY not set — falling back to Claude vision');
+    return null;
+  }
+  try {
+    // GCV Document Text Detection supports inline PDF (up to 5 pages, max 20MB)
+    const gcvUrl = `https://vision.googleapis.com/v1/files:annotate?key=${gcvKey}`;
+    const gcvBody = {
+      requests: [{
+        inputConfig: { content: pdfBase64, mimeType: 'application/pdf' },
+        features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
+        pages: [1, 2, 3, 4, 5]  // up to 5 pages
+      }]
+    };
+    const gcvRes = await fetch(gcvUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(gcvBody),
+      signal: AbortSignal.timeout(60000)
+    });
+    if (!gcvRes.ok) {
+      const errBody = await gcvRes.text();
+      console.error('[GCV] API error:', gcvRes.status, errBody.slice(0, 300));
+      return null;
+    }
+    const gcvData = await gcvRes.json();
+    const responses = gcvData.responses || [];
+
+    // Extract structured table data from GCV blocks/paragraphs/words
+    const pages = [];
+    for (const resp of responses) {
+      for (const pageAnnot of (resp.fullTextAnnotation?.pages || [])) {
+        const rows = [];
+        for (const block of (pageAnnot.blocks || [])) {
+          for (const para of (block.paragraphs || [])) {
+            const cellText = (para.words || [])
+              .map(w => (w.symbols || []).map(s => s.text).join(''))
+              .join(' ')
+              .trim();
+            if (cellText) {
+              const verts = para.boundingBox?.vertices || [];
+              rows.push({
+                text: cellText,
+                x: verts[0]?.x || 0,
+                y: verts[0]?.y || 0,
+                width:  Math.abs((verts[1]?.x || 0) - (verts[0]?.x || 0)),
+                height: Math.abs((verts[3]?.y || 0) - (verts[0]?.y || 0))
+              });
+            }
+          }
+        }
+        // Group rows by Y-position to reconstruct table rows
+        rows.sort((a, b) => a.y - b.y || a.x - b.x);
+        const tableRows = [];
+        let currentRowY = -1, currentRow = [];
+        for (const cell of rows) {
+          if (Math.abs(cell.y - currentRowY) > 15) {
+            if (currentRow.length) tableRows.push(currentRow.map(c => c.text));
+            currentRow = [cell];
+            currentRowY = cell.y;
+          } else {
+            currentRow.push(cell);
+          }
+        }
+        if (currentRow.length) tableRows.push(currentRow.map(c => c.text));
+        pages.push({ table_rows: tableRows, raw_text: resp.fullTextAnnotation?.text || '' });
+      }
+    }
+    console.log(`[GCV] Scanned PDF: extracted ${pages.length} pages with table structure`);
+    return { pages, is_gcv: true };
+  } catch (e) {
+    console.error('[GCV] Error:', e.message);
+    return null;
+  }
+}
+
 // Keep pdfToImageTiles as fallback for scanned PDFs only
 async function pdfToImageTiles(pdfBase64, tilesPerPage = 4) {
   const { execSync } = require('child_process');
@@ -566,8 +649,18 @@ app.post('/export-drawing', async (req, res) => {
         cvData.pdf_is_vector = true;
         console.log(`[PDF] Vector PDF detected — extracted ${allTexts.length} texts (no image tokens used)`);
       } else {
-        // Scanned PDF: will use Claude vision (image path)
-        console.log('[PDF] Scanned PDF — using Claude vision');
+        // Scanned PDF: use Google Cloud Vision API (table-aware) — do NOT send image to Claude
+        console.log('[PDF] Scanned PDF detected — attempting Google Cloud Vision table extraction');
+        const gcvResult = await extractScannedPdfWithGCV(pdfFiles[0].b64);
+        if (gcvResult?.pages?.length) {
+          cvData.gcv_table_pages = gcvResult.pages;
+          cvData.pdf_is_gcv = true;
+          console.log(`[PDF] GCV table extraction OK — ${gcvResult.pages.length} pages structured`);
+        } else {
+          // GCV unavailable/failed: fall back to Claude vision (last resort)
+          console.log('[PDF] GCV unavailable — falling back to Claude vision');
+          cvData.pdf_scanned_fallback = true;
+        }
       }
     }
 
@@ -940,7 +1033,7 @@ app.post('/analyze-dwg', async (req, res) => {
     let converterResult = {};
 
     if (ext === 'dwf') {
-      // DWF is a compressed vector/image bundle. Try LibreOffice → PNG.
+      // DWF support is weak industry-wide. Try LibreOffice first; if it fails, tell user to re-export.
       try {
         const soffice = process.platform === 'win32'
           ? '"C:\\Program Files\\LibreOffice\\program\\soffice.exe"'
@@ -952,10 +1045,26 @@ app.post('/analyze-dwg', async (req, res) => {
         if (fs.existsSync(libreOut)) {
           converterResult = { success: true, png_path: libreOut, texts: [], dimensions: [], layers: [], drawing_type: 'DWF_RENDER' };
         } else {
-          converterResult = { success: false, error: 'LibreOffice did not produce PNG from DWF' };
+          converterResult = {
+            success: false,
+            needsPdfOrDxf: true,
+            error: 'DWF format is not supported by this system. ' +
+              'Please re-export your drawing from ZWCAD or AutoCAD as PDF or DXF:\n' +
+              '  ZWCAD: File → Export → PDF  (or File → Save As → DXF 2018)\n' +
+              '  AutoCAD: File → Export → PDF (or SaveAs → DXF 2018)\n' +
+              'Then re-upload the PDF or DXF file.'
+          };
         }
       } catch (e) {
-        converterResult = { success: false, error: `DWF conversion failed: ${e.message}. Gemini Vision will still attempt analysis if a PNG thumbnail is embedded.` };
+        converterResult = {
+          success: false,
+          needsPdfOrDxf: true,
+          error: 'DWF format could not be converted (LibreOffice is not available or failed). ' +
+            'Please re-export your drawing as PDF or DXF:\n' +
+            '  ZWCAD: File → Export → PDF  (or File → Save As → DXF 2018)\n' +
+            '  AutoCAD: File → Export → PDF (or SaveAs → DXF 2018)\n' +
+            'Then re-upload the PDF or DXF file.'
+        };
       }
     } else {
       try {
@@ -968,8 +1077,28 @@ app.post('/analyze-dwg', async (req, res) => {
         );
         converterResult = JSON.parse(out.toString());
       } catch (e) {
-        converterResult = { success: false, error: e.message };
+        const isDwg = ext === 'dwg';
+        const userMsg = isDwg
+          ? `DWG file could not be converted using ezdxf. ` +
+            `Please open the file in ZWCAD or AutoCAD and re-save as DXF:\n` +
+            `  ZWCAD: File → Save As → File type: "AutoCAD 2018 DXF (*.dxf)"\n` +
+            `  AutoCAD: File → Save As → DXF 2018\n` +
+            `Then re-upload the saved .dxf file.`
+          : `DXF conversion failed: ${e.message}`;
+        converterResult = { success: false, error: userMsg, needsDxfExport: isDwg };
       }
+    }
+
+    // ── Early exit: if conversion failed AND no PNG was produced, return clear error to user ──
+    if (!converterResult.success && !converterResult.png_path) {
+      try { fs.unlinkSync(tmpIn); } catch(e) {}
+      return res.status(422).json({
+        success: false,
+        error: converterResult.error || 'File could not be converted.',
+        needsDxfExport: !!converterResult.needsDxfExport,
+        needsPdfOrDxf:  !!converterResult.needsPdfOrDxf,
+        converter: converterResult
+      });
     }
 
     // DWF or any path that has PNG but no tiles yet: split with helper script
