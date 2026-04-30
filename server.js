@@ -189,9 +189,51 @@ app.post('/claude', async (req, res) => {
     const { system, messages, max_tokens } = req.body;
     if (!messages?.length) return res.status(400).json({ error: 'No messages.' });
     const systemToUse = (system && system.trim().length > 50) ? system : CIVIL_SYSTEM;
-    const raw = await callClaudeAPI({ system: systemToUse, messages, maxTokens: max_tokens || 8192 });
+
+    // ── SCANNED PDF FIX: Process each message's content parts ──
+    const processedMessages = [];
+    for (const msg of messages) {
+      if (!Array.isArray(msg.content)) { processedMessages.push(msg); continue; }
+      const newParts = [];
+      for (const part of msg.content) {
+        if (part.type === 'document' && part.source?.media_type === 'application/pdf') {
+          const pdfB64 = part.source.data;
+          // Step 1: Try vector extraction
+          const extracted = await extractPdfText(pdfB64);
+          if (extracted?.is_vector) {
+            // Vector PDF — Claude reads natively, keep as document
+            console.log('[/claude] Vector PDF detected — sending as document');
+            newParts.push(part);
+          } else {
+            // Scanned PDF — convert to PNG tiles so Claude SEES it
+            console.log('[/claude] Scanned PDF detected — converting to PNG tiles');
+            // Try GCV first
+            const gcvResult = await extractScannedPdfWithGCV(pdfB64);
+            if (gcvResult?.pages?.length) {
+              const gcvText = gcvResult.pages.map(p => p.raw_text).join('\n');
+              newParts.push({ type: 'text', text: `[GCV OCR extracted text from scanned PDF]:\n${gcvText}` });
+            }
+            // Always also convert to PNG for visual reading
+            const pngTiles = await pdfToImageTiles(pdfB64, 2);
+            if (pngTiles?.length) {
+              for (const tile of pngTiles) {
+                newParts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
+              }
+              console.log(`[/claude] Scanned PDF → ${pngTiles.length} PNG tiles sent to Claude`);
+            } else {
+              // Fallback: send as document anyway
+              newParts.push(part);
+            }
+          }
+        } else {
+          newParts.push(part);
+        }
+      }
+      processedMessages.push({ ...msg, content: newParts });
+    }
+
+    const raw = await callClaudeAPI({ system: systemToUse, messages: processedMessages, maxTokens: max_tokens || 8192 });
     try { learnRatesFromMarkdown(raw, { filename: 'chat', drawing_type: 'GENERAL' }); } catch(e) {}
-    // Return Claude native format
     return res.json({ content: [{ type: 'text', text: raw }] });
   } catch (e) {
     console.error('[/claude]', e.message);
@@ -221,8 +263,27 @@ app.post('/gemini', async (req, res) => {
         } else if (part.inline_data) {
           const mt = part.inline_data.mime_type;
           if (mt === 'application/pdf') {
-            // Claude reads PDF natively — no need to tile
-            claudeParts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: part.inline_data.data } });
+            const pdfB64 = part.inline_data.data;
+            const extracted = await extractPdfText(pdfB64);
+            if (extracted?.is_vector) {
+              console.log('[/gemini] Vector PDF — sending as document');
+              claudeParts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
+            } else {
+              console.log('[/gemini] Scanned PDF — converting to PNG tiles');
+              const gcvResult = await extractScannedPdfWithGCV(pdfB64);
+              if (gcvResult?.pages?.length) {
+                const gcvText = gcvResult.pages.map(p => p.raw_text).join('\n');
+                claudeParts.push({ type: 'text', text: `[OCR extracted text from scanned PDF]:\n${gcvText}` });
+              }
+              const pngTiles = await pdfToImageTiles(pdfB64, 2);
+              if (pngTiles?.length) {
+                for (const tile of pngTiles) {
+                  claudeParts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
+                }
+              } else {
+                claudeParts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
+              }
+            }
           } else if (mt?.startsWith('image/')) {
             claudeParts.push({ type: 'image', source: { type: 'base64', media_type: mt, data: part.inline_data.data } });
           }
