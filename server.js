@@ -165,7 +165,7 @@ doc = fitz.open('${pdfPath}')
 tiles = []
 for page_num in range(min(len(doc), 2)):
     page = doc[page_num]
-    mat = fitz.Matrix(2.0, 2.0)
+    mat = fitz.Matrix(3.0, 3.0)  # 300 DPI — needed for rotated text, small dims in schedule tables
     pix = page.get_pixmap(matrix=mat)
     tiles.append(base64.b64encode(pix.tobytes('png')).decode())
 doc.close()
@@ -705,10 +705,40 @@ Return ONLY valid JSON, no markdown:
           cvData.gcv_raw_text = gcvResult.pages.map(p => p.raw_text).join('\n');
           cvData.pdf_is_gcv = true;
           console.log(`[PDF] GCV table extraction OK — ${gcvResult.pages.length} pages structured`);
+
+          // ── KEY FIX: Convert scanned PDF → 300 DPI PNG so Claude SEES the drawing visually ──
+          // Raw scanned PDF as 'document' fails — Claude finds no text, assumes values.
+          // High-res PNG lets Claude read rotated text, overlapping dims, schedule tables.
+          try {
+            const pngTiles = await pdfToImageTiles(pdfFiles[0].b64, 2);
+            if (pngTiles?.length) {
+              const pdfIdx = files.findIndex(f => f.type === 'application/pdf' || f.name?.match(/\.pdf$/i));
+              if (pdfIdx >= 0) files.splice(pdfIdx, 1);
+              pngTiles.forEach((tile, i) => {
+                files.push({ type: 'image/png', b64: tile, name: `scanned_page_${i+1}.png` });
+              });
+              console.log(`[PDF] Scanned PDF → ${pngTiles.length} PNG tiles for Claude vision`);
+            }
+          } catch(e) {
+            console.warn('[PDF→PNG] Conversion failed, PDF stays as document:', e.message);
+          }
         } else {
-          // GCV unavailable/failed: fall back to Claude vision (last resort)
-          console.log('[PDF] GCV unavailable — falling back to Claude vision');
+          // GCV unavailable: still convert PDF to PNG for Claude vision
+          console.log('[PDF] GCV unavailable — converting scanned PDF to PNG for Claude vision');
           cvData.pdf_scanned_fallback = true;
+          try {
+            const pngTiles = await pdfToImageTiles(pdfFiles[0].b64, 2);
+            if (pngTiles?.length) {
+              const pdfIdx = files.findIndex(f => f.type === 'application/pdf' || f.name?.match(/\.pdf$/i));
+              if (pdfIdx >= 0) files.splice(pdfIdx, 1);
+              pngTiles.forEach((tile, i) => {
+                files.push({ type: 'image/png', b64: tile, name: `scanned_page_${i+1}.png` });
+              });
+              console.log(`[PDF] Fallback: Scanned PDF → ${pngTiles.length} PNG tiles`);
+            }
+          } catch(e) {
+            console.warn('[PDF→PNG fallback] Failed:', e.message);
+          }
         }
       }
     }
