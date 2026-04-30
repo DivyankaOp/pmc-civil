@@ -466,7 +466,7 @@ function onFiles(e){
       rd.readAsText(f);
     }
     else if(name.match(/\.(xlsx|xls)$/)){
-      // Read as base64 — send to Gemini as document
+      // Read as base64 — send to Claude as document
       const rd=new FileReader();
       rd.onload=ev=>{
         files.push({name:f.name,type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',b64:ev.target.result.split(',')[1],isExcel:true});
@@ -492,7 +492,7 @@ function onFiles(e){
       };
       rd.readAsText(f);
     }
-    // ── Images + PDF: base64 for Gemini vision
+    // ── Images + PDF: base64 for Claude vision
     else {
       const rd=new FileReader();
       rd.onload=ev=>{files.push({name:f.name,type:f.type,b64:ev.target.result.split(',')[1]});renderChips();};
@@ -821,13 +821,18 @@ async function send(){
     if(f.type?.startsWith('image/')){
       parts.push({inline_data:{mime_type:f.type,data:f.b64}});
     }
-    // PDF — Gemini reads natively
+    // PDF — Claude reads natively
     else if(f.type==='application/pdf'||f.name?.match(/\.pdf$/i)){
       parts.push({inline_data:{mime_type:'application/pdf',data:f.b64}});
     }
-    // DWG — send extracted ASCII text as context
+    // FIX BUG-3: DWG files MUST be routed via /analyze-dwg (server converts to PNG tiles
+    // then Claude sees the actual drawing image). Sending raw DWG binary text to Claude
+    // is useless — the text contains no readable drawing data.
+    // The hasDWG early-return at the top of this function handles pure-DWG uploads.
+    // If a DWG is mixed with other files, skip it here — the user should upload DWG alone.
     else if(f.isDWG){
-      textExtras.push(`\n\n=== AutoCAD DWG FILE: ${f.name} ===\n${f.hint}\nExtracted readable text from DWG binary:\n${f.dwgText||'(no readable text found)'}\n\nAnalyze this as a civil drawing. Extract any dimensions, room names, layer names, coordinates, and annotations visible in the text above. Apply Gujarat DSR 2025 rates to calculate quantities and costs.`);
+      // Skip DWG in generic text path — it cannot be read as text
+      console.warn('[Chat] DWG file skipped in generic send — upload DWG alone to use /analyze-dwg route');
     }
     // Excel/Word — base64, Gemini treats as document
     else if(f.isExcel){
