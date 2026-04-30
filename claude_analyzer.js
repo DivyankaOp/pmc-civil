@@ -101,7 +101,7 @@ async function callClaude({ messages, maxTokens = 8192, thinking = false }) {
   const key = process.env.CLAUDE_API_KEY;
   if (!key) throw new Error('CLAUDE_API_KEY not set');
   const body = {
-    model: 'claude-sonnet-4-5', max_tokens: thinking ? 16000 : maxTokens,
+    model: 'claude-sonnet-4-6', max_tokens: thinking ? 16000 : maxTokens,
     system: SYSTEM_PROMPT, messages,
   };
   if (thinking) body.thinking = { type: 'enabled', budget_tokens: 8000 };
@@ -153,7 +153,7 @@ async function phase2_legendAndScale(files, cvData) {
   const raw = await callClaude({
     messages:[{ role:'user', content:[
       ...imgParts,
-      { type:'text', text:`${cv}\n${kb}\n\nTASK PHASE 2: Read ONLY legend/symbol table and title block. No BOQ yet.\nReturn JSON:\n{"drawing_type":"","project_name":"","drawing_no":"","date":"","scale":"1:100","scale_factor":100,"north_direction":"","legend":[{"symbol":"","meaning":"","layer":""}],"floors_visible":[],"title_block_confidence":"HIGH|MEDIUM|LOW","legend_confidence":"HIGH|MEDIUM|LOW","notes":[]}` }
+      { type:'text', text:`${cv}\n${kb}\n\nTASK PHASE 2: Read ONLY the legend/symbol table and title block. No quantities yet.\n\nCRITICAL RULES:\n1. Scale: read EXACTLY from title block (e.g. 1:100, 1:200). If not visible write null.\n2. Scale_factor: numeric part only (100 for 1:100). ALL dimensions sent to Phase 3 will be raw drawing units — Phase 3 multiplies by this factor.\n3. North direction: read compass or north arrow if present.\n4. Legend: read EVERY symbol in the legend table — hatch pattern name, its meaning, and the layer name printed next to it.\n5. If title block confidence is LOW, set scale to null so Phase 3 marks confidence LOW.\n\nReturn JSON:\n{"drawing_type":"","project_name":"","drawing_no":"","date":"","scale":"1:100","scale_factor":100,"north_direction":"","legend":[{"symbol":"","meaning":"","layer":"","hatch_pattern":""}],"annotation_layers":[],"floors_visible":[],"title_block_confidence":"HIGH|MEDIUM|LOW","legend_confidence":"HIGH|MEDIUM|LOW","schedule_tables_visible":["column_schedule","footing_schedule","door_schedule","window_schedule"],"notes":[]}` }
     ]}],
     maxTokens: 2048
   });
@@ -179,7 +179,7 @@ async function phase3_extractQuantities(files, meta) {
   const raw = await callClaude({
     messages:[{ role:'user', content:[
       ...imgParts,
-      { type:'text', text:`${legendCtx}\n${scaleCtx}\nDrawing type:${meta?.drawing_type||'unknown'}\n\nTASK PHASE 3: Extract ALL quantities visible in drawing.\nReturn JSON:\n{"quantities":[{"element":"","floor":"","length_m":0,"width_m":0,"height_m":0,"thickness_m":0,"nos":1,"area_sqmt":0,"volume_cum":0,"unit":"","annotation_text":"","source":"drawing|calculated|assumed","confidence":"high|medium|low"}],"element_counts":{"door_count":0,"window_count":0,"column_count":0,"footing_count":0,"staircase_count":0,"lift_count":0,"bedroom_count":0,"toilet_count":0,"kitchen_count":0,"floor_count":0},"road_data":{"roads":[{"name":"","length_rmt":0,"total_width_m":0,"carriage_width_m":0}]},"total_built_area_sqmt":0,"observations":[]}` }
+      { type:'text', text:`${legendCtx}\n${scaleCtx}\nDrawing type:${meta?.drawing_type||'unknown'}\nNorth direction:${meta?.north_direction||'not specified'}\nAnnotation layers (ignore for quantities):${JSON.stringify(meta?.annotation_layers||[])}\n\nCRITICAL QUANTITY READING RULES:\n1. Apply scale_factor=${meta?.scale_factor||1} to ALL raw dimensions before recording length_m/width_m/height_m.\n2. Count elements by counting symbols in the legend (from Phase 2) — NOT by guessing from drawing appearance.\n3. Read annotation texts EXACTLY as printed — do NOT add, remove, or change any digit.\n4. For schedule tables (column/footing/door/window): copy cell values EXACTLY. If unreadable → write "not legible".\n5. Distinguish what is drawn in THIS sheet vs referenced from another sheet.\n6. Mark source: "drawing" if directly read, "calculated" if derived, "assumed" if guessed.\n\nTASK PHASE 3: Extract ALL quantities visible in drawing.\nReturn JSON:\n{"quantities":[{"element":"","floor":"","length_m":0,"width_m":0,"height_m":0,"thickness_m":0,"nos":1,"area_sqmt":0,"volume_cum":0,"unit":"","annotation_text":"","source":"drawing|calculated|assumed","confidence":"high|medium|low"}],"element_counts":{"door_count":0,"window_count":0,"column_count":0,"footing_count":0,"staircase_count":0,"lift_count":0,"bedroom_count":0,"toilet_count":0,"kitchen_count":0,"floor_count":0},"schedule_data":{"columns":[{"mark":"","size_mm":"","main_bars":"","stirrups":"","qty":0,"source":"drawing-schedule|not legible"}],"footings":[{"mark":"","size_mm":"","depth_mm":"","main_bars":"","qty":0,"source":"drawing-schedule|not legible"}]},"road_data":{"roads":[{"name":"","length_rmt":0,"total_width_m":0,"carriage_width_m":0}]},"total_built_area_sqmt":0,"observations":[]}` }
     ]}],
     maxTokens: 6000
   });
@@ -317,7 +317,7 @@ function buildFinalOutput(boq, quantities, meta, cvData) {
       phase3_elements:quantities?.quantities?.length||0,
       phase4_boq_items:boq.boq?.length||0,
       phase5_warnings:boq.validation_warnings?.length||0,
-      model:'claude-sonnet-4-5',
+      model:'claude-sonnet-4-6',
     },
   };
 }
@@ -369,7 +369,7 @@ async function callClaudeAPI({ system, messages, maxTokens = 8192 }) {
   const key = process.env.CLAUDE_API_KEY;
   if (!key) throw new Error('CLAUDE_API_KEY not set');
   const body = {
-    model: 'claude-sonnet-4-5',
+    model: 'claude-sonnet-4-6',
     max_tokens: maxTokens,
     system: system || SYSTEM_PROMPT,
     messages,
