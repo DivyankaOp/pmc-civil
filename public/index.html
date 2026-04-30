@@ -326,23 +326,45 @@ function loadHistory(){
   catch(e){ return []; }
 }
 function saveHistory(chats){
-  try{ localStorage.setItem(HS_KEY, JSON.stringify(chats.slice(-50))); }
-  catch(e){}
+  try{
+    // Strip any b64 image/file data from messages before saving — prevents 5MB quota crash
+    const safe=chats.map(c=>({
+      ...c,
+      messages:(c.messages||[]).map(m=>{
+        if(m.role==='user_parts') return null; // never save raw parts
+        // Remove any b64 fields from message objects
+        const {b64,inline_data,...rest}=m;
+        return rest;
+      }).filter(Boolean)
+    }));
+    const json=JSON.stringify(safe.slice(-50));
+    localStorage.setItem(HS_KEY,json);
+  }catch(e){
+    // If still too large, save only titles/timestamps (no messages)
+    try{
+      const minimal=chats.slice(-50).map(c=>({id:c.id,title:c.title,mode:c.mode,ts:c.ts,messages:[]}));
+      localStorage.setItem(HS_KEY,JSON.stringify(minimal));
+    }catch(e2){ console.warn('History save failed even minimally:', e2.message); }
+  }
 }
 function renderHistList(){
   const allChats=loadHistory();
   const el=document.getElementById('histList');
+  if(!el) return;
   const q=(document.getElementById('histSearch')?.value||'').toLowerCase().trim();
   const chats=q ? allChats.filter(c=>(c.title||'').toLowerCase().includes(q)) : allChats;
-  if(!chats.length){el.innerHTML=`<div class="hist-empty">${q?'No results found.':'No history yet.<br>Start a conversation!'}</div>`;return;}
+  if(!chats.length){
+    el.innerHTML=`<div class="hist-empty">${q?'No results for "'+escHtml(q)+'"':'No history yet.<br>Start a conversation!'}</div>`;
+    return;
+  }
   el.innerHTML=chats.slice().reverse().map(c=>`
-    <button class="hist-item${c.id===currentChatId?' active-hist':''}" onclick="loadChat('${c.id}')">
+    <button class="hist-item${c.id===currentChatId?' active-hist':''}" onclick="loadChat('${escHtml(c.id)}')">
       <span class="hist-icon">${getModeIcon(c.mode||'auto')}</span>
       <span class="hist-text">
         <span class="hist-title">${escHtml(c.title||'Chat')}</span>
         <span class="hist-time">${formatTime(c.ts)}</span>
       </span>
-      <span class="hist-del" onclick="event.stopPropagation();deleteChat('${c.id}')">✕</span>
+      <span class="hist-del" onclick="event.stopPropagation();deleteChat('${escHtml(c.id)}')">✕</span>
     </button>`).join('');
 }
 function getModeIcon(m){return{auto:'🤖',drawing:'📐',estimate:'🧮',boq:'📋',compare:'⚖️',report:'📊',study:'🏗️'}[m]||'💬';}
