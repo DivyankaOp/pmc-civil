@@ -182,6 +182,7 @@ textarea.tin::placeholder{color:var(--tx3)}
         <span>Chat History</span>
         <span class="hist-clear" onclick="clearAllHistory()">Clear all</span>
       </div>
+      <input id="histSearch" type="text" placeholder="🔍 Search history..." oninput="renderHistList()" style="width:100%;box-sizing:border-box;margin-bottom:7px;padding:5px 9px;border-radius:6px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.07);color:#fff;font-size:11px;outline:none;">
       <div id="histList"><div class="hist-empty">No history yet.<br>Start a conversation!</div></div>
     </div>
 
@@ -329,9 +330,11 @@ function saveHistory(chats){
   catch(e){}
 }
 function renderHistList(){
-  const chats=loadHistory();
+  const allChats=loadHistory();
   const el=document.getElementById('histList');
-  if(!chats.length){el.innerHTML='<div class="hist-empty">No history yet.<br>Start a conversation!</div>';return;}
+  const q=(document.getElementById('histSearch')?.value||'').toLowerCase().trim();
+  const chats=q ? allChats.filter(c=>(c.title||'').toLowerCase().includes(q)) : allChats;
+  if(!chats.length){el.innerHTML=`<div class="hist-empty">${q?'No results found.':'No history yet.<br>Start a conversation!'}</div>`;return;}
   el.innerHTML=chats.slice().reverse().map(c=>`
     <button class="hist-item${c.id===currentChatId?' active-hist':''}" onclick="loadChat('${c.id}')">
       <span class="hist-icon">${getModeIcon(c.mode||'auto')}</span>
