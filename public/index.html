@@ -799,6 +799,14 @@ async function send(){
       const res=await fetch('/analyze-dwg',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({b64:dwgFile.b64,filename:dwgFile.name})});
       const data=await res.json();
+      if(!res.ok || data.needsDxfExport || data.needsPdfOrDxf){
+        // Conversion failed — show clear actionable message
+        rmLoad();
+        const errMsg = data.error || 'File could not be converted.';
+        addMsgEl('ai', `⚠️ **File Conversion Error**\n\n${errMsg}`);
+        busy=false;document.getElementById('sbtn').disabled=false;
+        return;
+      }
       const aiText=data.analysis||'DWG analysis failed.';
       rmLoad();
       hist=hist.filter(m=>m.role!=='user_parts');
