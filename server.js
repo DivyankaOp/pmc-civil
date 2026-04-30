@@ -653,7 +653,56 @@ app.post('/export-drawing', async (req, res) => {
         console.log('[PDF] Scanned PDF detected — attempting Google Cloud Vision table extraction');
         const gcvResult = await extractScannedPdfWithGCV(pdfFiles[0].b64);
         if (gcvResult?.pages?.length) {
+          // Pass raw GCV rows to Claude for structure validation + correction
+          // Claude fixes merged cells, rotated text, wrong groupings — uses only what's in the table
+          const gcvRaw = gcvResult.pages.map((p, i) => {
+            const rowsText = p.table_rows.map((r, ri) => `  Row ${ri+1}: ${r.join(' | ')}`).join('\n');
+            return `Page ${i+1} GCV extracted rows:\n${rowsText}`;
+          }).join('\n\n');
+
+          const claudeKey = process.env.CLAUDE_API_KEY;
+          let validatedTableData = null;
+          try {
+            const validationResp = await fetch('https://api.anthropic.com/v1/messages', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': claudeKey,
+                'anthropic-version': '2023-06-01'
+              },
+              body: JSON.stringify({
+                model: 'claude-sonnet-4-20250514',
+                max_tokens: 4096,
+                messages: [{
+                  role: 'user',
+                  content: `You are a civil engineering document parser. Below is raw OCR output from Google Cloud Vision extracted from a scanned PDF (BOQ/schedule/rate table).
+
+IMPORTANT RULES:
+- Use ONLY values that are explicitly present in the OCR text — do NOT assume, infer, or fill in any missing values
+- Fix obvious OCR grouping errors (merged cells split incorrectly, rotated text, misaligned columns)
+- Identify column headers from the first rows
+- Return structured JSON with: headers (array of column names) and rows (array of arrays matching headers)
+- If a cell is blank/missing in the source, use null — never guess a value
+
+RAW GCV OCR DATA:
+${gcvRaw}
+
+Return ONLY valid JSON, no markdown:
+{"headers":["col1","col2",...],"rows":[["val1","val2",...],...],"confidence":"HIGH|MEDIUM|LOW","issues_fixed":["description of any corrections made"]}`
+                }]
+              })
+            });
+            const vData = await validationResp.json();
+            const vText = vData.content?.find(b => b.type === 'text')?.text || '';
+            validatedTableData = JSON.parse(vText.replace(/```json|```/g, '').trim());
+            console.log(`[GCV+Claude] Table validated: ${validatedTableData.headers?.length} cols, ${validatedTableData.rows?.length} rows, confidence: ${validatedTableData.confidence}`);
+          } catch(e) {
+            console.warn('[GCV+Claude] Validation failed, using raw GCV:', e.message);
+          }
+
           cvData.gcv_table_pages = gcvResult.pages;
+          cvData.gcv_validated_table = validatedTableData;  // Claude-corrected structure
+          cvData.gcv_raw_text = gcvResult.pages.map(p => p.raw_text).join('\n');
           cvData.pdf_is_gcv = true;
           console.log(`[PDF] GCV table extraction OK — ${gcvResult.pages.length} pages structured`);
         } else {
