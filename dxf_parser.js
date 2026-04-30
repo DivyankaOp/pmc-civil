@@ -1009,4 +1009,121 @@ function extractTotalAreaSqft(dxfContent) {
   return Math.round(total * 100) / 100;
 }
 
-module.exports = { parseDXF, extractCivilData, extractTotalAreaSqft, detectProjectType, RATES };
+// ═══════════════════════════════════════════════════════════════════
+// COORDINATE CLUSTERING — Table Reconstruction from DXF texts
+// ─────────────────────────────────────────────────────────────────
+// texts: array of {text, x, y} (from parseDXF or extractCivilData)
+// yTol:  Y-band tolerance in drawing units (default 50 = 50mm)
+// xTol:  X-band tolerance in drawing units (default 80 = 80mm)
+//
+// Returns: array of rows, each row = array of {text, x, y}
+// Same Y band → same row. Within row, sorted by X → columns.
+//
+// Example output used to reconstruct footing/column schedule tables.
+// ═══════════════════════════════════════════════════════════════════
+function clusterTextsToTable(texts, yTol = 50, xTol = 80) {
+  if (!texts || !texts.length) return [];
+
+  // Filter out empty/whitespace texts
+  const valid = texts.filter(t => t.text && t.text.trim().length > 0);
+  if (!valid.length) return [];
+
+  // Sort by Y descending (top of drawing first, DXF Y increases upward)
+  const sorted = [...valid].sort((a, b) => b.y - a.y);
+
+  // Group into Y-bands (rows)
+  const rows = [];
+  for (const t of sorted) {
+    const existingRow = rows.find(r => Math.abs(r.yCenter - t.y) <= yTol);
+    if (existingRow) {
+      existingRow.cells.push(t);
+      // Update row Y center as average
+      existingRow.yCenter = existingRow.cells.reduce((s, c) => s + c.y, 0) / existingRow.cells.length;
+    } else {
+      rows.push({ yCenter: t.y, cells: [t] });
+    }
+  }
+
+  // Within each row, sort cells by X (left to right)
+  for (const row of rows) {
+    row.cells.sort((a, b) => a.x - b.x);
+  }
+
+  // Return rows sorted top-to-bottom
+  rows.sort((a, b) => b.yCenter - a.yCenter);
+  return rows.map(r => r.cells);
+}
+
+// Detect schedule tables: find rectangular grids of text
+// Returns array of named tables: { name, headers, rows }
+function reconstructScheduleTables(allTexts, scaleFactor = 1, yTol = 50) {
+  if (!allTexts || !allTexts.length) return [];
+
+  // Cluster all texts into rows
+  const rows = clusterTextsToTable(allTexts, yTol);
+  if (rows.length < 2) return [];
+
+  const tables = [];
+  let i = 0;
+
+  while (i < rows.length) {
+    const headerRow = rows[i];
+    // Detect header: row where cells contain keywords like MARK, SIZE, NOS, STEEL, TYPE, FOOTING, COLUMN
+    const headerTexts = headerRow.map(c => c.text.toUpperCase());
+    const isHeader = headerTexts.some(t =>
+      /^(MARK|TYPE|SIZE|NOS|NO\.|NO|QTY|QUANTITY|STEEL|BAR|DIA|FOOTING|COLUMN|COL|BEAM|SLAB|DEPTH|WIDTH|LENGTH|SPACING|STIRRUP|REINF|DETAIL)$/.test(t.replace(/[^A-Z.]/g,''))
+    );
+
+    if (isHeader && headerRow.length >= 2) {
+      // Collect data rows below this header until gap or new header
+      const dataRows = [];
+      let j = i + 1;
+      while (j < rows.length) {
+        const nextRow = rows[j];
+        // Stop if Y gap is too large (table ended)
+        const yGap = Math.abs(rows[j-1][0].y - nextRow[0].y);
+        if (yGap > yTol * 4) break;
+        // Stop if this row also looks like a header
+        const nextTexts = nextRow.map(c => c.text.toUpperCase());
+        const nextIsHeader = nextTexts.some(t =>
+          /^(MARK|TYPE|SIZE|NOS|FOOTING|COLUMN|BEAM|SLAB)$/.test(t.replace(/[^A-Z]/g,''))
+        );
+        if (nextIsHeader && dataRows.length > 0) break;
+        dataRows.push(nextRow.map(c => c.text.trim()));
+        j++;
+      }
+
+      if (dataRows.length > 0) {
+        // Find table name from cell above header or from header itself
+        const tableName = headerTexts.find(t => /FOOTING|COLUMN|BEAM|SLAB|SCHEDULE/.test(t)) || 'SCHEDULE';
+        tables.push({
+          name: tableName,
+          headers: headerRow.map(c => c.text.trim()),
+          rows: dataRows,
+          // Also output as JSON objects keyed by header
+          records: dataRows.map(row =>
+            Object.fromEntries(headerRow.map((h, idx) => [h.text.trim(), row[idx] || '']))
+          )
+        });
+        i = j;
+        continue;
+      }
+    }
+    i++;
+  }
+
+  return tables;
+}
+
+// High-level: given civilData, extract all schedule tables and attach
+function attachScheduleTables(civilData) {
+  if (!civilData || !civilData.all_texts) return civilData;
+  const sf = civilData.scale_factor || 1;
+  // Use a Y tolerance based on typical text height (default 50 drawing units)
+  const yTol = Math.max(30, (civilData.drawing_extents?.height_m || 10) * 1000 * 0.01);
+  civilData.schedule_tables = reconstructScheduleTables(civilData.all_texts, sf, yTol);
+  civilData.clustered_rows  = clusterTextsToTable(civilData.all_texts, yTol);
+  return civilData;
+}
+
+module.exports = { parseDXF, extractCivilData, extractTotalAreaSqft, detectProjectType, RATES, clusterTextsToTable, reconstructScheduleTables, attachScheduleTables };
