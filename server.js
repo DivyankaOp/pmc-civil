@@ -106,7 +106,7 @@ async function extractScannedPdfWithGCV(pdfBase64) {
     const pages = [];
     for (const resp of responses) {
       for (const pageAnnot of (resp.fullTextAnnotation?.pages || [])) {
-        const rows = [];
+        const cells = [];
         for (const block of (pageAnnot.blocks || [])) {
           for (const para of (block.paragraphs || [])) {
             const cellText = (para.words || [])
@@ -115,31 +115,50 @@ async function extractScannedPdfWithGCV(pdfBase64) {
               .trim();
             if (cellText) {
               const verts = para.boundingBox?.vertices || [];
-              rows.push({
-                text: cellText,
-                x: verts[0]?.x || 0,
-                y: verts[0]?.y || 0,
-                width:  Math.abs((verts[1]?.x || 0) - (verts[0]?.x || 0)),
-                height: Math.abs((verts[3]?.y || 0) - (verts[0]?.y || 0))
-              });
+              const x0 = verts[0]?.x || 0;
+              const y0 = verts[0]?.y || 0;
+              const x1 = verts[1]?.x || x0;
+              const y1 = verts[2]?.y || y0;
+              cells.push({ text: cellText, x: x0, y: y0, w: Math.abs(x1-x0), h: Math.abs(y1-y0) });
             }
           }
         }
-        // Group rows by Y-position to reconstruct table rows
-        rows.sort((a, b) => a.y - b.y || a.x - b.x);
+        // FIX 3: Detect rotation — if most blocks taller than wide, table is 90deg rotated
+        const rotatedCount = cells.filter(c => c.h > c.w * 1.5).length;
+        const isRotated = cells.length > 0 && rotatedCount > cells.length * 0.4;
+        if (isRotated) console.log('[GCV] Rotated table detected — swapping x/y for grouping');
+
+        // Sort by primary axis
+        cells.sort((a, b) => isRotated ? (a.x - b.x || a.y - b.y) : (a.y - b.y || a.x - b.x));
+
+        // FIX 2: Dynamic threshold based on avg cell height (not hardcoded 15px)
+        const avgSize = cells.reduce((s, c) => s + (isRotated ? c.w : c.h), 0) / (cells.length || 1);
+        const threshold = Math.max(25, avgSize * 0.6);
+
+        // Group into rows
         const tableRows = [];
-        let currentRowY = -1, currentRow = [];
-        for (const cell of rows) {
-          if (Math.abs(cell.y - currentRowY) > 15) {
-            if (currentRow.length) tableRows.push(currentRow.map(c => c.text));
+        let currentAxisVal = -1, currentRow = [];
+        for (const cell of cells) {
+          const axisVal = isRotated ? cell.x : cell.y;
+          if (Math.abs(axisVal - currentAxisVal) > threshold) {
+            if (currentRow.length) {
+              currentRow.sort((a, b) => isRotated ? a.y - b.y : a.x - b.x);
+              tableRows.push(currentRow.map(c => c.text));
+            }
             currentRow = [cell];
-            currentRowY = cell.y;
+            currentAxisVal = axisVal;
           } else {
             currentRow.push(cell);
           }
         }
-        if (currentRow.length) tableRows.push(currentRow.map(c => c.text));
-        pages.push({ table_rows: tableRows, raw_text: resp.fullTextAnnotation?.text || '' });
+        if (currentRow.length) {
+          currentRow.sort((a, b) => isRotated ? a.y - b.y : a.x - b.x);
+          tableRows.push(currentRow.map(c => c.text));
+        }
+
+        // FIX 1: raw_text = structured pipe-separated format (not raw dump)
+        const formattedText = tableRows.map(r => r.join(' | ')).join('\n');
+        pages.push({ table_rows: tableRows, raw_text: formattedText, is_rotated: isRotated });
       }
     }
     console.log(`[GCV] Scanned PDF: extracted ${pages.length} pages with table structure`);
@@ -210,8 +229,11 @@ app.post('/claude', async (req, res) => {
             // Try GCV first
             const gcvResult = await extractScannedPdfWithGCV(pdfB64);
             if (gcvResult?.pages?.length) {
-              const gcvText = gcvResult.pages.map(p => p.raw_text).join('\n');
-              newParts.push({ type: 'text', text: `[GCV OCR extracted text from scanned PDF]:\n${gcvText}` });
+              const gcvText = gcvResult.pages.map((p, i) => {
+                const rotNote = p.is_rotated ? ' [rotated table — x/y swapped]' : '';
+                return `=== PAGE ${i+1}${rotNote} ===\n${p.raw_text}`;
+              }).join('\n\n');
+              newParts.push({ type: 'text', text: `[STRUCTURED TABLE DATA from scanned PDF — read cell by cell, pipe-separated]:\n${gcvText}\n\nIMPORTANT: Use ONLY these exact values. Do not say "not legible" if value is present above.` });
             }
             // Always also convert to PNG for visual reading
             const pngTiles = await pdfToImageTiles(pdfB64, 2);
@@ -272,8 +294,11 @@ app.post('/gemini', async (req, res) => {
               console.log('[/gemini] Scanned PDF — converting to PNG tiles');
               const gcvResult = await extractScannedPdfWithGCV(pdfB64);
               if (gcvResult?.pages?.length) {
-                const gcvText = gcvResult.pages.map(p => p.raw_text).join('\n');
-                claudeParts.push({ type: 'text', text: `[OCR extracted text from scanned PDF]:\n${gcvText}` });
+                const gcvText = gcvResult.pages.map((p, i) => {
+                  const rotNote = p.is_rotated ? ' [rotated table — x/y swapped]' : '';
+                  return `=== PAGE ${i+1}${rotNote} ===\n${p.raw_text}`;
+                }).join('\n\n');
+                claudeParts.push({ type: 'text', text: `[STRUCTURED TABLE DATA from scanned PDF — pipe-separated rows/columns]:\n${gcvText}\n\nIMPORTANT: Use ONLY these exact values. Do not say "not legible" if value is present above.` });
               }
               const pngTiles = await pdfToImageTiles(pdfB64, 2);
               if (pngTiles?.length) {
