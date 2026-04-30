@@ -142,18 +142,18 @@ function buildImageParts(files) {
 // ════════════════════════════════════════════
 // PHASE 2 — Legend + Title Block
 // ════════════════════════════════════════════
-async function phase2_legendAndScale(files, cvData) {
+async function phase2_legendAndScale(files, cvData, gcvTableContext='') {
   console.log('[Phase 2] Reading legend + title block...');
   const kb = knowledgeBaseHints();
   const cv = cvData&&!cvData.error
     ? `CV: ${cvData.image_dimensions?.width_px}x${cvData.image_dimensions?.height_px}px | spaces:${cvData.detected_spaces?.length||0} | scale candidates:${JSON.stringify(cvData.scale_bar_candidates_px?.slice(0,4))}` : '';
   const imgParts = buildImageParts(files);
-  if (!imgParts.length) return null;
+  if (!imgParts.length && !gcvTableContext) return null;
 
   const raw = await callClaude({
     messages:[{ role:'user', content:[
       ...imgParts,
-      { type:'text', text:`${cv}\n${kb}\n\nTASK PHASE 2: Read ONLY the legend/symbol table and title block. No quantities yet.\n\nCRITICAL RULES:\n1. Scale: read EXACTLY from title block (e.g. 1:100, 1:200). If not visible write null.\n2. Scale_factor: numeric part only (100 for 1:100). ALL dimensions sent to Phase 3 will be raw drawing units — Phase 3 multiplies by this factor.\n3. North direction: read compass or north arrow if present.\n4. Legend: read EVERY symbol in the legend table — hatch pattern name, its meaning, and the layer name printed next to it.\n5. If title block confidence is LOW, set scale to null so Phase 3 marks confidence LOW.\n\nReturn JSON:\n{"drawing_type":"","project_name":"","drawing_no":"","date":"","scale":"1:100","scale_factor":100,"north_direction":"","legend":[{"symbol":"","meaning":"","layer":"","hatch_pattern":""}],"annotation_layers":[],"floors_visible":[],"title_block_confidence":"HIGH|MEDIUM|LOW","legend_confidence":"HIGH|MEDIUM|LOW","schedule_tables_visible":["column_schedule","footing_schedule","door_schedule","window_schedule"],"notes":[]}` }
+      { type:'text', text:`${cv}\n${kb}${gcvTableContext}\n\nTASK PHASE 2: Read ONLY the legend/symbol table and title block. No quantities yet.\n\nCRITICAL RULES:\n1. Scale: read EXACTLY from title block (e.g. 1:100, 1:200). If not visible write null.\n2. Scale_factor: numeric part only (100 for 1:100). ALL dimensions sent to Phase 3 will be raw drawing units — Phase 3 multiplies by this factor.\n3. North direction: read compass or north arrow if present.\n4. Legend: read EVERY symbol in the legend table — hatch pattern name, its meaning, and the layer name printed next to it.\n5. If title block confidence is LOW, set scale to null so Phase 3 marks confidence LOW.\n6. If GCV table data is provided above, extract project/drawing info ONLY from those values — do not infer.\n\nReturn JSON:\n{"drawing_type":"","project_name":"","drawing_no":"","date":"","scale":"1:100","scale_factor":100,"north_direction":"","legend":[{"symbol":"","meaning":"","layer":"","hatch_pattern":""}],"annotation_layers":[],"floors_visible":[],"title_block_confidence":"HIGH|MEDIUM|LOW","legend_confidence":"HIGH|MEDIUM|LOW","schedule_tables_visible":["column_schedule","footing_schedule","door_schedule","window_schedule"],"notes":[]}` }
     ]}],
     maxTokens: 2048
   });
@@ -166,7 +166,7 @@ async function phase2_legendAndScale(files, cvData) {
 // ════════════════════════════════════════════
 // PHASE 3 — Quantity Extraction
 // ════════════════════════════════════════════
-async function phase3_extractQuantities(files, meta) {
+async function phase3_extractQuantities(files, meta, gcvTableContext='') {
   console.log('[Phase 3] Extracting quantities with legend context...');
   const legendCtx = meta?.legend?.length
     ? `LEGEND FROM PHASE 2 (use for all element identification):\n${meta.legend.map(l=>`  ${l.symbol} = ${l.meaning} (layer:${l.layer||'?'})`).join('\n')}`
@@ -179,7 +179,7 @@ async function phase3_extractQuantities(files, meta) {
   const raw = await callClaude({
     messages:[{ role:'user', content:[
       ...imgParts,
-      { type:'text', text:`${legendCtx}\n${scaleCtx}\nDrawing type:${meta?.drawing_type||'unknown'}\nNorth direction:${meta?.north_direction||'not specified'}\nAnnotation layers (ignore for quantities):${JSON.stringify(meta?.annotation_layers||[])}\n\nCRITICAL QUANTITY READING RULES:\n1. Apply scale_factor=${meta?.scale_factor||1} to ALL raw dimensions before recording length_m/width_m/height_m.\n2. Count elements by counting symbols in the legend (from Phase 2) — NOT by guessing from drawing appearance.\n3. Read annotation texts EXACTLY as printed — do NOT add, remove, or change any digit.\n4. For schedule tables (column/footing/door/window): copy cell values EXACTLY. If unreadable → write "not legible".\n5. Distinguish what is drawn in THIS sheet vs referenced from another sheet.\n6. Mark source: "drawing" if directly read, "calculated" if derived, "assumed" if guessed.\n\nTASK PHASE 3: Extract ALL quantities visible in drawing.\nReturn JSON:\n{"quantities":[{"element":"","floor":"","length_m":0,"width_m":0,"height_m":0,"thickness_m":0,"nos":1,"area_sqmt":0,"volume_cum":0,"unit":"","annotation_text":"","source":"drawing|calculated|assumed","confidence":"high|medium|low"}],"element_counts":{"door_count":0,"window_count":0,"column_count":0,"footing_count":0,"staircase_count":0,"lift_count":0,"bedroom_count":0,"toilet_count":0,"kitchen_count":0,"floor_count":0},"schedule_data":{"columns":[{"mark":"","size_mm":"","main_bars":"","stirrups":"","qty":0,"source":"drawing-schedule|not legible"}],"footings":[{"mark":"","size_mm":"","depth_mm":"","main_bars":"","qty":0,"source":"drawing-schedule|not legible"}]},"road_data":{"roads":[{"name":"","length_rmt":0,"total_width_m":0,"carriage_width_m":0}]},"total_built_area_sqmt":0,"observations":[]}` }
+      { type:'text', text:`${legendCtx}\n${scaleCtx}\nDrawing type:${meta?.drawing_type||'unknown'}\nNorth direction:${meta?.north_direction||'not specified'}\nAnnotation layers (ignore for quantities):${JSON.stringify(meta?.annotation_layers||[])}${gcvTableContext}\n\nCRITICAL QUANTITY READING RULES:\n1. Apply scale_factor=${meta?.scale_factor||1} to ALL raw dimensions before recording length_m/width_m/height_m.\n2. Count elements by counting symbols in the legend (from Phase 2) — NOT by guessing from drawing appearance.\n3. Read annotation texts EXACTLY as printed — do NOT add, remove, or change any digit.\n4. For schedule tables (column/footing/door/window): copy cell values EXACTLY. If unreadable → write "not legible".\n5. If GCV table data is provided above — use those cell values AS-IS for all quantities and schedule data. Do not recalculate or assume any value not present in the table.\n6. Distinguish what is drawn in THIS sheet vs referenced from another sheet.\n7. Mark source: "drawing" if directly read, "calculated" if derived, "assumed" if guessed.\n\nTASK PHASE 3: Extract ALL quantities visible in drawing.\nReturn JSON:\n{"quantities":[{"element":"","floor":"","length_m":0,"width_m":0,"height_m":0,"thickness_m":0,"nos":1,"area_sqmt":0,"volume_cum":0,"unit":"","annotation_text":"","source":"drawing|calculated|assumed","confidence":"high|medium|low"}],"element_counts":{"door_count":0,"window_count":0,"column_count":0,"footing_count":0,"staircase_count":0,"lift_count":0,"bedroom_count":0,"toilet_count":0,"kitchen_count":0,"floor_count":0},"schedule_data":{"columns":[{"mark":"","size_mm":"","main_bars":"","stirrups":"","qty":0,"source":"drawing-schedule|not legible"}],"footings":[{"mark":"","size_mm":"","depth_mm":"","main_bars":"","qty":0,"source":"drawing-schedule|not legible"}]},"road_data":{"roads":[{"name":"","length_rmt":0,"total_width_m":0,"carriage_width_m":0}]},"total_built_area_sqmt":0,"observations":[]}` }
     ]}],
     maxTokens: 6000
   });
@@ -250,8 +250,20 @@ function runCVAnalysis(b64Image) {
 async function geminiAnalyzeDrawing(key, files, cvData, fetchFn) {
   console.log('\n[PMC] === 5-Phase Claude Pipeline Starting ===');
 
-  const meta        = await phase2_legendAndScale(files, cvData);
-  const quantities  = await phase3_extractQuantities(files, meta);
+  // Build GCV table context string — passed to all phases so Claude uses actual table values
+  let gcvTableContext = '';
+  if (cvData?.gcv_validated_table) {
+    const t = cvData.gcv_validated_table;
+    const headerLine = (t.headers || []).join(' | ');
+    const rowLines = (t.rows || []).map(r => r.map(v => v ?? '').join(' | ')).join('\n');
+    gcvTableContext = `\n\nSCANNED PDF TABLE (GCV+Claude validated, confidence:${t.confidence||'?'}):\nUse ONLY these values — do not assume or calculate anything not present here.\nHeaders: ${headerLine}\n${rowLines}\n`;
+    if (t.issues_fixed?.length) gcvTableContext += `Corrections applied: ${t.issues_fixed.join('; ')}\n`;
+  } else if (cvData?.gcv_raw_text) {
+    gcvTableContext = `\n\nSCANNED PDF RAW TEXT (GCV):\n${cvData.gcv_raw_text.slice(0, 3000)}\nUse ONLY values present in this text.\n`;
+  }
+
+  const meta        = await phase2_legendAndScale(files, cvData, gcvTableContext);
+  const quantities  = await phase3_extractQuantities(files, meta, gcvTableContext);
   const boqData     = await phase4_calculateBOQ(quantities, meta);
   const finalData   = await phase5_validateAndFlag(boqData);
 
