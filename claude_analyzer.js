@@ -101,7 +101,7 @@ async function callClaude({ messages, maxTokens = 8192, thinking = false }) {
   const key = process.env.CLAUDE_API_KEY;
   if (!key) throw new Error('CLAUDE_API_KEY not set');
   const body = {
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-6',
     max_tokens: thinking ? 16000 : maxTokens,
     system: SYSTEM_PROMPT,
     messages,
@@ -818,7 +818,7 @@ async function callClaudeAPI({ system, messages, maxTokens = 8192 }) {
   const key = process.env.CLAUDE_API_KEY;
   if (!key) throw new Error('CLAUDE_API_KEY not set');
   const body = {
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-6',
     max_tokens: maxTokens,
     system: system || SYSTEM_PROMPT,
     messages,
