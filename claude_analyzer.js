@@ -140,9 +140,178 @@ function buildImageParts(files) {
 }
 
 // ════════════════════════════════════════════
+// DRAWING LAYOUT DETECTOR
+// Detects what TYPE of drawing it is from GCV text / filename / file count
+// Returns a layout strategy object — NO hardcoded values, purely signal-based
+// ════════════════════════════════════════════
+function detectDrawingLayout(files, cvData, gcvTableContext) {
+  const gcvText = (gcvTableContext || '').toLowerCase();
+  const fileNames = (files||[]).map(f => (f.name||'').toLowerCase()).join(' ');
+  const allText = gcvText + ' ' + fileNames;
+
+  // ── Signal detection ────────────────────────────────────────────
+  const signals = {
+    // Industrial steel+RCC
+    hasBasePlate:    /base plate|base-plate|baseplate/.test(allText),
+    hasAnchorBolt:   /anchor bolt|h\.d\. bolt|hd bolt|anchor/.test(allText),
+    hasBodOfSteel:   /bod of steel|b\.o\.d|bottom of steel/.test(allText),
+    hasBracedBay:    /braced bay|x.brac/.test(allText),
+    hasSlope:        /slope\s*1\s*[:/]\s*\d/.test(allText),
+    hasCanopy:       /canopy/.test(allText),
+    hasRoofMonitor:  /roof monitor|monitor/.test(allText),
+    hasPedestal:     /pedestal/.test(allText),
+
+    // Multi-panel layout (one sheet with plan + sections + schedules)
+    hasScheduleOfFootings: /schedule of footing/.test(allText),
+    hasScheduleOfColumns:  /schedule of column/.test(allText),
+    hasSectionDetail:      /section[- ][a-z]-[a-z]|detail [a-z]-[a-z]/.test(allText),
+    hasColumnDetail:       /column detail|c\d.*detail/.test(allText),
+    hasGridRef:            /grid[- ]\d|grid[- ][a-z]/.test(allText),
+
+    // Residential / building
+    hasFloorPlan:    /floor plan|ground floor|first floor|second floor/.test(allText),
+    hasDoorSchedule: /door schedule|door mark|d\.s\./.test(allText),
+    hasWindowSchedule:/window schedule|window mark|w\.s\./.test(allText),
+    hasBeamSchedule: /beam schedule|beam mark/.test(allText),
+    hasSlabSchedule: /slab schedule/.test(allText),
+
+    // Road / infrastructure
+    hasGSB:          /\bgsb\b/.test(allText),
+    hasWMM:          /\bwmm\b/.test(allText),
+    hasPQC:          /\bpqc\b/.test(allText),
+    hasChainage:     /ch\.\d|chainage/.test(allText),
+
+    // Layout type from GCV position data (if available)
+    isScannedPdf:    !!(cvData?.pdf_is_gcv || cvData?.pdf_scanned_fallback),
+    isVectorPdf:     !!(cvData?.pdf_is_vector),
+    hasMultipleTiles: (files||[]).filter(f => f.name?.match(/tile|page/i)).length > 1,
+  };
+
+  // ── Classify drawing type ────────────────────────────────────────
+  let drawingType = 'UNKNOWN';
+  let layoutStrategy = 'STANDARD';
+  let panelMap = {};
+  let readingInstructions = '';
+
+  const industrialScore = [
+    signals.hasBasePlate, signals.hasAnchorBolt, signals.hasBodOfSteel,
+    signals.hasBracedBay, signals.hasScheduleOfFootings, signals.hasScheduleOfColumns,
+  ].filter(Boolean).length;
+
+  const residentialScore = [
+    signals.hasFloorPlan, signals.hasDoorSchedule, signals.hasWindowSchedule,
+    signals.hasBeamSchedule, signals.hasSlabSchedule,
+  ].filter(Boolean).length;
+
+  const roadScore = [
+    signals.hasGSB, signals.hasWMM, signals.hasPQC, signals.hasChainage,
+  ].filter(Boolean).length;
+
+  if (industrialScore >= 2) {
+    drawingType = 'INDUSTRIAL_STEEL_RCC';
+    layoutStrategy = 'MULTI_PANEL_SCHEDULE';
+
+    // This drawing type: left=column detail panels, centre=plan, bottom-right=schedules
+    panelMap = {
+      titleBlock:       'bottom strip — title block and notes',
+      plan:             'right half — RCC layout plan with grid lines',
+      columnDetails:    'left side — individual grid column details with base plate dims',
+      footingSection:   'bottom-left — footing cross-section details (Section A-A, B-B)',
+      footingSchedule:  'bottom-right — SCHEDULE OF FOOTINGS table',
+      columnSchedule:   'far right — SCHEDULE OF COLUMNS table (column/pedestal schedule)',
+      notes:            'bottom-left notes box',
+    };
+
+    readingInstructions = `
+DRAWING LAYOUT — INDUSTRIAL STEEL+RCC MULTI-PANEL SHEET:
+This is a single sheet with MULTIPLE PANELS. Read each panel separately:
+
+PANEL 1 — PLAN VIEW (centre/right area):
+  • Grid layout showing column positions in plan
+  • Note which grids are BRACED BAYs (X-pattern)
+  • Note SLOPE annotations (roof slope — NOT structural dimensions)
+  • Count total column positions in plan (approximate — use schedule for exact qty)
+
+PANEL 2 — COLUMN DETAIL PANELS (left side, multiple stacked):
+  • Each panel shows one column type (e.g. "GRID-1&17-BT01", "GRID-3A,2A,11...")
+  • Read: column mark, pedestal size, base plate size, anchor bolt count
+  • These are ELEVATION/SECTION details — NOT the schedule table
+  • Do NOT use these sizes as schedule quantities — they show details only
+
+PANEL 3 — FOOTING SECTION DETAILS (bottom-left):
+  • Cross-section labeled "SECTION A-A", "SECTION B-B" or "TYPICAL FOOTING SECTION"
+  • Read: footing depth, PCC thickness, pedestal height, cover
+  • This shows geometry — quantities come from the schedule table
+
+PANEL 4 — SCHEDULE OF FOOTINGS (bottom-right):
+  • Tabular grid: footing mark | size | depth | reinforcement | qty
+  • THIS IS THE PRIMARY SOURCE for footing BOQ quantities
+  • Read EVERY row — do NOT skip any footing type
+
+PANEL 5 — SCHEDULE OF COLUMNS (far right):
+  • Tabular grid: column mark | pedestal size | main bars | ties/stirrups | qty
+  • THIS IS THE PRIMARY SOURCE for column/pedestal BOQ quantities
+  • Read EVERY row — do NOT skip any column type
+
+PANEL 6 — TITLE BLOCK + NOTES (bottom strip):
+  • Read: project name, drawing no, date, concrete grade, steel grade
+  • Read ALL notes — they contain critical specs (cover, lap length, material specs)
+
+CRITICAL RULES FOR THIS LAYOUT:
+  • Schedule quantities OVERRIDE everything else — plan count is approximate
+  • Column detail panel sizes are FOR REFERENCE ONLY — schedule table is authoritative
+  • Footing mark from footing schedule ≠ column mark from column schedule (they are linked but separate)
+  • If a schedule cell is not legible → write "not legible", do NOT copy from detail panel`;
+
+  } else if (residentialScore >= 2) {
+    drawingType = 'RESIDENTIAL_BUILDING';
+    layoutStrategy = 'FLOOR_PLAN_WITH_SCHEDULES';
+    panelMap = {
+      plan:          'main area — floor plan with dimensions',
+      schedules:     'side panels or separate sheets — door/window/beam schedules',
+      titleBlock:    'bottom-right corner',
+      sections:      'if present — elevation or section views',
+    };
+    readingInstructions = `
+DRAWING LAYOUT — RESIDENTIAL BUILDING PLAN:
+  • Main panel: floor plan — read room dimensions, wall thickness, openings
+  • Door/Window schedule: read each row for size, type, qty
+  • Beam schedule: read span, size, reinforcement from table
+  • Column schedule: read from table only
+  • Count floors from floor labels in plan or title block`;
+
+  } else if (roadScore >= 2) {
+    drawingType = 'ROAD_INFRASTRUCTURE';
+    layoutStrategy = 'CHAINAGE_BASED';
+    panelMap = {
+      plan:      'plan view — chainage markers, widths',
+      section:   'typical cross-section — layers, widths',
+      titleBlock:'bottom strip',
+    };
+    readingInstructions = `
+DRAWING LAYOUT — ROAD/INFRASTRUCTURE:
+  • Plan view: read start/end chainage, road width
+  • Cross-section: read GSB/WMM/PQC thickness and widths
+  • Calculate quantities from length × width × layer thickness
+  • Use compaction factors from system prompt`;
+
+  } else {
+    // Generic fallback — let Claude figure it out
+    drawingType = 'GENERAL_CIVIL';
+    layoutStrategy = 'STANDARD';
+    readingInstructions = `Read all panels systematically: title block first, then plan, then details, then schedules.`;
+  }
+
+  console.log(`[Layout Detector] Type: ${drawingType} | Strategy: ${layoutStrategy} | Signals: industrial=${industrialScore}, residential=${residentialScore}, road=${roadScore}`);
+
+  return { drawingType, layoutStrategy, panelMap, readingInstructions, signals };
+}
+
+
+// ════════════════════════════════════════════
 // PHASE 2 — Legend + Title Block
 // ════════════════════════════════════════════
-async function phase2_legendAndScale(files, cvData, gcvTableContext='') {
+async function phase2_legendAndScale(files, cvData, gcvTableContext='', layout={}) {
   console.log('[Phase 2] Reading legend + title block...');
   const kb = knowledgeBaseHints();
   const cv = cvData&&!cvData.error
@@ -150,10 +319,15 @@ async function phase2_legendAndScale(files, cvData, gcvTableContext='') {
   const imgParts = buildImageParts(files);
   if (!imgParts.length && !gcvTableContext) return null;
 
+  // Inject layout reading instructions so Phase 2 knows WHERE to look for title block
+  const layoutHint = layout.readingInstructions
+    ? `\nDRAWING LAYOUT CONTEXT (auto-detected):\n${layout.readingInstructions}\n\nFor Phase 2: Focus on the TITLE BLOCK panel (${layout.panelMap?.titleBlock||'usually bottom strip'}) and NOTES section.\n`
+    : '';
+
   const raw = await callClaude({
     messages:[{ role:'user', content:[
       ...imgParts,
-      { type:'text', text:`${cv}\n${kb}${gcvTableContext}\n\nTASK PHASE 2: Read ONLY the legend/symbol table and title block. No quantities yet.\n\nCRITICAL RULES:\n1. Scale: read EXACTLY from title block (e.g. 1:100, 1:200). If not visible write null.\n2. Scale_factor: numeric part only (100 for 1:100). ALL dimensions sent to Phase 3 will be raw drawing units — Phase 3 multiplies by this factor.\n3. North direction: read compass or north arrow if present.\n4. Legend: read EVERY symbol in the legend table — hatch pattern name, its meaning, and the layer name printed next to it.\n5. If title block confidence is LOW, set scale to null so Phase 3 marks confidence LOW.\n6. If GCV table data is provided above, extract project/drawing info ONLY from those values — do not infer.\n\nReturn JSON:\n{"drawing_type":"","project_name":"","drawing_no":"","date":"","scale":"1:100","scale_factor":100,"north_direction":"","legend":[{"symbol":"","meaning":"","layer":"","hatch_pattern":""}],"annotation_layers":[],"floors_visible":[],"title_block_confidence":"HIGH|MEDIUM|LOW","legend_confidence":"HIGH|MEDIUM|LOW","schedule_tables_visible":["column_schedule","footing_schedule","door_schedule","window_schedule"],"notes":[]}` }
+      { type:'text', text:`${cv}\n${kb}${layoutHint}${gcvTableContext}\n\nTASK PHASE 2: Read ONLY the legend/symbol table, title block, and identify where schedule tables are located in the drawing. No quantities yet.\n\nCRITICAL RULES:\n1. Scale: read EXACTLY from title block (e.g. 1:100, 1:200). If not visible write null.\n2. Scale_factor: numeric part only (100 for 1:100). ALL dimensions sent to Phase 3 will be raw drawing units — Phase 3 multiplies by this factor.\n3. North direction: read compass or north arrow if present.\n4. Legend: read EVERY symbol in the legend table — hatch pattern name, its meaning, and the layer name printed next to it.\n5. If title block confidence is LOW, set scale to null so Phase 3 marks confidence LOW.\n6. If GCV table data is provided above, extract project/drawing info ONLY from those values — do not infer.\n7. DRAWING TYPE DETECTION: If you see steel column base plates, anchor bolts, braced bays, "BOD OF STEEL", "BASE PLATE", SLOPE annotations, CANOPY — set drawing_type to "RCC_FOOTING_INDUSTRIAL" and structural_system to "STEEL_FRAME_RCC_PEDESTAL".\n8. SCHEDULE TABLE LOCATIONS: Scan the full drawing and describe WHERE each schedule table appears. Phase 3 uses this to focus on the right area.\n9. CONCRETE + STEEL GRADE: Read from NOTES section or title block exactly as printed (e.g. M40, Fe500D).\n10. NOTES SECTION: Read every line of the NOTES box — critical spec info is here.\n\nReturn JSON:\n{"drawing_type":"","project_name":"","drawing_no":"","date":"","concrete_grade":"","steel_grade":"","scale":"1:100","scale_factor":100,"north_direction":"","structural_system":"","legend":[{"symbol":"","meaning":"","layer":"","hatch_pattern":""}],"annotation_layers":[],"floors_visible":[],"title_block_confidence":"HIGH|MEDIUM|LOW","legend_confidence":"HIGH|MEDIUM|LOW","schedule_tables_visible":["column_schedule","footing_schedule"],"schedule_table_locations":{"column_schedule":"describe location","footing_schedule":"describe location"},"general_notes":[],"notes":[]}` }
     ]}],
     maxTokens: 2048
   });
@@ -166,7 +340,7 @@ async function phase2_legendAndScale(files, cvData, gcvTableContext='') {
 // ════════════════════════════════════════════
 // PHASE 3 — Quantity Extraction
 // ════════════════════════════════════════════
-async function phase3_extractQuantities(files, meta, gcvTableContext='') {
+async function phase3_extractQuantities(files, meta, gcvTableContext='', layout={}) {
   console.log('[Phase 3] Extracting quantities with legend context...');
   const legendCtx = meta?.legend?.length
     ? `LEGEND FROM PHASE 2 (use for all element identification):\n${meta.legend.map(l=>`  ${l.symbol} = ${l.meaning} (layer:${l.layer||'?'})`).join('\n')}`
@@ -176,12 +350,47 @@ async function phase3_extractQuantities(files, meta, gcvTableContext='') {
     : 'Scale not confirmed — mark confidence LOW.';
   const imgParts = buildImageParts(files);
 
+  // Build schedule location hints — prefer Phase 2 result, fallback to layout detector
+  const schedLoc = meta?.schedule_table_locations
+    ? `SCHEDULE TABLE LOCATIONS (confirmed by Phase 2):\n  Column Schedule: ${meta.schedule_table_locations.column_schedule||'unknown'}\n  Footing Schedule: ${meta.schedule_table_locations.footing_schedule||'unknown'}\nFocus on these exact areas when reading schedule tables.`
+    : (layout.panelMap?.footingSchedule
+      ? `SCHEDULE TABLE LOCATIONS (from auto-detector):\n  Footing Schedule: ${layout.panelMap.footingSchedule}\n  Column Schedule: ${layout.panelMap.columnSchedule}`
+      : '');
+
+  // Use layout reading instructions — this is the KEY adaptive behaviour
+  // For industrial: tells Claude exactly which panel has which data
+  // For residential: tells Claude about floor plan reading
+  // For road: tells Claude about chainage-based reading
+  const layoutInstructions = layout.readingInstructions || '';
+
+  // Industrial context (kept for backward compat if layout detector missed it)
+  const isIndustrial = layout.drawingType === 'INDUSTRIAL_STEEL_RCC' ||
+    /industrial|steel_frame|rcc_footing/i.test(meta?.drawing_type||'');
+  const industrialCtx = isIndustrial && !layoutInstructions
+    ? `\nINDUSTRIAL STEEL+RCC DRAWING:\n- Column Schedule = RCC PEDESTAL sizes\n- Footing Schedule = isolated footing sizes\n- Base plate dimensions in left detail panels\n`
+    : '';
+
+  const strictScheduleRules = `
+═══════════════════════════════════════════════════════════
+SCHEDULE READING — ABSOLUTE RULES (violation = wrong BOQ)
+═══════════════════════════════════════════════════════════
+1. Read ONLY values PHYSICALLY PRINTED in schedule table cells.
+2. Column schedule and Footing schedule are COMPLETELY SEPARATE tables — NEVER mix them.
+3. Column/Pedestal size: copy EXACT printed value (e.g. 300×300). NEVER output 400×400, 500×500 unless printed.
+4. Main bars: copy EXACTLY as printed (e.g. 8-16Ø, 4T20). NEVER invent bar sizes.
+5. Stirrups/ties: copy EXACTLY (e.g. 8Ø@150c/c). NEVER invent.
+6. Footing size: from footing schedule ONLY (e.g. 1500×1500, 2000×2000).
+7. Qty (number of columns/footings): use ONLY the qty column from schedule.
+8. Unreadable cell → write "not legible" — NEVER guess.
+9. Source field: "drawing-schedule" for schedule values, "calculated" for derived, "not legible" if unclear.
+═══════════════════════════════════════════════════════════`;
+
   const raw = await callClaude({
     messages:[{ role:'user', content:[
       ...imgParts,
-      { type:'text', text:`${gcvTableContext ? 'PRIORITY DATA FROM SCANNED PDF TABLE (GCV+Claude validated):\n'+gcvTableContext+'\nUSE THESE VALUES EXACTLY — do not recalculate, do not assume missing values.\n\n' : ''}${legendCtx}\n${scaleCtx}\nDrawing type:${meta?.drawing_type||'unknown'}\nNorth direction:${meta?.north_direction||'not specified'}\nAnnotation layers (ignore for quantities):${JSON.stringify(meta?.annotation_layers||[])}\n\nCRITICAL QUANTITY READING RULES:\n1. Apply scale_factor=${meta?.scale_factor||1} to ALL raw dimensions before recording length_m/width_m/height_m.\n2. Count elements by counting symbols in the legend (from Phase 2) — NOT by guessing from drawing appearance.\n3. Read annotation texts EXACTLY as printed — do NOT add, remove, or change any digit.\n4. For schedule tables (column/footing/door/window): copy cell values EXACTLY. If unreadable → write "not legible".\n5. If GCV table data is provided above — use those cell values AS-IS. Do not recalculate or assume any value not in the table.\n6. Distinguish what is drawn in THIS sheet vs referenced from another sheet.\n7. Mark source: "drawing" if directly read, "calculated" if derived, "assumed" if guessed.\n\nTASK PHASE 3: Extract ALL quantities visible in drawing.\nReturn JSON:\n{"quantities":[{"element":"","floor":"","length_m":0,"width_m":0,"height_m":0,"thickness_m":0,"nos":1,"area_sqmt":0,"volume_cum":0,"unit":"","annotation_text":"","source":"drawing|calculated|assumed","confidence":"high|medium|low"}],"element_counts":{"door_count":0,"window_count":0,"column_count":0,"footing_count":0,"staircase_count":0,"lift_count":0,"bedroom_count":0,"toilet_count":0,"kitchen_count":0,"floor_count":0},"schedule_data":{"columns":[{"mark":"","size_mm":"","main_bars":"","stirrups":"","qty":0,"source":"drawing-schedule|not legible"}],"footings":[{"mark":"","size_mm":"","depth_mm":"","main_bars":"","qty":0,"source":"drawing-schedule|not legible"}]},"road_data":{"roads":[{"name":"","length_rmt":0,"total_width_m":0,"carriage_width_m":0}]},"total_built_area_sqmt":0,"observations":[]}` }
+      { type:'text', text:`${gcvTableContext ? 'PRIORITY DATA FROM SCANNED PDF TABLE (GCV+Claude validated):\n'+gcvTableContext+'\nUSE THESE VALUES EXACTLY — do not recalculate, do not assume missing values.\n\n' : ''}${layoutInstructions ? '━━━ DRAWING LAYOUT READING GUIDE (auto-detected — follow this precisely) ━━━\n'+layoutInstructions+'\n━━━ END LAYOUT GUIDE ━━━\n\n' : ''}${legendCtx}\n${scaleCtx}\n${schedLoc}${industrialCtx}${strictScheduleRules}\nDrawing type: ${meta?.drawing_type||layout.drawingType||'unknown'}\nStructural system: ${meta?.structural_system||'unknown'}\nConcrete grade: ${meta?.concrete_grade||'read from drawing'}\nSteel grade: ${meta?.steel_grade||'read from drawing'}\nAnnotation layers (ignore for quantities): ${JSON.stringify(meta?.annotation_layers||[])}\n\nCRITICAL QUANTITY READING RULES:\n1. Apply scale_factor=${meta?.scale_factor||1} to ALL raw dimensions before recording length_m/width_m/height_m.\n2. Count columns/footings from schedule QTY column ONLY — do NOT count from plan view.\n3. Read annotation texts EXACTLY as printed — do NOT change any digit.\n4. For schedule tables: copy cell values EXACTLY. If unreadable → write "not legible".\n5. If GCV table data is provided above — use those cell values AS-IS.\n6. Distinguish what is drawn in THIS sheet vs referenced from another sheet.\n7. Mark source: "drawing" if directly read, "calculated" if derived, "assumed" if guessed.\n8. For INDUSTRIAL drawings: read base plate sizes and anchor bolt counts from COLUMN DETAIL panels (left side).\n9. Read PCC (Plain Cement Concrete) bed thickness from FOOTING SECTION DETAILS panel.\n10. Read pedestal height from section drawings if shown.\n\nTASK PHASE 3: Extract ALL quantities from this drawing, panel by panel as described in the layout guide above.\nReturn JSON:\n{"quantities":[{"element":"","floor":"","length_m":0,"width_m":0,"height_m":0,"thickness_m":0,"nos":1,"area_sqmt":0,"volume_cum":0,"unit":"","annotation_text":"","source":"drawing|calculated|assumed","confidence":"high|medium|low"}],"element_counts":{"column_count":0,"footing_count":0,"braced_bay_count":0,"anchor_bolt_count":0},"schedule_data":{"concrete_grade":"","steel_grade":"","columns":[{"mark":"","size_mm":"","main_bars":"","stirrups":"","height_m":0,"qty":0,"source":"drawing-schedule|not legible","notes":""}],"footings":[{"mark":"","size_mm":"","depth_mm":"","pcc_mm":75,"main_bars_x":"","main_bars_y":"","qty":0,"pedestal_size_mm":"","source":"drawing-schedule|not legible"}],"base_plates":[{"column_mark":"","plate_size_mm":"","anchor_bolt_nos":0,"anchor_bolt_dia_mm":0,"source":"drawing-schedule|not legible"}]},"section_details":{"footing_depth_mm":0,"pedestal_height_mm":0,"pcc_thickness_mm":75,"cover_mm":50},"grid_info":{"typical_bay_m":0,"total_columns_plan":0,"braced_bay_grids":[]},"road_data":{"roads":[]},"total_built_area_sqmt":0,"observations":[]}` }
     ]}],
-    maxTokens: 6000
+    maxTokens: 7000
   });
 
   const q = parseJSON(raw);
@@ -192,13 +401,24 @@ async function phase3_extractQuantities(files, meta, gcvTableContext='') {
 // ════════════════════════════════════════════
 // PHASE 4 — BOQ Calculation
 // ════════════════════════════════════════════
-async function phase4_calculateBOQ(quantities, meta) {
+async function phase4_calculateBOQ(quantities, meta, layout={}) {
   console.log('[Phase 4] Calculating BOQ...');
   if (!quantities) return null;
 
+  // Pull schedule_data out separately so Claude sees it clearly
+  const scheduleCtx = quantities.schedule_data
+    ? `\nSCHEDULE DATA FROM PHASE 3 (use these EXACT values — do NOT recalculate):\n${JSON.stringify(quantities.schedule_data, null, 2)}\n\nSECTION DETAILS FROM PHASE 3:\n${JSON.stringify(quantities.section_details||{}, null, 2)}\n\nGRID INFO FROM PHASE 3:\n${JSON.stringify(quantities.grid_info||{}, null, 2)}\n`
+    : '';
+
+  const isIndustrial = layout.drawingType === 'INDUSTRIAL_STEEL_RCC' ||
+    /industrial|steel_frame|rcc_footing/i.test(meta?.drawing_type||'');
+  const industrialBOQHint = isIndustrial
+    ? `\nINDUSTRIAL STEEL+RCC BOQ PARTS TO INCLUDE (if quantities available):\nPART A — EARTHWORK: Excavation in foundation (CUM), Backfilling & compaction (CUM), Dewatering (LS)\nPART B — PCC WORK: PCC M10 bed below footing 75mm thick (CUM)\nPART C — RCC WORK: RCC M40 Isolated Footing (CUM), RCC M40 Pedestal/Column (CUM)\nPART D — FORMWORK: Formwork to footing (SQM), Formwork to pedestal (SQM)\nPART E — REINFORCEMENT: Fe500D HYSD bars in footing (MT), Fe500D HYSD bars in pedestal (MT)\nPART F — BASE PLATE & ANCHOR BOLTS: M.S. Base plate fabrication & fixing (KG), H.D. Anchor bolts supply & fix (NOS), Non-shrink grout below base plate (CUM)\nPART G — MISCELLANEOUS: Anti-termite treatment (SQM)\n\nCALCULATION RULES for industrial footing BOQ:\n- Excavation CUM = footing plan area × (footing depth + PCC thickness + 0.3m working space) × 1.25 (slope factor)\n- PCC CUM = footing plan area × 0.075m\n- RCC Footing CUM = footing plan area × footing depth (from schedule)\n- RCC Pedestal CUM = pedestal plan area × pedestal height\n- Formwork = exposed surface area of each element\n- Steel in footing = RCC CUM × 80 kg/CUM (typical for isolated footing)\n- Steel in pedestal = RCC CUM × 200 kg/CUM (typical for column with base plate)\n- Base plate weight (KG) = plate area (m²) × thickness (assume 20mm) × 7850 kg/m³ × qty\n`
+    : '';
+
   const raw = await callClaude({
-    messages:[{ role:'user', content:`TASK PHASE 4: Calculate BOQ from quantities.\n\nQUANTITIES:\n${JSON.stringify(quantities,null,2)}\n\nDRAWING: type=${meta?.drawing_type||'?'} project=${meta?.project_name||'?'} scale=${meta?.scale||'?'}\n\nUse DSR 2025 rates from system prompt. Group into PARTS.\nReturn JSON:\n{"project_name":"","drawing_type":"","drawing_no":"","date":"","scale":"","boq":[{"sr":1,"part":"PART A","description":"","unit":"","qty":0,"rate":0,"amount":0,"source":"drawing|calculated|assumed","confidence":"high|medium|low"}],"element_counts":{},"area_statement":{"total_bua_sqmt":0,"floor_wise":[],"road_area_sqmt":0,"road_length_rmt":0},"cost_summary":{"civil_total_inr":0,"civil_total_lacs":0,"civil_total_crores":0},"observations":[],"missing_info":[]}` }],
-    maxTokens: 8192
+    messages:[{ role:'user', content:`TASK PHASE 4: Calculate complete BOQ from Phase 3 quantities and schedule data.\n\nDRAWING: type=${meta?.drawing_type||'?'} | project=${meta?.project_name||'?'} | scale=${meta?.scale||'?'} | concrete=${meta?.concrete_grade||'?'} | steel=${meta?.steel_grade||'?'}\n${scheduleCtx}\nALL QUANTITIES FROM PHASE 3:\n${JSON.stringify({quantities: quantities.quantities, element_counts: quantities.element_counts}, null, 2)}\n${industrialBOQHint}\nRATES: Use DSR 2025 rates from system prompt. If a specific item rate is not in DSR, use reasonable market rate for Gujarat.\nGroup items into PARTS (PART A, PART B etc.).\n\nIMPORTANT:\n- Calculate qty precisely using schedule data dimensions × count from schedule\n- Show formula/note in each BOQ item description so engineer can verify\n- Use "drawing-schedule" as source for items calculated directly from schedule values\n- Use "calculated" for items derived (earthwork volumes etc.)\n- Do NOT add items with qty=0 unless needed as placeholder with "not legible" note\n\nReturn JSON:\n{"project_name":"","drawing_type":"","drawing_no":"","date":"","scale":"","concrete_grade":"","steel_grade":"","boq":[{"sr":1,"part":"PART A","description":"","unit":"","qty":0,"rate":0,"amount":0,"source":"drawing-schedule|calculated|assumed","confidence":"high|medium|low","calc_note":""}],"element_counts":{},"area_statement":{"total_bua_sqmt":0,"floor_wise":[],"road_area_sqmt":0,"road_length_rmt":0},"cost_summary":{"civil_total_inr":0,"civil_total_lacs":0,"civil_total_crores":0},"observations":[],"missing_info":[]}` }],
+    maxTokens: 10000
   });
 
   const boq = parseJSON(raw);
@@ -209,12 +429,12 @@ async function phase4_calculateBOQ(quantities, meta) {
 // ════════════════════════════════════════════
 // PHASE 5 — Validation (Extended Thinking)
 // ════════════════════════════════════════════
-async function phase5_validateAndFlag(boqData) {
+async function phase5_validateAndFlag(boqData, layout={}) {
   console.log('[Phase 5] Validating with extended thinking...');
   if (!boqData) return boqData;
 
   const raw = await callClaude({
-    messages:[{ role:'user', content:`TASK PHASE 5: Validate this BOQ. Use extended thinking.\n\n${JSON.stringify(boqData,null,2)}\n\nCHECKS:\n1. Steel ratios (slab 100-140, beam 150-200, column 180-240 kg/CUM)\n2. Wall area vs floor area (0.6x to 1.2x)\n3. Road GSB: area x 1.15 x 0.3 x 1.8\n4. Road WMM: area x 1.15 x 0.2 x 2.1\n5. Cost per sqmt sanity (building Rs.1500-3500, road Rs.2000-4000)\n6. Any qty=0 with amount>0 (math error)\n7. Items with source=assumed\n\nAdd to existing JSON:\n- "validation_warnings":[{"item":"","check":"","expected":"","found":"","severity":"HIGH|MEDIUM|LOW"}]\n- "validation_passed":["check desc"]\n- "overall_confidence":"HIGH|MEDIUM|LOW"\n- "engineer_action_required":["what to verify manually"]` }],
+    messages:[{ role:'user', content:`TASK PHASE 5: Validate this BOQ. Use extended thinking.\n\n${JSON.stringify(boqData,null,2)}\n\nCHECKS:\n1. Steel ratios (slab 100-140, beam 150-200, column/pedestal 180-240 kg/CUM, footing 70-100 kg/CUM)\n2. For INDUSTRIAL drawings: verify footing CUM = plan area × depth for each footing type\n3. For INDUSTRIAL drawings: pedestal CUM = section area × height × count\n4. Road GSB: area x 1.15 x 0.3 x 1.8\n5. Road WMM: area x 1.15 x 0.2 x 2.1\n6. Cost per sqmt sanity (building Rs.1500-3500, road Rs.2000-4000, industrial foundation Rs.8000-15000 per column)\n7. Any qty=0 with amount>0 (math error)\n8. Items with source=assumed — flag for engineer review\n9. Base plate weight sanity: typical 300×300×20mm plate = ~14 kg\n10. Anchor bolt count: should be qty_columns × bolts_per_column\n11. Excavation volume ≥ footing volume (must include working space)\n12. Schedule data used correctly — no invented sizes\n\nAdd to existing JSON:\n- "validation_warnings":[{"item":"","check":"","expected":"","found":"","severity":"HIGH|MEDIUM|LOW"}]\n- "validation_passed":["check desc"]\n- "overall_confidence":"HIGH|MEDIUM|LOW"\n- "engineer_action_required":["what to verify manually"]\n- "pmc_flags":["IS code references for any issues found"]` }],
     maxTokens: 10000,
     thinking: true
   });
@@ -262,15 +482,21 @@ async function geminiAnalyzeDrawing(key, files, cvData, fetchFn) {
     gcvTableContext = `\n\nSCANNED PDF RAW TEXT (GCV):\n${cvData.gcv_raw_text.slice(0, 3000)}\nUse ONLY values present in this text.\n`;
   }
 
-  const meta        = await phase2_legendAndScale(files, cvData, gcvTableContext);
-  const quantities  = await phase3_extractQuantities(files, meta, gcvTableContext);
-  const boqData     = await phase4_calculateBOQ(quantities, meta);
-  const finalData   = await phase5_validateAndFlag(boqData);
+  // ── DETECT DRAWING LAYOUT AUTOMATICALLY ──────────────────────────
+  // This is the KEY step — it tells all phases HOW to read this drawing
+  // No hardcoded values — purely signal-based from GCV text + file metadata
+  const layout = detectDrawingLayout(files, cvData, gcvTableContext);
+  console.log(`[PMC] Layout detected: ${layout.drawingType} | Strategy: ${layout.layoutStrategy}`);
 
-  return buildFinalOutput(finalData, quantities, meta, cvData);
+  const meta        = await phase2_legendAndScale(files, cvData, gcvTableContext, layout);
+  const quantities  = await phase3_extractQuantities(files, meta, gcvTableContext, layout);
+  const boqData     = await phase4_calculateBOQ(quantities, meta, layout);
+  const finalData   = await phase5_validateAndFlag(boqData, layout);
+
+  return buildFinalOutput(finalData, quantities, meta, cvData, layout);
 }
 
-function buildFinalOutput(boq, quantities, meta, cvData) {
+function buildFinalOutput(boq, quantities, meta, cvData, layout={}) {
   if (!boq) return null;
   const totalInr   = boq.cost_summary?.civil_total_inr || 0;
   const totalLacs  = boq.cost_summary?.civil_total_lacs || Math.round(totalInr/100000*100)/100;
@@ -282,23 +508,29 @@ function buildFinalOutput(boq, quantities, meta, cvData) {
     drawing_type: boq.drawing_type||meta?.drawing_type||'',
     scale:        boq.scale||meta?.scale||'',
     date:         boq.date||meta?.date||'',
+    concrete_grade: boq.concrete_grade||meta?.concrete_grade||'',
+    steel_grade:    boq.steel_grade||meta?.steel_grade||'',
+    structural_system: meta?.structural_system||'',
     elements: (boq.boq||[]).map((item,i)=>({
       id:`E${String(i+1).padStart(3,'0')}`, type:guessType(item.description),
-      name:item.description, dimensions:{note:item.source||''},
+      name:item.description, dimensions:{note:item.calc_note||item.source||''},
       quantities:{
         area_sqmt:   item.unit==='sqmt'?item.qty:0,
-        volume_cum:  item.unit==='cum'?item.qty:0,
+        volume_cum:  ['cum','CUM'].includes(item.unit)?item.qty:0,
         gsb_ton:     /gsb/i.test(item.description)?item.qty:0,
         wmm_ton:     /wmm/i.test(item.description)?item.qty:0,
         pqc_cum:     /pqc/i.test(item.description)?item.qty:0,
-        steel_kg:    item.unit==='kg'?item.qty:0,
+        steel_kg:    ['kg','mt','ton','MT'].includes(item.unit?.toLowerCase())?item.qty:0,
         brickwork_cum:/brick/i.test(item.description)?item.qty:0,
       },
       cost_inr:{total:item.amount||0,per_unit:item.rate||0},
       confidence:item.confidence||'medium', annotation_found:item.source||'',
-      part:item.part||'', sr:item.sr||i+1,
+      part:item.part||'', sr:item.sr||i+1, calc_note:item.calc_note||'',
     })),
     element_counts:{...quantities?.element_counts,...boq.element_counts},
+    schedule_data: quantities?.schedule_data||{},      // ← Phase 3 schedule tables surfaced
+    section_details: quantities?.section_details||{},  // ← footing depth, cover, PCC thickness
+    grid_info: quantities?.grid_info||{},              // ← bay spacing, braced grids
     total_quantities:{
       total_area_sqmt: boq.area_statement?.total_bua_sqmt||0,
       total_road_rmt:  boq.area_statement?.road_length_rmt||0,
@@ -307,15 +539,20 @@ function buildFinalOutput(boq, quantities, meta, cvData) {
       pqc_total_cum:   sumKw(boq.boq,'pqc'),
       rcc_total_cum:   sumKw(boq.boq,'rcc'),
       steel_total_kg:  sumKw(boq.boq,'steel'),
+      footing_rcc_cum: sumKw(boq.boq,'footing'),
+      pedestal_rcc_cum:sumKw(boq.boq,'pedestal'),
+      base_plate_kg:   sumKw(boq.boq,'base plate'),
       calculation_note:'5-phase Claude pipeline',
     },
     cost_summary:{civil_total_inr:totalInr,civil_total_lacs:totalLacs,civil_total_crores:totalCr,item_wise:boq.boq||[]},
     area_statement:    boq.area_statement||{},
     validation_warnings:      boq.validation_warnings||[],
     validation_passed:        boq.validation_passed||[],
+    pmc_flags:                boq.pmc_flags||[],
     overall_confidence:       boq.overall_confidence||'MEDIUM',
     engineer_action_required: boq.engineer_action_required||[],
     legend: meta?.legend||[],
+    general_notes: meta?.general_notes||[],
     observations:[...(boq.observations||[]),...(boq.missing_info||[])],
     pmc_recommendation:`5-phase Claude pipeline. Confidence:${boq.overall_confidence||'MEDIUM'}. ${boq.engineer_action_required?.length?'Verify: '+boq.engineer_action_required.join(', '):'No major issues.'}`,
     extraction_confidence: boq.overall_confidence||'MEDIUM',
@@ -326,10 +563,19 @@ function buildFinalOutput(boq, quantities, meta, cvData) {
     pipeline_info:{
       phases_completed:5,
       phase2_legend_items:meta?.legend?.length||0,
+      phase2_schedule_tables:meta?.schedule_tables_visible||[],
       phase3_elements:quantities?.quantities?.length||0,
+      phase3_columns_read:quantities?.schedule_data?.columns?.length||0,
+      phase3_footings_read:quantities?.schedule_data?.footings?.length||0,
       phase4_boq_items:boq.boq?.length||0,
       phase5_warnings:boq.validation_warnings?.length||0,
       model:'claude-sonnet-4-6',
+      detected_layout:{
+        drawing_type: layout.drawingType||'UNKNOWN',
+        layout_strategy: layout.layoutStrategy||'STANDARD',
+        panel_map: layout.panelMap||{},
+        signals: layout.signals||{},
+      },
     },
   };
 }
@@ -338,11 +584,14 @@ function guessType(desc){
   if(!desc)return'GENERAL';
   const d=desc.toLowerCase();
   if(/road|gsb|wmm|pqc|kerb/.test(d))return'ROAD';
-  if(/steel|rebar|bar/.test(d))return'STEEL';
-  if(/rcc|slab|beam|column|footing/.test(d))return'STRUCTURE';
+  if(/steel|rebar|bar|fe500|hysd/.test(d))return'STEEL';
+  if(/base plate|anchor bolt|grout/.test(d))return'BASE_PLATE';
+  if(/rcc|slab|beam|column|footing|pedestal/.test(d))return'STRUCTURE';
+  if(/pcc|plain cement/.test(d))return'PCC';
   if(/brick|wall/.test(d))return'WALL';
-  if(/excavat|earth/.test(d))return'EARTHWORK';
-  if(/plaster|paint|floor|tile/.test(d))return'FINISH';
+  if(/excavat|earth|backfill|dewater/.test(d))return'EARTHWORK';
+  if(/plaster|paint|floor|tile|anti.?termite/.test(d))return'FINISH';
+  if(/formwork|shuttering/.test(d))return'FORMWORK';
   return'GENERAL';
 }
 
@@ -480,21 +729,25 @@ async function claudeAnalyzeDrawingVision(files, userText, aiResponse) {
   if (!imageParts.length) throw new Error('No image/PDF files provided for vision analysis');
 
   const strictScheduleRules = `
-═══════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════
 COLUMN / FOOTING SCHEDULE READING — ABSOLUTE RULES
-═══════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════
 1. ONLY read values that are PHYSICALLY PRINTED in the schedule table cells.
-2. Column sizes: copy the EXACT printed value (e.g. 300×300, 230×450).
+2. Column/Pedestal sizes: copy the EXACT printed value (e.g. 300×300, 230×450).
    - NEVER output 400×400, 450×450, 500×500 unless those numbers appear in the drawing.
-3. Main bars / stirrups: copy EXACTLY (e.g. 8-12Ø, 4-16Ø).
+3. Main bars / stirrups: copy EXACTLY (e.g. 8-12Ø, 4-16Ø, 10T16).
    - NEVER output 12-20Ø, 16-25Ø or any bar size not printed in the schedule.
 4. Column schedule and Footing schedule are COMPLETELY SEPARATE tables.
    - NEVER copy footing sizes/steel into the column table or vice versa.
-5. Qty (number of columns): use ONLY the qty column in the schedule.
-   - NEVER guess or count columns from the plan view.
+5. Qty (number of columns/footings): use ONLY the qty column in the schedule.
+   - NEVER guess or count from the plan view.
 6. If any cell is unclear / not legible → write "not legible" — do NOT guess.
-7. Source field must be "drawing-schedule" for schedule values, "calculated" for derived values.
-═══════════════════════════════════════════════════`;
+7. Source field: "drawing-schedule" for schedule values, "calculated" for derived.
+8. INDUSTRIAL DRAWING: If you see base plates, anchor bolts, BOD OF STEEL, braced bays:
+   - "Column Schedule" = RCC PEDESTAL schedule (not steel section schedule)
+   - Read base plate dimensions and anchor bolt pattern from detail panels
+   - Note concrete grade (M40 etc.) and steel grade (Fe500D etc.) from NOTES/title block
+═══════════════════════════════════════════════════════════`;
 
   const content = [
     ...imageParts,
@@ -508,6 +761,11 @@ ${aiResponse ? `\nPREVIOUS AI RESPONSE CONTEXT:\n${aiResponse}` : ''}
 Return ONLY raw JSON:
 {
   "drawing_type": "",
+  "project_name": "",
+  "drawing_no": "",
+  "concrete_grade": "",
+  "steel_grade": "",
+  "structural_system": "",
   "column_schedule": [
     {
       "col_mark": "",
@@ -524,13 +782,36 @@ Return ONLY raw JSON:
       "footing_mark": "",
       "size_mm": "",
       "depth_mm": "",
-      "main_bars": "",
+      "pcc_mm": 75,
+      "main_bars_x": "",
+      "main_bars_y": "",
       "qty": 0,
+      "pedestal_size_mm": "",
       "source": "drawing-schedule|not legible"
     }
   ],
+  "base_plate_schedule": [
+    {
+      "column_mark": "",
+      "plate_size_mm": "",
+      "anchor_bolt_nos": 0,
+      "anchor_bolt_dia_mm": 0,
+      "source": "drawing-schedule|not legible"
+    }
+  ],
+  "section_details": {
+    "footing_depth_mm": 0,
+    "pedestal_height_mm": 0,
+    "pcc_thickness_mm": 75,
+    "cover_mm": 50
+  },
+  "grid_info": {
+    "typical_bay_m": 0,
+    "total_columns_plan": 0,
+    "braced_bay_grids": []
+  },
   "boq": [
-    { "sr": 1, "part": "PART A", "description": "", "unit": "", "qty": 0, "rate": 0, "amount": 0, "source": "drawing-schedule|calculated", "confidence": "high|medium|low" }
+    { "sr": 1, "part": "PART A", "description": "", "unit": "", "qty": 0, "rate": 0, "amount": 0, "source": "drawing-schedule|calculated", "confidence": "high|medium|low", "calc_note": "" }
   ],
   "cost_summary": { "civil_total_inr": 0, "civil_total_lacs": 0 },
   "observations": [],
