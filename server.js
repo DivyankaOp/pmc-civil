@@ -169,8 +169,9 @@ async function extractScannedPdfWithGCV(pdfBase64) {
   }
 }
 
-// Keep pdfToImageTiles as fallback for scanned PDFs only
-async function pdfToImageTiles(pdfBase64, tilesPerPage = 4) {
+// PDF → high-res PNG tiles (full page + 4 quadrant crops for small text)
+// quadrants = true → returns [full, TL, TR, BL, BR] per page (5x zoom coverage)
+async function pdfToImageTiles(pdfBase64, tilesPerPage = 4, quadrants = true) {
   const { execSync } = require('child_process');
   const fs = require('fs');
   const os = require('os');
@@ -179,21 +180,40 @@ async function pdfToImageTiles(pdfBase64, tilesPerPage = 4) {
   try {
     fs.writeFileSync(pdfPath, Buffer.from(pdfBase64, 'base64'));
     const script = `
-import fitz, os, json, base64
+import fitz, json, base64
 doc = fitz.open('${pdfPath}')
 tiles = []
 for page_num in range(min(len(doc), 2)):
     page = doc[page_num]
-    mat = fitz.Matrix(8.0, 8.0)  # 800 DPI — high-res for schedule table legibility
-    pix = page.get_pixmap(matrix=mat)
-    tiles.append(base64.b64encode(pix.tobytes('png')).decode())
+    w, h = page.rect.width, page.rect.height
+
+    # Full page at 300 DPI (overview)
+    mat300 = fitz.Matrix(300/72, 300/72)
+    pix_full = page.get_pixmap(matrix=mat300, alpha=False)
+    tiles.append({'label': f'page_{page_num+1}_full', 'data': base64.b64encode(pix_full.tobytes('png')).decode()})
+
+    # 4 quadrant crops at 400 DPI each (2x zoom — critical for small schedule text)
+    quadrants = [
+        fitz.Rect(0, 0, w/2, h/2),        # Top-Left
+        fitz.Rect(w/2, 0, w, h/2),         # Top-Right
+        fitz.Rect(0, h/2, w/2, h),         # Bottom-Left
+        fitz.Rect(w/2, h/2, w, h),         # Bottom-Right
+    ]
+    labels = ['TL', 'TR', 'BL', 'BR']
+    mat400 = fitz.Matrix(400/72, 400/72)
+    for quad_rect, label in zip(quadrants, labels):
+        clip_pix = page.get_pixmap(matrix=mat400, clip=quad_rect, alpha=False)
+        tiles.append({'label': f'page_{page_num+1}_{label}', 'data': base64.b64encode(clip_pix.tobytes('png')).decode()})
+
 doc.close()
 print(json.dumps(tiles))
 `.trim();
     const scriptPath = tmpDir + '/convert.py';
     fs.writeFileSync(scriptPath, script);
-    const out = execSync(`python3 "${scriptPath}"`, { timeout: 120000, maxBuffer: 200 * 1024 * 1024 });
-    return JSON.parse(out.toString());
+    const out = execSync(`python3 "${scriptPath}"`, { timeout: 120000, maxBuffer: 300 * 1024 * 1024 });
+    const result = JSON.parse(out.toString());
+    // Return just the base64 data strings (backward-compatible)
+    return result.map(t => typeof t === 'object' ? t.data : t);
   } catch(e) {
     console.error('PDF tile error:', e.message);
     return null;
@@ -201,6 +221,77 @@ print(json.dumps(tiles))
     try { require('fs').rmSync(tmpDir, { recursive: true }); } catch(e) {}
   }
 }
+// ─── DRAWING PDF READING — inject extracted text as context ───────
+// This is the KEY fix: Claude gets BOTH the visual image AND the
+// machine-extracted text side-by-side, so it can cross-reference.
+// Even if Claude's vision misses a small dimension, the text covers it.
+async function buildDrawingContext(pdfB64) {
+  const parts = [];
+  let extractedTextBlock = '';
+
+  // Step 1: Extract text with XY coordinates (vector PDF)
+  const extracted = await extractPdfText(pdfB64);
+  const isVector = extracted?.is_vector;
+
+  if (isVector && extracted.pages?.length) {
+    // Build a spatial text map — group by Y position (rows)
+    const textLines = [];
+    for (const page of extracted.pages) {
+      const byY = {};
+      for (const t of (page.texts || [])) {
+        const row = Math.round(t.y / 15) * 15; // 15px tolerance per row
+        if (!byY[row]) byY[row] = [];
+        byY[row].push(t);
+      }
+      for (const row of Object.keys(byY).sort((a, b) => Number(a) - Number(b))) {
+        const line = byY[row].sort((a, b) => a.x - b.x).map(t => t.text).join('  ');
+        if (line.trim()) textLines.push(line);
+      }
+    }
+    const totalTexts = extracted.total_texts || 0;
+    extractedTextBlock = `=== MACHINE-EXTRACTED TEXT FROM DRAWING (${totalTexts} items — read left-to-right, top-to-bottom) ===\nIMPORTANT: These are ALL text labels, dimensions, and annotations in this drawing. Use these as your primary data source.\n\n${textLines.join('\n')}\n=== END EXTRACTED TEXT ===`;
+    console.log(`[drawing-context] Vector PDF: ${totalTexts} texts extracted`);
+  }
+
+  // Step 2: Try GCV for scanned PDFs (table structure)
+  let gcvBlock = '';
+  if (!isVector) {
+    const gcvResult = await extractScannedPdfWithGCV(pdfB64);
+    if (gcvResult?.pages?.length) {
+      gcvBlock = gcvResult.pages.map((p, i) => {
+        const rotNote = p.is_rotated ? ' [rotated]' : '';
+        return `=== PAGE ${i+1}${rotNote} (pipe-separated columns) ===\n${p.raw_text}`;
+      }).join('\n\n');
+      gcvBlock = `=== SCANNED PDF TABLE DATA (Google Cloud Vision — read cell by cell) ===\n${gcvBlock}\n=== END TABLE DATA ===`;
+      console.log(`[drawing-context] Scanned PDF: ${gcvResult.pages.length} pages via GCV`);
+    }
+  }
+
+  // Step 3: Always render PNG tiles (full page + 4 quadrant zooms)
+  // This gives Claude visual access to hatches, symbols, dimensions
+  const pngTiles = await pdfToImageTiles(pdfB64);
+  if (pngTiles?.length) {
+    for (const tile of pngTiles) {
+      parts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
+    }
+    console.log(`[drawing-context] ${pngTiles.length} PNG tiles (1 full + 4 quadrant zooms)`);
+  } else {
+    // Final fallback: send as PDF document
+    parts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
+  }
+
+  // Step 4: Inject extracted text AFTER images so Claude can cross-reference
+  const contextText = [extractedTextBlock, gcvBlock].filter(Boolean).join('\n\n');
+  if (contextText) {
+    parts.push({
+      type: 'text',
+      text: `\n\n${contextText}\n\nINSTRUCTION: You are looking at ${pngTiles?.length || 1} images above:\n- Image 1: Full page overview\n- Images 2-5: Quadrant zooms (Top-Left, Top-Right, Bottom-Left, Bottom-Right) for reading small text\nCross-reference the machine-extracted text above with what you see visually. The extracted text catches everything — use it to verify dimensions and schedule values you see in the images.`
+    });
+  }
+
+  return parts;
+}
+
 // ─── DIRECT CLAUDE CHAT ROUTE (no Gemini wrapper) ────────────────
 app.post('/claude', async (req, res) => {
   try {
@@ -209,51 +300,23 @@ app.post('/claude', async (req, res) => {
     if (!messages?.length) return res.status(400).json({ error: 'No messages.' });
     const systemToUse = (system && system.trim().length > 50) ? system : CIVIL_SYSTEM;
 
-    // ── SCANNED PDF FIX: Process each message's content parts ──
+    // ── PDF DRAWING FIX: Replace PDF with visual tiles + extracted text ──
     const processedMessages = [];
     for (const msg of messages) {
       if (!Array.isArray(msg.content)) { processedMessages.push(msg); continue; }
+
       const newParts = [];
       for (const part of msg.content) {
         if (part.type === 'document' && part.source?.media_type === 'application/pdf') {
           const pdfB64 = part.source.data;
-          // Step 1: Try vector extraction
-          const extracted = await extractPdfText(pdfB64);
-          if (extracted?.is_vector) {
-            // Vector PDF — Claude reads natively, keep as document + render PNG for schedules
-            console.log('[/claude] Vector PDF — sending as document + 800 DPI PNG tiles for schedule legibility');
+          console.log('[/claude] PDF detected — building drawing context (images + extracted text)');
+          try {
+            const drawingParts = await buildDrawingContext(pdfB64);
+            newParts.push(...drawingParts);
+          } catch (e) {
+            console.error('[/claude] Drawing context build failed:', e.message);
+            // Fallback: send PDF directly
             newParts.push(part);
-            // CRITICAL FIX: Also render high-res PNG tiles so schedule tables are always visually legible
-            const pngTilesVec = await pdfToImageTiles(pdfB64, 2);
-            if (pngTilesVec?.length) {
-              for (const tile of pngTilesVec) {
-                newParts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
-              }
-              console.log('[/claude] Vector PDF → ' + pngTilesVec.length + ' high-res PNG tiles sent for schedule reading');
-            }
-          } else {
-            // Scanned PDF — convert to PNG tiles so Claude SEES it
-            console.log('[/claude] Scanned PDF detected — converting to PNG tiles');
-            // Try GCV first
-            const gcvResult = await extractScannedPdfWithGCV(pdfB64);
-            if (gcvResult?.pages?.length) {
-              const gcvText = gcvResult.pages.map((p, i) => {
-                const rotNote = p.is_rotated ? ' [rotated table — x/y swapped]' : '';
-                return `=== PAGE ${i+1}${rotNote} ===\n${p.raw_text}`;
-              }).join('\n\n');
-              newParts.push({ type: 'text', text: `[STRUCTURED TABLE DATA from scanned PDF — read cell by cell, pipe-separated]:\n${gcvText}\n\nIMPORTANT: Use ONLY these exact values. Do not say "not legible" if value is present above.` });
-            }
-            // Always also convert to PNG for visual reading
-            const pngTiles = await pdfToImageTiles(pdfB64, 2);
-            if (pngTiles?.length) {
-              for (const tile of pngTiles) {
-                newParts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
-              }
-              console.log(`[/claude] Scanned PDF → ${pngTiles.length} PNG tiles sent to Claude`);
-            } else {
-              // Fallback: send as document anyway
-              newParts.push(part);
-            }
           }
         } else {
           newParts.push(part);
@@ -293,30 +356,16 @@ app.post('/gemini', async (req, res) => {
         } else if (part.inline_data) {
           const mt = part.inline_data.mime_type;
           if (mt === 'application/pdf') {
-            const pdfB64 = part.inline_data.data;
-            const extracted = await extractPdfText(pdfB64);
-            if (extracted?.is_vector) {
-              console.log('[/gemini] Vector PDF — sending as document');
-              claudeParts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
-            } else {
-              console.log('[/gemini] Scanned PDF — converting to PNG tiles');
-              const gcvResult = await extractScannedPdfWithGCV(pdfB64);
-              if (gcvResult?.pages?.length) {
-                const gcvText = gcvResult.pages.map((p, i) => {
-                  const rotNote = p.is_rotated ? ' [rotated table — x/y swapped]' : '';
-                  return `=== PAGE ${i+1}${rotNote} ===\n${p.raw_text}`;
-                }).join('\n\n');
-                claudeParts.push({ type: 'text', text: `[STRUCTURED TABLE DATA from scanned PDF — pipe-separated rows/columns]:\n${gcvText}\n\nIMPORTANT: Use ONLY these exact values. Do not say "not legible" if value is present above.` });
-              }
-              const pngTiles = await pdfToImageTiles(pdfB64, 2);
-              if (pngTiles?.length) {
-                for (const tile of pngTiles) {
-                  claudeParts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
-                }
-              } else {
-                claudeParts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
-              }
+            // Use unified drawing context builder (images + extracted text)
+            console.log('[/gemini] PDF — using buildDrawingContext');
+            try {
+              const drawingParts = await buildDrawingContext(part.inline_data.data);
+              claudeParts.push(...drawingParts);
+            } catch (e) {
+              console.error('[/gemini] buildDrawingContext failed:', e.message);
+              claudeParts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: part.inline_data.data } });
             }
+          } else if (mt?.startsWith('image/')) {
           } else if (mt?.startsWith('image/')) {
             claudeParts.push({ type: 'image', source: { type: 'base64', media_type: mt, data: part.inline_data.data } });
           }
@@ -731,124 +780,28 @@ app.post('/export-drawing', async (req, res) => {
       catch(e) { console.log('CV skipped:', e.message); }
     }
 
-    // Step 2: For vector PDFs — extract text first (FREE, no image tokens needed)
-    // For scanned images — go directly to Claude vision (single call)
+    // Step 2: Build drawing context — images + extracted text (replaces complex PDF pipeline)
+    // Uses buildDrawingContext() which: extracts vector text, renders quadrant tiles, adds GCV if scanned
     const pdfFiles = (files||[]).filter(f => f.type === 'application/pdf' || f.name?.match(/\.pdf$/i));
     if (pdfFiles.length > 0) {
-      const extracted = await extractPdfText(pdfFiles[0].b64);
-      if (extracted?.is_vector && extracted.pages?.length) {
-        // Vector PDF: attach extracted texts to cvData so geminiAnalyzeDrawing can use them
-        const allTexts = extracted.pages.flatMap(p => p.texts || []);
-        cvData.pdf_extracted_texts = allTexts;
-        cvData.pdf_is_vector = true;
-        console.log(`[PDF] Vector PDF detected — extracted ${allTexts.length} texts`);
-        // CRITICAL FIX: Also render 800 DPI PNG tiles for visual schedule table reading
-        // Vector text extraction alone misses schedule tables with complex cell layouts
-        try {
-          const pngTilesVec = await pdfToImageTiles(pdfFiles[0].b64, 2);
-          if (pngTilesVec?.length) {
-            const pdfIdx = files.findIndex(f => f.type === 'application/pdf' || f.name?.match(/\.pdf$/i));
-            if (pdfIdx >= 0) files.splice(pdfIdx, 1);
-            pngTilesVec.forEach((tile, i) => {
-              files.push({ type: 'image/png', b64: tile, name: `vector_page_${i+1}.png` });
-            });
-            console.log(`[PDF] Vector PDF → ${pngTilesVec.length} high-res PNG tiles added for schedule reading`);
+      try {
+        const drawingParts = await buildDrawingContext(pdfFiles[0].b64);
+        // Extract PNG tiles from drawingParts and add to files array for geminiAnalyzeDrawing
+        const pdfIdx = files.findIndex(f => f.type === 'application/pdf' || f.name?.match(/\.pdf$/i));
+        if (pdfIdx >= 0) files.splice(pdfIdx, 1);
+        let tileCount = 0;
+        for (const part of drawingParts) {
+          if (part.type === 'image' && part.source?.type === 'base64') {
+            files.push({ type: 'image/png', b64: part.source.data, name: `pdf_tile_${++tileCount}.png` });
           }
-        } catch(e) {
-          console.warn('[PDF→PNG vector] Conversion failed, using text extraction only:', e.message);
-        }
-      } else {
-        // Scanned PDF: use Google Cloud Vision API (table-aware) — do NOT send image to Claude
-        console.log('[PDF] Scanned PDF detected — attempting Google Cloud Vision table extraction');
-        const gcvResult = await extractScannedPdfWithGCV(pdfFiles[0].b64);
-        if (gcvResult?.pages?.length) {
-          // Pass raw GCV rows to Claude for structure validation + correction
-          // Claude fixes merged cells, rotated text, wrong groupings — uses only what's in the table
-          const gcvRaw = gcvResult.pages.map((p, i) => {
-            const rowsText = p.table_rows.map((r, ri) => `  Row ${ri+1}: ${r.join(' | ')}`).join('\n');
-            return `Page ${i+1} GCV extracted rows:\n${rowsText}`;
-          }).join('\n\n');
-
-          const claudeKey = process.env.CLAUDE_API_KEY;
-          let validatedTableData = null;
-          try {
-            const validationResp = await fetch('https://api.anthropic.com/v1/messages', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': claudeKey,
-                'anthropic-version': '2023-06-01'
-              },
-              body: JSON.stringify({
-                model: 'claude-sonnet-4-20250514',
-                max_tokens: 4096,
-                messages: [{
-                  role: 'user',
-                  content: `You are a civil engineering document parser. Below is raw OCR output from Google Cloud Vision extracted from a scanned PDF (BOQ/schedule/rate table).
-
-IMPORTANT RULES:
-- Use ONLY values that are explicitly present in the OCR text — do NOT assume, infer, or fill in any missing values
-- Fix obvious OCR grouping errors (merged cells split incorrectly, rotated text, misaligned columns)
-- Identify column headers from the first rows
-- Return structured JSON with: headers (array of column names) and rows (array of arrays matching headers)
-- If a cell is blank/missing in the source, use null — never guess a value
-
-RAW GCV OCR DATA:
-${gcvRaw}
-
-Return ONLY valid JSON, no markdown:
-{"headers":["col1","col2",...],"rows":[["val1","val2",...],...],"confidence":"HIGH|MEDIUM|LOW","issues_fixed":["description of any corrections made"]}`
-                }]
-              })
-            });
-            const vData = await validationResp.json();
-            const vText = vData.content?.find(b => b.type === 'text')?.text || '';
-            validatedTableData = JSON.parse(vText.replace(/```json|```/g, '').trim());
-            console.log(`[GCV+Claude] Table validated: ${validatedTableData.headers?.length} cols, ${validatedTableData.rows?.length} rows, confidence: ${validatedTableData.confidence}`);
-          } catch(e) {
-            console.warn('[GCV+Claude] Validation failed, using raw GCV:', e.message);
-          }
-
-          cvData.gcv_table_pages = gcvResult.pages;
-          cvData.gcv_validated_table = validatedTableData;  // Claude-corrected structure
-          cvData.gcv_raw_text = gcvResult.pages.map(p => p.raw_text).join('\n');
-          cvData.pdf_is_gcv = true;
-          console.log(`[PDF] GCV table extraction OK — ${gcvResult.pages.length} pages structured`);
-
-          // ── KEY FIX: Convert scanned PDF → 300 DPI PNG so Claude SEES the drawing visually ──
-          // Raw scanned PDF as 'document' fails — Claude finds no text, assumes values.
-          // High-res PNG lets Claude read rotated text, overlapping dims, schedule tables.
-          try {
-            const pngTiles = await pdfToImageTiles(pdfFiles[0].b64, 2);
-            if (pngTiles?.length) {
-              const pdfIdx = files.findIndex(f => f.type === 'application/pdf' || f.name?.match(/\.pdf$/i));
-              if (pdfIdx >= 0) files.splice(pdfIdx, 1);
-              pngTiles.forEach((tile, i) => {
-                files.push({ type: 'image/png', b64: tile, name: `scanned_page_${i+1}.png` });
-              });
-              console.log(`[PDF] Scanned PDF → ${pngTiles.length} PNG tiles for Claude vision`);
-            }
-          } catch(e) {
-            console.warn('[PDF→PNG] Conversion failed, PDF stays as document:', e.message);
-          }
-        } else {
-          // GCV unavailable: still convert PDF to PNG for Claude vision
-          console.log('[PDF] GCV unavailable — converting scanned PDF to PNG for Claude vision');
-          cvData.pdf_scanned_fallback = true;
-          try {
-            const pngTiles = await pdfToImageTiles(pdfFiles[0].b64, 2);
-            if (pngTiles?.length) {
-              const pdfIdx = files.findIndex(f => f.type === 'application/pdf' || f.name?.match(/\.pdf$/i));
-              if (pdfIdx >= 0) files.splice(pdfIdx, 1);
-              pngTiles.forEach((tile, i) => {
-                files.push({ type: 'image/png', b64: tile, name: `scanned_page_${i+1}.png` });
-              });
-              console.log(`[PDF] Fallback: Scanned PDF → ${pngTiles.length} PNG tiles`);
-            }
-          } catch(e) {
-            console.warn('[PDF→PNG fallback] Failed:', e.message);
+          // Extract the text context and add to cvData
+          if (part.type === 'text' && part.text?.includes('MACHINE-EXTRACTED TEXT')) {
+            cvData.drawing_context_text = part.text;
           }
         }
+        console.log(`[export-drawing] PDF → ${tileCount} tiles via buildDrawingContext`);
+      } catch(e) {
+        console.warn('[export-drawing] buildDrawingContext failed:', e.message);
       }
     }
 
