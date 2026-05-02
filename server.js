@@ -88,7 +88,7 @@ async function extractLargePdfViaImageOCR(pdfBase64, gcvKey) {
     // Render each page to PNG at 200 DPI (balance quality vs size for GCV)
     const script = `
 import fitz, base64, json
-doc = fitz.open('${pdfPath.replace(/\/g, '/')}')
+doc = fitz.open('${pdfPath}')
 tiles = []
 for i in range(min(len(doc), 3)):
     page = doc[i]
