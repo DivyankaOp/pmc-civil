@@ -93,7 +93,7 @@ doc = fitz.open('${pdfPath}')
 tiles = []
 for i in range(min(len(doc), 3)):
     page = doc[i]
-    pix = page.get_pixmap(matrix=fitz.Matrix(200/72, 200/72), alpha=False)
+    pix = page.get_pixmap(matrix=fitz.Matrix(400/72, 400/72), alpha=False)
     tiles.append(base64.b64encode(pix.tobytes('png')).decode())
 doc.close()
 print(json.dumps(tiles))
@@ -152,7 +152,7 @@ doc = fitz.open('${pdfPath}')
 paths = []
 for i in range(min(len(doc), 5)):
     page = doc[i]
-    pix = page.get_pixmap(matrix=fitz.Matrix(200/72, 200/72), alpha=False)
+    pix = page.get_pixmap(matrix=fitz.Matrix(400/72, 400/72), alpha=False)
     p = '${tmpDir}/page_{}.png'.format(i)
     pix.save(p)
     paths.append(p)
@@ -168,7 +168,7 @@ print(json.dumps(paths))
     const pages = [];
     for (const pngPath of pngPaths) {
       try {
-        const ocrOut = execSync(`tesseract "${pngPath}" stdout --oem 1 --psm 6 -l eng`, {
+        const ocrOut = execSync(`tesseract "${pngPath}" stdout --oem 1 --psm 11 -l eng`, {
           timeout: 30000, maxBuffer: 5 * 1024 * 1024
         });
         const text = ocrOut.toString().trim();
@@ -199,18 +199,23 @@ async function pdfToImageTiles(pdfBase64, tilesPerPage = 4, quadrants = true) {
   const pdfPath = tmpDir + '/input.pdf';
   try {
     fs.writeFileSync(pdfPath, Buffer.from(pdfBase64, 'base64'));
-    // COST FIX: Sirf 1 full page per page at 150 DPI — no quadrants
-    // Previously: 2 pages × 5 tiles = 10 images per upload (~$3-4)
-    // Now: max 2 pages × 1 tile = 2 images per upload (~$0.40)
+    // DPI 250 for scanned drawings — schedule table cells need high resolution to be legible
+    // Previously 150 DPI was too low for A1/A0 scanned drawings — bar sizes, footing dims not readable
+    // Now: 250 DPI balances readability vs token cost — adds ~1 tile per page but schedule cells legible
     const script = `
 import fitz, json, base64
 doc = fitz.open('${pdfPath}')
 tiles = []
 for page_num in range(min(len(doc), 2)):
     page = doc[page_num]
-    mat = fitz.Matrix(150/72, 150/72)
+    mat = fitz.Matrix(400/72, 400/72)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     tiles.append({'label': f'page_{page_num+1}_full', 'data': base64.b64encode(pix.tobytes('png')).decode()})
+    # Also add a zoomed crop of bottom-right (where schedules usually are)
+    w, h = page.rect.width, page.rect.height
+    sched_rect = fitz.Rect(w*0.45, h*0.45, w, h)
+    pix2 = page.get_pixmap(matrix=mat, alpha=False, clip=sched_rect)
+    tiles.append({'label': f'page_{page_num+1}_schedule_zoom', 'data': base64.b64encode(pix2.tobytes('png')).decode()})
 doc.close()
 print(json.dumps(tiles))
 `.trim();
@@ -276,26 +281,31 @@ async function buildDrawingContext(pdfB64) {
     console.log('[drawing-context] GCV returned no data — check API key or drawing format');
   }
 
-  // Step 3: PNG tiles — ONLY send if BOTH PyMuPDF AND GCV failed to extract useful text
-  // FIX: Previously PyMuPDF partial text (title block only, >200 chars) was making
-  // hasGoodText=true, so images were skipped AND GCV was skipped → Claude got incomplete data.
-  // Now: good text = GCV extracted something OR PyMuPDF got substantial text (>500 chars = real schedule data)
-  const hasGoodText = (gcvBlock.length > 200) || (extractedTextBlock.length > 500);
+  // Step 3: PNG tiles — ALWAYS send for scanned PDFs so Claude can visually read schedule tables
+  // FIX: Previously tiles were skipped when Tesseract extracted ANY text (hasGoodText=true).
+  // Problem: Tesseract gets title block text but misses table cell values (numbers, bar sizes).
+  // Solution: ALWAYS send PNG tiles alongside extracted text — Claude cross-references both.
+  // PNG tiles are only skipped for vector PDFs with substantial text (>2000 chars = full schedule).
+  const hasFullText = (extractedTextBlock.length > 2000); // vector PDF with complete schedule
+  const hasAnyText  = (gcvBlock.length > 200) || (extractedTextBlock.length > 200);
 
-  if (!hasGoodText) {
-    // No text extracted — send PNG tiles so Claude can at least see the drawing
-    // but add a strong warning that it must say "not legible" for anything unclear
-    const pngTiles = await pdfToImageTiles(pdfB64);
-    if (pngTiles?.length) {
-      for (const tile of pngTiles) {
-        parts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
-      }
-      console.log(`[drawing-context] No text extracted — sending ${pngTiles.length} PNG tiles for visual fallback`);
-    } else {
-      parts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
+  // Always render high-res PNG tiles for visual reading
+  const pngTiles = await pdfToImageTiles(pdfB64);
+
+  if (pngTiles?.length) {
+    for (const tile of pngTiles) {
+      parts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
     }
+    console.log(`[drawing-context] Sending ${pngTiles.length} PNG tiles (always-on for scanned PDF visual reading)`);
+  } else if (!hasAnyText) {
+    // No tiles AND no text — raw PDF fallback
+    parts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
+  }
+
+  if (hasFullText) {
+    console.log(`[drawing-context] Vector PDF with full text (${extractedTextBlock.length} chars) — tiles sent as visual supplement`);
   } else {
-    console.log(`[drawing-context] Text extracted (${extractedTextBlock.length + gcvBlock.length} chars) — skipping images to prevent Claude from guessing visually`);
+    console.log(`[drawing-context] Scanned PDF — tiles + OCR text sent together for cross-reference`);
   }
 
   // Step 4: Inject extracted text with HARD instruction to use text only
