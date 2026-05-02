@@ -73,14 +73,80 @@ print(json.dumps({"pages": pages, "is_vector": any(len(p["texts"])>10 for p in p
 // Returns structured JSON that Claude can use to calculate BOQ — we do NOT
 // send the raw image to Claude directly (too many tokens, no table structure).
 // Cost: ~$1.50 per 1000 pages — effectively free for typical usage.
+
+// Large PDF fallback: PyMuPDF renders pages to PNG tiles → GCV images:annotate OCRs each tile
+// images:annotate has no PDF size limit — works for any large A0/A1 drawing
+async function extractLargePdfViaImageOCR(pdfBase64, gcvKey) {
+  const { execSync } = require('child_process');
+  const fs = require('fs');
+  const os = require('os');
+  const tmpDir = fs.mkdtempSync(os.tmpdir() + '/pmc_large_');
+  const pdfPath = tmpDir + '/input.pdf';
+  try {
+    fs.writeFileSync(pdfPath, Buffer.from(pdfBase64, 'base64'));
+
+    // Render each page to PNG at 200 DPI (balance quality vs size for GCV)
+    const script = `
+import fitz, base64, json
+doc = fitz.open('${pdfPath.replace(/\/g, '/')}')
+tiles = []
+for i in range(min(len(doc), 3)):
+    page = doc[i]
+    pix = page.get_pixmap(matrix=fitz.Matrix(200/72, 200/72), alpha=False)
+    tiles.append(base64.b64encode(pix.tobytes('png')).decode())
+doc.close()
+print(json.dumps(tiles))
+`.trim();
+    const sp = tmpDir + '/r.py';
+    fs.writeFileSync(sp, script);
+    const out = execSync(`python3 "${sp}"`, { timeout: 60000, maxBuffer: 100 * 1024 * 1024 });
+    const tiles = JSON.parse(out.toString());
+    console.log(`[GCV-Large] Rendered ${tiles.length} page tiles from large PDF`);
+
+    // OCR each tile using images:annotate (no size restriction)
+    const pages = [];
+    for (let i = 0; i < tiles.length; i++) {
+      try {
+        const gcvRes = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${gcvKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ requests: [{ image: { content: tiles[i] }, features: [{ type: 'DOCUMENT_TEXT_DETECTION' }] }] }),
+          signal: AbortSignal.timeout(30000)
+        });
+        if (!gcvRes.ok) continue;
+        const data = await gcvRes.json();
+        const text = data.responses?.[0]?.fullTextAnnotation?.text || '';
+        if (text.trim()) {
+          const lines = text.split('\n').filter(l => l.trim());
+          pages.push({ table_rows: lines.map(l => [l]), raw_text: lines.join('\n'), is_rotated: false });
+          console.log(`[GCV-Large] Page ${i+1}: ${text.length} chars`);
+        }
+      } catch(e) { console.error(`[GCV-Large] Page ${i+1} failed:`, e.message); }
+    }
+    return pages.length ? { pages, is_gcv: true } : null;
+  } catch(e) {
+    console.error('[GCV-Large] Error:', e.message);
+    return null;
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch(e) {}
+  }
+}
+
 async function extractScannedPdfWithGCV(pdfBase64) {
   const gcvKey = process.env.GOOGLE_CLOUD_VISION_API_KEY;
   if (!gcvKey) {
-    console.warn('[GCV] GOOGLE_CLOUD_VISION_API_KEY not set — falling back to Claude vision');
+    console.warn('[GCV] GOOGLE_CLOUD_VISION_API_KEY not set');
     return null;
   }
+  // BUG FIX: GCV has 20MB limit for inline PDF
+  const pdfBytes = Buffer.from(pdfBase64, 'base64');
+  const pdfMB = pdfBytes.length / 1024 / 1024;
+  // Large PDF (>19MB): GCV files:annotate won't work — use tile strategy instead
+  if (pdfMB > 19) {
+    console.log(`[GCV] PDF ${pdfMB.toFixed(1)}MB > 19MB limit — switching to tile+OCR strategy`);
+    return await extractLargePdfViaImageOCR(pdfBase64, gcvKey);
+  }
   try {
-    // GCV Document Text Detection supports inline PDF (up to 5 pages, max 20MB)
     const gcvUrl = `https://vision.googleapis.com/v1/files:annotate?key=${gcvKey}`;
     const gcvBody = {
       requests: [{
@@ -106,8 +172,10 @@ async function extractScannedPdfWithGCV(pdfBase64) {
     // Extract structured table data from GCV blocks/paragraphs/words
     const pages = [];
     for (const resp of responses) {
+      // BUG FIX: Always capture fullTextAnnotation.text — if block parsing fails, use this
+      const rawFullText = resp.fullTextAnnotation?.text || '';
+      const cells = [];
       for (const pageAnnot of (resp.fullTextAnnotation?.pages || [])) {
-        const cells = [];
         for (const block of (pageAnnot.blocks || [])) {
           for (const para of (block.paragraphs || [])) {
             const cellText = (para.words || [])
@@ -124,46 +192,44 @@ async function extractScannedPdfWithGCV(pdfBase64) {
             }
           }
         }
-        // FIX 3: Detect rotation — if most blocks taller than wide, table is 90deg rotated
-        const rotatedCount = cells.filter(c => c.h > c.w * 1.5).length;
-        const isRotated = cells.length > 0 && rotatedCount > cells.length * 0.4;
-        if (isRotated) console.log('[GCV] Rotated table detected — swapping x/y for grouping');
-
-        // Sort by primary axis
-        cells.sort((a, b) => isRotated ? (a.x - b.x || a.y - b.y) : (a.y - b.y || a.x - b.x));
-
-        // FIX 2: Dynamic threshold based on avg cell height (not hardcoded 15px)
-        const avgSize = cells.reduce((s, c) => s + (isRotated ? c.w : c.h), 0) / (cells.length || 1);
-        const threshold = Math.max(25, avgSize * 0.6);
-
-        // Group into rows
-        const tableRows = [];
-        let currentAxisVal = -1, currentRow = [];
-        for (const cell of cells) {
-          const axisVal = isRotated ? cell.x : cell.y;
-          if (Math.abs(axisVal - currentAxisVal) > threshold) {
-            if (currentRow.length) {
-              currentRow.sort((a, b) => isRotated ? a.y - b.y : a.x - b.x);
-              tableRows.push(currentRow.map(c => c.text));
-            }
-            currentRow = [cell];
-            currentAxisVal = axisVal;
-          } else {
-            currentRow.push(cell);
-          }
-        }
-        if (currentRow.length) {
-          currentRow.sort((a, b) => isRotated ? a.y - b.y : a.x - b.x);
-          tableRows.push(currentRow.map(c => c.text));
-        }
-
-        // FIX 1: raw_text = structured pipe-separated format (not raw dump)
-        const formattedText = tableRows.map(r => r.join(' | ')).join('\n');
-        pages.push({ table_rows: tableRows, raw_text: formattedText, is_rotated: isRotated });
       }
+      // BUG FIX: If block parsing gave no cells, fall back to raw text line-by-line
+      if (cells.length === 0 && rawFullText.trim()) {
+        console.log('[GCV] Blocks empty — using raw fullTextAnnotation.text fallback');
+        const lines = rawFullText.split('\n').filter(l => l.trim());
+        pages.push({ table_rows: lines.map(l => [l]), raw_text: lines.join('\n'), is_rotated: false });
+        continue;
+      }
+      const rotatedCount = cells.filter(c => c.h > c.w * 1.5).length;
+      const isRotated = cells.length > 0 && rotatedCount > cells.length * 0.4;
+      if (isRotated) console.log('[GCV] Rotated table detected');
+      cells.sort((a, b) => isRotated ? (a.x - b.x || a.y - b.y) : (a.y - b.y || a.x - b.x));
+      const avgSize = cells.reduce((s, c) => s + (isRotated ? c.w : c.h), 0) / (cells.length || 1);
+      const threshold = Math.max(25, avgSize * 0.6);
+      const tableRows = [];
+      let currentAxisVal = -1, currentRow = [];
+      for (const cell of cells) {
+        const axisVal = isRotated ? cell.x : cell.y;
+        if (Math.abs(axisVal - currentAxisVal) > threshold) {
+          if (currentRow.length) {
+            currentRow.sort((a, b) => isRotated ? a.y - b.y : a.x - b.x);
+            tableRows.push(currentRow.map(c => c.text));
+          }
+          currentRow = [cell];
+          currentAxisVal = axisVal;
+        } else {
+          currentRow.push(cell);
+        }
+      }
+      if (currentRow.length) {
+        currentRow.sort((a, b) => isRotated ? a.y - b.y : a.x - b.x);
+        tableRows.push(currentRow.map(c => c.text));
+      }
+      const formattedText = tableRows.map(r => r.join(' | ')).join('\n');
+      pages.push({ table_rows: tableRows, raw_text: formattedText, is_rotated: isRotated });
     }
-    console.log(`[GCV] Scanned PDF: extracted ${pages.length} pages with table structure`);
-    return { pages, is_gcv: true };
+    console.log(`[GCV] Extracted ${pages.length} pages | PDF: ${(pdfBytes.length/1024).toFixed(0)}KB`);
+    return pages.length ? { pages, is_gcv: true } : null;
   } catch (e) {
     console.error('[GCV] Error:', e.message);
     return null;
@@ -329,13 +395,58 @@ app.post('/claude', async (req, res) => {
       for (const part of msg.content) {
         if (part.type === 'document' && part.source?.media_type === 'application/pdf') {
           const pdfB64 = part.source.data;
-          console.log('[/claude] PDF detected — building drawing context (images + extracted text)');
+          console.log('[/claude] PDF detected — building drawing context (GCV + PyMuPDF + tiles)');
           try {
             const drawingParts = await buildDrawingContext(pdfB64);
             newParts.push(...drawingParts);
           } catch (e) {
             console.error('[/claude] Drawing context build failed:', e.message);
-            // Fallback: send PDF directly
+            newParts.push(part);
+          }
+        } else if (part.type === 'image' && part.source?.type === 'base64') {
+          // BUG FIX: Image drawings (PNG/JPG) were going directly to Claude without GCV OCR
+          // Now: run GCV image OCR first, inject text, then send image as fallback
+          const imgB64 = part.source.data;
+          const imgMime = part.source.media_type || 'image/png';
+          console.log('[/claude] Image drawing — running GCV OCR...');
+          try {
+            const gcvKey = process.env.GOOGLE_CLOUD_VISION_API_KEY;
+            if (gcvKey) {
+              const gcvRes = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${gcvKey}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ requests: [{ image: { content: imgB64 }, features: [{ type: 'DOCUMENT_TEXT_DETECTION' }] }] }),
+                signal: AbortSignal.timeout(30000)
+              });
+              if (gcvRes.ok) {
+                const gcvData = await gcvRes.json();
+                const ocrText = gcvData.responses?.[0]?.fullTextAnnotation?.text || '';
+                if (ocrText.trim().length > 50) {
+                  console.log(`[/claude] GCV image OCR: ${ocrText.length} chars extracted`);
+                  newParts.push({
+                    type: 'text',
+                    text: `CRITICAL INSTRUCTION: Use ONLY this GCV-extracted text for all values. DO NOT guess from image.
+
+=== IMAGE OCR TEXT ===
+${ocrText}
+=== END OCR TEXT ===
+If a value is not above → write "not found in drawing".`
+                  });
+                  // Still send image but OCR text takes priority
+                  newParts.push(part);
+                } else {
+                  // OCR got nothing — send image with warning
+                  newParts.push(part);
+                  newParts.push({ type: 'text', text: 'WARNING: OCR extracted no text from this image. Only report values you can read with 100% certainty. Anything unclear → "not legible".' });
+                }
+              } else {
+                newParts.push(part);
+              }
+            } else {
+              newParts.push(part);
+            }
+          } catch (e) {
+            console.error('[/claude] Image GCV failed:', e.message);
             newParts.push(part);
           }
         } else {
