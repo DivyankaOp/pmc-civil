@@ -53,7 +53,8 @@ for page_num in range(min(len(doc), 5)):
                         texts.append({"text": t, "x": round(x,2), "y": round(y,2), "size": round(span.get("size",10),1)})
     pages.append({"page": page_num+1, "texts": texts, "width": page.rect.width, "height": page.rect.height})
 doc.close()
-print(json.dumps({"pages": pages, "is_vector": any(len(p["texts"])>10 for p in pages)}))
+total = sum(len(p["texts"]) for p in pages)
+print(json.dumps({"pages": pages, "is_vector": any(len(p["texts"])>10 for p in pages), "total_texts": total}))
 `.trim();
     const scriptPath = tmpDir + '/extract.py';
     fs.writeFileSync(scriptPath, script);
@@ -253,25 +254,28 @@ async function buildDrawingContext(pdfB64) {
     console.log(`[drawing-context] Vector PDF: ${totalTexts} texts extracted`);
   }
 
-  // Step 2: Try GCV for scanned PDFs (table structure)
+  // Step 2: ALWAYS run GCV — not just for scanned PDFs
+  // BUG FIX: PyMuPDF marks PDF as "vector" if it finds >10 texts (title block, axis labels)
+  // but schedule table cells are still not extractable — GCV was being skipped wrongly.
+  // Now: run GCV on ALL PDFs and merge with PyMuPDF text for complete coverage.
   let gcvBlock = '';
-  if (!isVector) {
-    const gcvResult = await extractScannedPdfWithGCV(pdfB64);
-    if (gcvResult?.pages?.length) {
-      gcvBlock = gcvResult.pages.map((p, i) => {
-        const rotNote = p.is_rotated ? ' [rotated]' : '';
-        return `=== PAGE ${i+1}${rotNote} (pipe-separated columns) ===\n${p.raw_text}`;
-      }).join('\n\n');
-      gcvBlock = `=== SCANNED PDF TABLE DATA (Google Cloud Vision — read cell by cell) ===\n${gcvBlock}\n=== END TABLE DATA ===`;
-      console.log(`[drawing-context] Scanned PDF: ${gcvResult.pages.length} pages via GCV`);
-    }
+  const gcvResult = await extractScannedPdfWithGCV(pdfB64);
+  if (gcvResult?.pages?.length) {
+    gcvBlock = gcvResult.pages.map((p, i) => {
+      const rotNote = p.is_rotated ? ' [rotated]' : '';
+      return `=== PAGE ${i+1}${rotNote} (pipe-separated columns) ===\n${p.raw_text}`;
+    }).join('\n\n');
+    gcvBlock = `=== SCANNED PDF TABLE DATA (Google Cloud Vision — read cell by cell) ===\n${gcvBlock}\n=== END TABLE DATA ===`;
+    console.log(`[drawing-context] GCV: ${gcvResult.pages.length} pages extracted (always-on mode)`);
+  } else {
+    console.log('[drawing-context] GCV returned no data — check API key or drawing format');
   }
 
-  // Step 3: PNG tiles — ONLY send if text extraction failed
-  // FIX B: When PyMuPDF/GCV extracts real text, sending images ALSO causes Claude to
-  // visually "read" the drawing and make assumptions, ignoring the extracted text.
-  // So: if we have good extracted text → skip images → Claude MUST use text only.
-  const hasGoodText = (extractedTextBlock.length > 200) || (gcvBlock.length > 200);
+  // Step 3: PNG tiles — ONLY send if BOTH PyMuPDF AND GCV failed to extract useful text
+  // FIX: Previously PyMuPDF partial text (title block only, >200 chars) was making
+  // hasGoodText=true, so images were skipped AND GCV was skipped → Claude got incomplete data.
+  // Now: good text = GCV extracted something OR PyMuPDF got substantial text (>500 chars = real schedule data)
+  const hasGoodText = (gcvBlock.length > 200) || (extractedTextBlock.length > 500);
 
   if (!hasGoodText) {
     // No text extracted — send PNG tiles so Claude can at least see the drawing
