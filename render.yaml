@@ -1,12 +1,13 @@
 services:
   - type: web
     name: pmc-civil-ai-agent
-    runtime: docker
+    runtime: node
     plan: starter
-    dockerfilePath: ./Dockerfile
+    buildCommand: npm install && python3 -m pip install ezdxf matplotlib pillow --quiet && (apt-get install -y tesseract-ocr 2>/dev/null || echo "tesseract already installed")
+    startCommand: node server.js
     autoDeploy: true
     envVars:
-      - key: GEMINI_API_KEY
+      - key: CLAUDE_API_KEY
         sync: false        # set this in the Render dashboard
       - key: NODE_ENV
         value: production
