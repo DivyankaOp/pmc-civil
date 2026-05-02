@@ -726,7 +726,16 @@ async function geminiAnalyzeDrawing(key, files, cvData, fetchFn) {
 
   const meta        = await phase2_legendAndScale(files, cvData, gcvTableContext, layout);
   const quantities  = await phase3_extractQuantities(files, meta, gcvTableContext, layout);
-  const boqData     = await phase4_calculateBOQ(quantities, meta, layout);
+  // Fix: Pass only what Phase 4 actually needs — not the full quantities array (~40% token saving)
+  const phase4Input = {
+    schedule_data:       quantities?.schedule_data       || {},
+    section_details:     quantities?.section_details     || {},
+    grid_info:           quantities?.grid_info           || {},
+    element_counts:      quantities?.element_counts      || {},
+    unit_system_detected: quantities?.unit_system_detected || 'unknown',
+    road_data:           quantities?.road_data           || {}
+  };
+  const boqData     = await phase4_calculateBOQ(phase4Input, meta, layout);
   const finalData   = await phase5_validateAndFlag(boqData, layout);
 
   return buildFinalOutput(finalData, quantities, meta, cvData, layout);
