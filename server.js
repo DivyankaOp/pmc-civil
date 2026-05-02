@@ -300,17 +300,56 @@ async function buildDrawingContext(pdfB64) {
 
   // Step 4: Inject extracted text with HARD instruction to use text only
   const contextText = [extractedTextBlock, gcvBlock].filter(Boolean).join('\n\n');
+
+  // FIX: Full structural schema + strict rules injected for BOTH text and image fallback paths
+  const strictScheduleRules = `
+═══════════════════════════════════════════════════════════
+COLUMN / FOOTING SCHEDULE READING — ABSOLUTE RULES
+═══════════════════════════════════════════════════════════
+1. ONLY read values PHYSICALLY PRINTED in the schedule table cells.
+2. Column/Pedestal sizes: copy EXACT printed value (e.g. 300x300, 230x450).
+   - NEVER output 400x400, 500x500 unless those numbers appear in the drawing.
+3. Main bars / stirrups: copy EXACTLY (e.g. 8-12O, 4-16O, 10T16).
+   - NEVER output bar sizes not printed in the schedule.
+4. Column schedule and Footing schedule are COMPLETELY SEPARATE tables.
+5. Qty: use ONLY the qty column in the schedule. NEVER count from plan view.
+6. Unclear/unreadable cell -> write "not legible" — NEVER guess.
+7. Source: "drawing-schedule" for schedule values, "calculated" for derived.
+8. INDUSTRIAL DRAWING (base plates, anchor bolts, braced bays):
+   - Column Schedule = RCC PEDESTAL schedule only
+   - Read base plate + anchor bolt details from detail panels
+═══════════════════════════════════════════════════════════
+
+Return ONLY raw JSON (no markdown, no explanation):
+{
+  "drawing_type": "",
+  "project_name": "",
+  "drawing_no": "",
+  "scale": "",
+  "concrete_grade": "",
+  "steel_grade": "",
+  "structural_system": "",
+  "column_schedule": [{"col_mark":"","size_mm":"","main_bars":"","stirrups":"","qty":0,"floor":"","height_m":0,"source":"drawing-schedule|not legible"}],
+  "footing_schedule": [{"footing_mark":"","pcc_size_mm":"","rcc_size_mm":"","depth_mm":0,"pcc_thickness_mm":150,"main_bars_x":"","main_bars_y":"","qty":0,"pedestal_size_mm":"","source":"drawing-schedule|not legible"}],
+  "base_plate_schedule": [{"column_mark":"","plate_size_mm":"","anchor_bolt_nos":0,"anchor_bolt_dia_mm":0,"source":"drawing-schedule|not legible"}],
+  "section_details": {"footing_depth_mm":0,"pedestal_height_mm":0,"pcc_thickness_mm":150,"cover_mm":50},
+  "grid_info": {"typical_bay_m":0,"total_columns_plan":0,"braced_bay_grids":[]},
+  "boq": [{"sr":1,"part":"PART A","description":"","unit":"","qty":0,"rate":0,"amount":0,"source":"drawing-schedule|calculated","confidence":"high|medium|low","calc_note":""}],
+  "cost_summary": {"civil_total_inr":0,"civil_total_lacs":0},
+  "observations": [],
+  "not_legible_fields": []
+}`;
+
   if (contextText) {
     parts.push({
       type: 'text',
-      // FIX C: Strong instruction — Claude must use ONLY this text, not visual guessing
-      text: `\n\nCRITICAL INSTRUCTION — READ THIS FIRST:\nThe following is MACHINE-EXTRACTED TEXT directly from the drawing file using PyMuPDF/GCV.\nThis is 100% accurate — every character below was PRINTED on the drawing.\nYOU MUST use ONLY this extracted text for all schedule tables, dimensions, and values.\nDO NOT use vision/image reading. DO NOT guess or assume any value not present below.\nIf a value is not in this text → write "not found in drawing".\n\n${contextText}\n\nEND OF EXTRACTED TEXT.\nReminder: Use ONLY the values above. Any value not in this text = "not found in drawing".`
+      text: `\n\nCRITICAL INSTRUCTION — READ THIS FIRST:\nThe following is MACHINE-EXTRACTED TEXT directly from the drawing file using PyMuPDF/GCV.\nThis is 100% accurate — every character below was PRINTED on the drawing.\nYOU MUST use ONLY this extracted text for all schedule tables, dimensions, and values.\nDO NOT use vision/image reading. DO NOT guess or assume any value not present below.\nIf a value is not in this text → write "not found in drawing".\n\n${contextText}\n\nEND OF EXTRACTED TEXT.\nReminder: Use ONLY the values above.\n${strictScheduleRules}`
     });
   } else {
-    // No text extracted at all — warn Claude strongly
+    // No text extracted — warn Claude but still give full schema
     parts.push({
       type: 'text',
-      text: `\n\nWARNING: Text extraction from this drawing FAILED (possibly a scanned/rasterized PDF).\nYou are viewing PNG images of the drawing above.\nFor ANY value you cannot clearly read from the image → write "not legible — original DWG file required".\nDO NOT assume, estimate, or invent any dimension, bar count, footing size, or quantity.\nOnly report values you can read with 100% certainty from the image.`
+      text: `\n\nWARNING: Text extraction from this drawing FAILED (scanned/rasterized PDF).\nYou are viewing PNG images of the drawing above.\nFor ANY value you cannot clearly read from the image → write "not legible — original DWG file required".\nDO NOT assume, estimate, or invent any dimension, bar count, footing size, or quantity.\nOnly report values you can read with 100% certainty from the image.\n${strictScheduleRules}`
     });
   }
 
@@ -865,8 +904,11 @@ app.post('/export-drawing', async (req, res) => {
             files.push({ type: 'image/png', b64: part.source.data, name: `pdf_tile_${++tileCount}.png` });
           }
           // Extract the text context and add to cvData
-          if (part.type === 'text' && part.text?.includes('MACHINE-EXTRACTED TEXT')) {
-            cvData.drawing_context_text = part.text;
+          // FIX: Previously only set for 'MACHINE-EXTRACTED TEXT' — scanned PDFs use
+          // 'WARNING:' text part with Tesseract OCR data embedded → was never passed to
+          // geminiAnalyzeDrawing(), so scanned drawings got 0 context. Now capture ALL text parts.
+          if (part.type === 'text' && part.text?.length > 50) {
+            cvData.drawing_context_text = (cvData.drawing_context_text || '') + '\n' + part.text;
           }
         }
         console.log(`[export-drawing] PDF → ${tileCount} tiles via buildDrawingContext`);
@@ -1430,14 +1472,120 @@ CRITICAL RULES:
     for (const p of parts.filter(p => p.inline_data?.mime_type === 'image/png')) {
       pngTiles.push(p.inline_data.data);
     }
-    let analysis;
+    let analysisRaw;
     try {
-      analysis = await claudeAnalyzeDWGVision(pngTiles, converterResult, filename);
-      console.log('[DWG] Claude vision analysis done, length:', analysis.length);
+      analysisRaw = await claudeAnalyzeDWGVision(pngTiles, converterResult, filename);
+      console.log('[DWG] Claude vision analysis done');
     } catch(e) {
       console.error('Claude DWG analysis fail:', e.message);
-      analysis = null;
+      analysisRaw = null;
     }
+
+    // FIX: claudeAnalyzeDWGVision returns parsed JSON object (via parseJSON).
+    // Convert it to a human-readable markdown string for the frontend to display.
+    // Also keep the raw structured data in response for Excel export.
+    function boqToMarkdown(d) {
+      if (!d) return null;
+      const lines = [];
+      lines.push(`## DWG Analysis: ${filename}`);
+      if (d.project_name) lines.push(`**Project:** ${d.project_name}`);
+      if (d.drawing_no) lines.push(`**Drawing No:** ${d.drawing_no}`);
+      if (d.drawing_type) lines.push(`**Drawing Type:** ${d.drawing_type}`);
+      if (d.scale) lines.push(`**Scale:** ${d.scale}`);
+      if (d.concrete_grade) lines.push(`**Concrete Grade:** ${d.concrete_grade}`);
+      if (d.steel_grade) lines.push(`**Steel Grade:** ${d.steel_grade}`);
+      if (d.structural_system) lines.push(`**Structural System:** ${d.structural_system}`);
+      lines.push('');
+
+      // Column Schedule
+      if (d.column_schedule?.length) {
+        lines.push('### Column Schedule');
+        lines.push('| Mark | Size (mm) | Main Bars | Stirrups | Qty | Floor | Source |');
+        lines.push('|------|-----------|-----------|----------|-----|-------|--------|');
+        for (const c of d.column_schedule) {
+          lines.push(`| ${c.col_mark||''} | ${c.size_mm||''} | ${c.main_bars||''} | ${c.stirrups||''} | ${c.qty||0} | ${c.floor||''} | ${c.source||''} |`);
+        }
+        lines.push('');
+      }
+
+      // Footing Schedule
+      if (d.footing_schedule?.length) {
+        lines.push('### Footing Schedule');
+        lines.push('| Mark | PCC Size | RCC Size | Depth | PCC Thk | Bars X | Bars Y | Qty | Pedestal | Source |');
+        lines.push('|------|----------|----------|-------|---------|--------|--------|-----|----------|--------|');
+        for (const f of d.footing_schedule) {
+          lines.push(`| ${f.footing_mark||''} | ${f.pcc_size_mm||''} | ${f.rcc_size_mm||''} | ${f.depth_mm||0} | ${f.pcc_thickness_mm||150} | ${f.main_bars_x||''} | ${f.main_bars_y||''} | ${f.qty||0} | ${f.pedestal_size_mm||''} | ${f.source||''} |`);
+        }
+        lines.push('');
+      }
+
+      // Base Plate Schedule
+      if (d.base_plate_schedule?.length) {
+        lines.push('### Base Plate Schedule');
+        lines.push('| Column Mark | Plate Size (mm) | Anchor Bolts | Bolt Dia (mm) | Source |');
+        lines.push('|-------------|----------------|--------------|----------------|--------|');
+        for (const b of d.base_plate_schedule) {
+          lines.push(`| ${b.column_mark||''} | ${b.plate_size_mm||''} | ${b.anchor_bolt_nos||0} | ${b.anchor_bolt_dia_mm||0} | ${b.source||''} |`);
+        }
+        lines.push('');
+      }
+
+      // Section Details
+      if (d.section_details) {
+        const s = d.section_details;
+        lines.push('### Section Details');
+        if (s.footing_depth_mm) lines.push(`- Footing Depth: **${s.footing_depth_mm} mm**`);
+        if (s.pedestal_height_mm) lines.push(`- Pedestal Height: **${s.pedestal_height_mm} mm**`);
+        if (s.pcc_thickness_mm) lines.push(`- PCC Thickness: **${s.pcc_thickness_mm} mm**`);
+        if (s.cover_mm) lines.push(`- Clear Cover: **${s.cover_mm} mm**`);
+        lines.push('');
+      }
+
+      // Grid Info
+      if (d.grid_info?.total_columns_plan) {
+        lines.push('### Grid Information');
+        lines.push(`- Total Columns (Plan): **${d.grid_info.total_columns_plan}**`);
+        if (d.grid_info.typical_bay_m) lines.push(`- Typical Bay: **${d.grid_info.typical_bay_m} m**`);
+        if (d.grid_info.braced_bay_grids?.length) lines.push(`- Braced Bays: ${d.grid_info.braced_bay_grids.join(', ')}`);
+        lines.push('');
+      }
+
+      // BOQ Table
+      if (d.boq?.length) {
+        lines.push('### Bill of Quantities');
+        lines.push('| Sr | Description | Unit | Qty | Rate (₹) | Amount (₹) | Confidence |');
+        lines.push('|----|-------------|------|-----|----------|------------|------------|');
+        for (const b of d.boq) {
+          if (b.part && !b.description) { lines.push(`| **${b.part}** | | | | | | |`); continue; }
+          const amt = b.amount ? b.amount.toLocaleString('en-IN') : '0';
+          const rate = b.rate ? b.rate.toLocaleString('en-IN') : '0';
+          lines.push(`| ${b.sr||''} | ${b.description||''} | ${b.unit||''} | ${b.qty||0} | ${rate} | ${amt} | ${b.confidence||''} |`);
+        }
+        lines.push('');
+        if (d.cost_summary?.civil_total_lacs) {
+          lines.push(`**Total Civil Cost: ₹${d.cost_summary.civil_total_inr?.toLocaleString('en-IN')||0} (₹${d.cost_summary.civil_total_lacs} Lacs)**`);
+        }
+        lines.push('');
+      }
+
+      // Observations
+      if (d.observations?.length) {
+        lines.push('### PMC Observations');
+        for (const o of d.observations) lines.push(`- ${o}`);
+        lines.push('');
+      }
+      if (d.not_legible_fields?.length) {
+        lines.push('### Not Legible / Not Found');
+        for (const nf of d.not_legible_fields) lines.push(`- ${nf}`);
+        lines.push('');
+      }
+
+      lines.push('> Analyzed by PMC Civil AI (Claude Vision — ZWCAD/AutoCAD DWG compatible)');
+      return lines.join('\n');
+    }
+
+    const analysisMarkdown = analysisRaw ? boqToMarkdown(analysisRaw) : null;
+
     const fallbackAnalysis =
       `## DWG/DXF File: ${filename}\n\n` +
       `**PNG rendered:** ${converterResult.png_path ? "Yes" : "No"}\n` +
@@ -1451,24 +1599,21 @@ CRITICAL RULES:
     // Cleanup temp input
     try { fs.unlinkSync(tmpIn); } catch(e) {}
 
-    // ── NEW: Auto-learn rates from Claude's markdown analysis ──────
-    if (analysis) {
+    // ── Auto-learn rates from markdown analysis ──────
+    if (analysisMarkdown) {
       try {
-        const learnedCount = learnRatesFromMarkdown(analysis, {
+        const learnedCount = learnRatesFromMarkdown(analysisMarkdown, {
           filename,
           drawing_type: converterResult.drawing_type || 'UNKNOWN',
         });
-        if (learnedCount > 0) {
-          console.log(`[rate_store] Learned ${learnedCount} rates from DWG analysis`);
-        }
-      } catch (e) {
-        console.warn('[rate_store] learn failed:', e.message);
-      }
+        if (learnedCount > 0) console.log(`[rate_store] Learned ${learnedCount} rates from DWG`);
+      } catch (e) { console.warn('[rate_store] learn failed:', e.message); }
     }
 
     res.json({
       success: true,
-      analysis: analysis || fallbackAnalysis,
+      analysis: analysisMarkdown || fallbackAnalysis,
+      structured: analysisRaw || null,   // raw JSON for Excel export
       converter: converterResult,
       detailMode: useDetail,
       quadrantTiles: nDetailTiles,
