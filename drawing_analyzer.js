@@ -361,27 +361,101 @@ async function geminiAnalyzeDrawing(key, files, cvData, fetchFn) {
     } else {
       console.log('[PMC] Not vector — trying GCV scanned PDF...');
       const gcv = await extractScannedPDF_GCV(b64);
-      if (gcv) extracted.gcv_pdf = gcv;
+      if (gcv) {
+        extracted.gcv_pdf = gcv;
+      } else {
+        // ── Tesseract fallback: GCV key missing or GCV returned null ──
+        console.log('[PMC] GCV unavailable — Tesseract fallback for scanned PDF...');
+        try {
+          const { execSync: _exec } = require('child_process');
+          const _fs = require('fs');
+          const _os = require('os');
+          const _tmpDir = _fs.mkdtempSync(_os.tmpdir() + '/pmc_scan_');
+          const _pdfPath = _tmpDir + '/input.pdf';
+          _fs.writeFileSync(_pdfPath, Buffer.from(b64, 'base64'));
+          const _rScript = `
+import fitz, json
+doc = fitz.open('${_pdfPath.replace(/\\/g, '/')}')
+paths = []
+for i in range(min(len(doc), 5)):
+    pix = doc[i].get_pixmap(matrix=fitz.Matrix(200/72, 200/72), alpha=False)
+    p = '${_tmpDir.replace(/\\/g, '/')}/page_{}.png'.format(i)
+    pix.save(p)
+    paths.append(p)
+doc.close()
+print(json.dumps(paths))
+`.trim();
+          _fs.writeFileSync(_tmpDir + '/r.py', _rScript);
+          const _pngPaths = JSON.parse(_exec(`python3 "${_tmpDir}/r.py"`, { timeout: 30000 }).toString());
+          const _tessPages = [];
+          for (const _png of _pngPaths) {
+            try {
+              const _out = _exec(`tesseract "${_png}" stdout --oem 1 --psm 6 -l eng`, { timeout: 30000, maxBuffer: 5*1024*1024 });
+              const _text = _out.toString().trim();
+              if (_text.length > 20) {
+                _tessPages.push({ rows: _text.split('\n').filter(l=>l.trim()).map(l=>[l]), text: _text });
+                console.log(`[PMC-Tesseract] Page ${_tessPages.length}: ${_text.length} chars`);
+              }
+            } catch(e) { console.error('[PMC-Tesseract] page failed:', e.message); }
+          }
+          if (_tessPages.length) extracted.gcv_pdf = { pages: _tessPages, engine: 'tesseract' };
+          try { _fs.rmSync(_tmpDir, { recursive: true }); } catch(e) {}
+        } catch(e) { console.error('[PMC-Tesseract] Error:', e.message); }
+      }
     }
   }
 
   // ── Images ────────────────────────────────────────────────────
-  // FIX 3: Was only sending imgFiles[0] to GCV — now sends ALL tiles (up to 5)
-  // export-drawing passes 5 tiles (1 full page + 4 quadrant zooms) — all must be OCR'd
+  // PNG tiles (from buildDrawingContext or direct image upload)
+  // Priority: GCV OCR → Tesseract fallback (if GCV key missing or fails)
   const imgFiles = (files||[]).filter(f => f.type?.startsWith('image/'));
   if (imgFiles.length > 0) {
     console.log(`[PMC] ${imgFiles.length} image tile(s) — running GCV OCR on all...`);
     const allTexts = [];
+    const gcvAvailable = !!process.env.GOOGLE_CLOUD_VISION_API_KEY;
+
     for (const imgFile of imgFiles.slice(0, 5)) {
-      const gcv = await extractImage_GCV(imgFile.b64, imgFile.type||'image/png');
-      if (gcv?.full_text) allTexts.push(gcv.full_text);
+      let tileText = null;
+
+      // ── Try GCV first ──
+      if (gcvAvailable) {
+        const gcv = await extractImage_GCV(imgFile.b64, imgFile.type||'image/png');
+        if (gcv?.full_text) tileText = gcv.full_text;
+      }
+
+      // ── Tesseract fallback: GCV unavailable OR GCV returned nothing ──
+      if (!tileText) {
+        try {
+          const { execSync } = require('child_process');
+          const fs = require('fs');
+          const os = require('os');
+          const tmpDir = fs.mkdtempSync(os.tmpdir() + '/pmc_tess_');
+          const pngPath = `${tmpDir}/tile.png`;
+          fs.writeFileSync(pngPath, Buffer.from(imgFile.b64, 'base64'));
+          const out = execSync(
+            `tesseract "${pngPath}" stdout --oem 1 --psm 6 -l eng`,
+            { timeout: 30000, maxBuffer: 5 * 1024 * 1024 }
+          );
+          const tessText = out.toString().trim();
+          if (tessText.length > 20) {
+            tileText = tessText;
+            console.log(`[PMC] Tesseract fallback: ${tessText.length} chars from tile`);
+          }
+          try { fs.rmSync(tmpDir, { recursive: true }); } catch(e) {}
+        } catch(e) {
+          console.error('[PMC] Tesseract fallback failed:', e.message);
+        }
+      }
+
+      if (tileText) allTexts.push(tileText);
     }
+
     if (allTexts.length) {
       extracted.gcv_image = {
         full_text: allTexts.join('\n\n--- NEXT TILE ---\n\n'),
         word_count: allTexts.length
       };
-      console.log(`[PMC] GCV OCR: ${allTexts.length}/${imgFiles.length} tiles extracted`);
+      console.log(`[PMC] Image OCR: ${allTexts.length}/${imgFiles.length} tiles extracted (GCV=${gcvAvailable})`);
     }
   }
 
