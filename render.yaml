@@ -3,7 +3,7 @@ services:
     name: pmc-civil-ai-agent
     runtime: node
     plan: starter
-    buildCommand: npm install && python3 -m pip install ezdxf matplotlib pillow --quiet && (apt-get install -y tesseract-ocr 2>/dev/null || echo "tesseract already installed")
+    buildCommand: npm install && python3 -m pip install ezdxf matplotlib pillow pymupdf opencv-python --quiet && (apt-get install -y tesseract-ocr 2>/dev/null || echo "tesseract already installed")
     startCommand: node server.js
     autoDeploy: true
     envVars:
