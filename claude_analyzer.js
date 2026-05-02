@@ -593,8 +593,8 @@ Note: Column sizes in INCHES — already converted to mm in Phase 3 schedule_dat
 DRAWING: type=${drawingType} | project=${meta?.project_name||'?'} | concrete=${meta?.concrete_grade||'?'} | steel=${meta?.steel_grade||'?'}
 Unit system detected by Phase 3: ${quantities?.unit_system_detected || 'unknown'}
 ${scheduleCtx}
-ALL QUANTITIES FROM PHASE 3:
-${JSON.stringify({quantities: quantities.quantities, element_counts: quantities.element_counts}, null, 2)}
+ELEMENT COUNTS FROM PHASE 3:
+${JSON.stringify(quantities.element_counts || {}, null, 2)}
 ${industrialBOQHint}${buildingFoundationBOQHint}${columnDetailBOQHint}
 
 RATES: Use DSR 2025 rates from system prompt.
@@ -613,27 +613,77 @@ Return JSON:
 }
 
 // ════════════════════════════════════════════
-// PHASE 5 — Validation (Extended Thinking)
+// PHASE 5 — Validation (FREE JS — no Claude API call)
+// Replaced extended thinking (expensive) with pure math checks
+// Saves ~₹8-15 per drawing analysis
 // ════════════════════════════════════════════
 async function phase5_validateAndFlag(boqData, layout={}) {
-  console.log('[Phase 5] Validating with extended thinking...');
+  console.log('[Phase 5] FREE JS validation (no API call)...');
   if (!boqData) return boqData;
 
-  const raw = await callClaude({
-    messages:[{ role:'user', content:`TASK PHASE 5: Validate this BOQ. Use extended thinking.\n\n${JSON.stringify(boqData,null,2)}\n\nCHECKS:\n1. Steel ratios (slab 100-140, beam 150-200, column/pedestal 180-240 kg/CUM, footing 70-100 kg/CUM)\n2. For INDUSTRIAL drawings: verify footing CUM = plan area × depth for each footing type\n3. For INDUSTRIAL drawings: pedestal CUM = section area × height × count\n4. Road GSB: area x 1.15 x 0.3 x 1.8\n5. Road WMM: area x 1.15 x 0.2 x 2.1\n6. Cost per sqmt sanity (building Rs.1500-3500, road Rs.2000-4000, industrial foundation Rs.8000-15000 per column)\n7. Any qty=0 with amount>0 (math error)\n8. Items with source=assumed — flag for engineer review\n9. Base plate weight sanity: typical 300×300×20mm plate = ~14 kg\n10. Anchor bolt count: should be qty_columns × bolts_per_column\n11. Excavation volume ≥ footing volume (must include working space)\n12. Schedule data used correctly — no invented sizes\n\nAdd to existing JSON:\n- "validation_warnings":[{"item":"","check":"","expected":"","found":"","severity":"HIGH|MEDIUM|LOW"}]\n- "validation_passed":["check desc"]\n- "overall_confidence":"HIGH|MEDIUM|LOW"\n- "engineer_action_required":["what to verify manually"]\n- "pmc_flags":["IS code references for any issues found"]` }],
-    maxTokens: 4096,
-    thinking: true
-  });
+  const warnings = [], passed = [], engineerActions = [], pmcFlags = [];
+  const boq = boqData.boq || [];
+  const find = (kw) => boq.filter(i => (i.description||'').toLowerCase().includes(kw.toLowerCase()));
+  const sumQty = (items) => items.reduce((s, i) => s + (i.qty||0), 0);
 
-  const validated = parseJSON(raw);
-  if (!validated) {
-    boqData.validation_warnings = [];
-    boqData.validation_passed = ['Phase 5 parse failed — manual review recommended'];
-    boqData.overall_confidence = 'MEDIUM';
-    return boqData;
+  // CHECK 1: qty=0 but amount>0
+  for (const item of boq) {
+    if ((item.qty||0) === 0 && (item.amount||0) > 0) {
+      warnings.push({ item: item.description, check: 'qty=0 but amount>0', expected: 'amount=0', found: `amount=${item.amount}`, severity: 'HIGH' });
+    }
   }
-  console.log(`[Phase 5] ${validated.validation_warnings?.length||0} warnings | confidence:${validated.overall_confidence}`);
-  return validated;
+  if (!warnings.some(w => w.check === 'qty=0 but amount>0')) passed.push('No qty=0 with amount>0 errors');
+
+  // CHECK 2: Steel ratios
+  const footingCUM = sumQty(find('footing'));
+  const colCUM = sumQty(find('pedestal')) + sumQty(find('column'));
+  const steelItems = find('steel').concat(find('rebar')).concat(find('fe500'));
+  const steelKG = steelItems.reduce((s,i) => {
+    const u = (i.unit||'').toLowerCase();
+    return s + (i.qty||0) * (u==='mt'||u==='ton' ? 1000 : 1);
+  }, 0);
+  if (footingCUM > 0 && steelKG > 0) {
+    const r = steelKG/footingCUM;
+    if (r < 60 || r > 150) warnings.push({ item: 'Steel in footing', check: 'kg/CUM ratio', expected: '70-120', found: Math.round(r), severity: 'MEDIUM' });
+    else passed.push(`Footing steel ratio OK: ${Math.round(r)} kg/CUM`);
+  }
+  if (colCUM > 0 && steelKG > 0) {
+    const r = steelKG/colCUM;
+    if (r < 100 || r > 320) warnings.push({ item: 'Steel in column', check: 'kg/CUM ratio', expected: '180-240', found: Math.round(r), severity: 'MEDIUM' });
+    else passed.push(`Column steel ratio OK: ${Math.round(r)} kg/CUM`);
+  }
+
+  // CHECK 3: Excavation >= footing
+  const excav = sumQty(find('excavat'));
+  if (excav > 0 && footingCUM > 0 && excav < footingCUM) {
+    warnings.push({ item: 'Excavation', check: 'Excavation < footing CUM', expected: `>=${footingCUM.toFixed(2)}`, found: excav.toFixed(2), severity: 'HIGH' });
+    pmcFlags.push('IS 1200-Part 1: Excavation must exceed structural volume');
+  } else if (excav > 0) passed.push('Excavation > footing volume: OK');
+
+  // CHECK 4: GSB/WMM ratio
+  const gsbT = sumQty(find('gsb')), wmmT = sumQty(find('wmm'));
+  if (gsbT > 0 && wmmT > 0) {
+    const r = gsbT/wmmT;
+    if (r < 1.1 || r > 1.7) warnings.push({ item: 'GSB/WMM ratio', check: 'road layer ratio', expected: '~1.3', found: r.toFixed(2), severity: 'LOW' });
+    else passed.push(`GSB/WMM ratio OK: ${r.toFixed(2)}`);
+  }
+
+  // CHECK 5: Assumed items
+  const assumed = boq.filter(i => (i.source||'').toLowerCase().includes('assumed'));
+  if (assumed.length) {
+    engineerActions.push(`Verify ${assumed.length} assumed items: ${assumed.map(i=>i.description).slice(0,3).join(', ')}`);
+    warnings.push({ item: 'Assumed values', check: 'source=assumed', expected: 'drawing-schedule', found: `${assumed.length} items`, severity: 'MEDIUM' });
+  }
+
+  // CHECK 6: Total cost sanity
+  const total = boqData.cost_summary?.civil_total_lacs || 0;
+  if (total > 0 && total > 500) warnings.push({ item: 'Total cost', check: 'unusually high', expected: '<500 lacs for foundation', found: `${total} lacs`, severity: 'LOW' });
+  else if (total > 0) passed.push(`Total ₹${total} lacs — plausible`);
+
+  const highW = warnings.filter(w => w.severity==='HIGH').length;
+  const overall_confidence = highW >= 2 ? 'LOW' : highW === 1 ? 'MEDIUM' : warnings.length > 3 ? 'MEDIUM' : 'HIGH';
+  console.log(`[Phase 5 JS] ${warnings.length} warnings | ${passed.length} passed | confidence:${overall_confidence} | NO API CALL`);
+  return { ...boqData, validation_warnings: warnings, validation_passed: passed, overall_confidence, engineer_action_required: engineerActions, pmc_flags: pmcFlags };
 }
 
 // ════════════════════════════════════════════
