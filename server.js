@@ -267,25 +267,41 @@ async function buildDrawingContext(pdfB64) {
     }
   }
 
-  // Step 3: Always render PNG tiles (full page + 4 quadrant zooms)
-  // This gives Claude visual access to hatches, symbols, dimensions
-  const pngTiles = await pdfToImageTiles(pdfB64);
-  if (pngTiles?.length) {
-    for (const tile of pngTiles) {
-      parts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
+  // Step 3: PNG tiles — ONLY send if text extraction failed
+  // FIX B: When PyMuPDF/GCV extracts real text, sending images ALSO causes Claude to
+  // visually "read" the drawing and make assumptions, ignoring the extracted text.
+  // So: if we have good extracted text → skip images → Claude MUST use text only.
+  const hasGoodText = (extractedTextBlock.length > 200) || (gcvBlock.length > 200);
+
+  if (!hasGoodText) {
+    // No text extracted — send PNG tiles so Claude can at least see the drawing
+    // but add a strong warning that it must say "not legible" for anything unclear
+    const pngTiles = await pdfToImageTiles(pdfB64);
+    if (pngTiles?.length) {
+      for (const tile of pngTiles) {
+        parts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
+      }
+      console.log(`[drawing-context] No text extracted — sending ${pngTiles.length} PNG tiles for visual fallback`);
+    } else {
+      parts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
     }
-    console.log(`[drawing-context] ${pngTiles.length} PNG tiles (1 full + 4 quadrant zooms)`);
   } else {
-    // Final fallback: send as PDF document
-    parts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
+    console.log(`[drawing-context] Text extracted (${extractedTextBlock.length + gcvBlock.length} chars) — skipping images to prevent Claude from guessing visually`);
   }
 
-  // Step 4: Inject extracted text AFTER images so Claude can cross-reference
+  // Step 4: Inject extracted text with HARD instruction to use text only
   const contextText = [extractedTextBlock, gcvBlock].filter(Boolean).join('\n\n');
   if (contextText) {
     parts.push({
       type: 'text',
-      text: `\n\n${contextText}\n\nINSTRUCTION: You are looking at ${pngTiles?.length || 1} images above:\n- Image 1: Full page overview\n- Images 2-5: Quadrant zooms (Top-Left, Top-Right, Bottom-Left, Bottom-Right) for reading small text\nCross-reference the machine-extracted text above with what you see visually. The extracted text catches everything — use it to verify dimensions and schedule values you see in the images.`
+      // FIX C: Strong instruction — Claude must use ONLY this text, not visual guessing
+      text: `\n\nCRITICAL INSTRUCTION — READ THIS FIRST:\nThe following is MACHINE-EXTRACTED TEXT directly from the drawing file using PyMuPDF/GCV.\nThis is 100% accurate — every character below was PRINTED on the drawing.\nYOU MUST use ONLY this extracted text for all schedule tables, dimensions, and values.\nDO NOT use vision/image reading. DO NOT guess or assume any value not present below.\nIf a value is not in this text → write "not found in drawing".\n\n${contextText}\n\nEND OF EXTRACTED TEXT.\nReminder: Use ONLY the values above. Any value not in this text = "not found in drawing".`
+    });
+  } else {
+    // No text extracted at all — warn Claude strongly
+    parts.push({
+      type: 'text',
+      text: `\n\nWARNING: Text extraction from this drawing FAILED (possibly a scanned/rasterized PDF).\nYou are viewing PNG images of the drawing above.\nFor ANY value you cannot clearly read from the image → write "not legible — original DWG file required".\nDO NOT assume, estimate, or invent any dimension, bar count, footing size, or quantity.\nOnly report values you can read with 100% certainty from the image.`
     });
   }
 
@@ -366,7 +382,7 @@ app.post('/gemini', async (req, res) => {
               claudeParts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: part.inline_data.data } });
             }
           } else if (mt?.startsWith('image/')) {
-          } else if (mt?.startsWith('image/')) {
+            // FIX A: Was duplicated — second handler had empty body, so direct images were DROPPED
             claudeParts.push({ type: 'image', source: { type: 'base64', media_type: mt, data: part.inline_data.data } });
           }
         }
