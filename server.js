@@ -133,18 +133,44 @@ print(json.dumps(tiles))
   }
 }
 
-// ── SCANNED PDF → FREE Tesseract OCR (replaces Google Cloud Vision) ──
-// Tesseract server pe already available hai — zero cost
-// GCV key nahi chahiye, accurate bhi hai Indian drawings ke liye
-// ── BEST-EFFORT OCR PIPELINE for Rasterized/Scanned PDFs ──────────
-// Uses ocr_pipeline.py which does:
-//   1. 400 DPI render (PyMuPDF)
-//   2. 6 crops per page (full + schedule zones: btm-right, btm-left, right-third, btm-strip)
-//   3. Preprocess each crop: grayscale → upscale → adaptive binarize → denoise (OpenCV)
-//   4. Tesseract PSM 6 (table mode) + PSM 11 (sparse) on each crop
-//   5. Merge + deduplicate all lines
-// Result: 3-5x more text extracted vs simple full-page Tesseract
+// ── SCANNED PDF OCR — GCV first, Tesseract fallback ──────────────
+// Strategy (priority order):
+//   1. Google Cloud Vision (DOCUMENT_TEXT_DETECTION) — best table accuracy
+//      Called via extractLargePdfViaImageOCR() which renders PDF→PNG tiles then hits GCV API.
+//      Cost: ~$1.50/1000 pages — effectively free for typical usage.
+//      Enabled when GOOGLE_CLOUD_VISION_API_KEY env var is set.
+//   2. Tesseract multi-crop pipeline (ocr_pipeline.py) — zero cost fallback
+//      Used when GOOGLE_CLOUD_VISION_API_KEY is absent or GCV call fails.
+//      Does 400 DPI render + 6 crops + OpenCV preprocessing + PSM 6/11 dual pass.
+// Both paths return the same shape: { pages, is_gcv, engine }
 async function extractScannedPdfWithGCV(pdfBase64) {
+  const gcvKey = process.env.GOOGLE_CLOUD_VISION_API_KEY;
+
+  // ── Path 1: GCV (if API key present) ──────────────────────────────
+  if (gcvKey) {
+    try {
+      console.log('[OCR] GCV key found — trying Google Cloud Vision first');
+      const gcvResult = await extractLargePdfViaImageOCR(pdfBase64, gcvKey);
+      if (gcvResult?.pages?.length) {
+        console.log(`[OCR] GCV success: ${gcvResult.pages.length} pages`);
+        return gcvResult; // already has { pages, is_gcv: true }
+      }
+      console.warn('[OCR] GCV returned no data — falling back to Tesseract');
+    } catch(gcvErr) {
+      console.error('[OCR] GCV failed:', gcvErr.message, '— falling back to Tesseract');
+    }
+  } else {
+    console.log('[OCR] No GOOGLE_CLOUD_VISION_API_KEY — using Tesseract pipeline');
+  }
+
+  // ── Path 2: Tesseract multi-crop pipeline ─────────────────────────
+  // Uses ocr_pipeline.py which does:
+  //   1. 400 DPI render (PyMuPDF)
+  //   2. 6 crops per page (full + schedule zones: btm-right, btm-left, right-third, btm-strip)
+  //   3. Preprocess each crop: grayscale → upscale → adaptive binarize → denoise (OpenCV)
+  //   4. Tesseract PSM 6 (table mode) + PSM 11 (sparse) on each crop
+  //   5. Merge + deduplicate all lines
+  // Result: 3-5x more text extracted vs simple full-page Tesseract
   const { execSync } = require('child_process');
   const fs = require('fs');
   const os = require('os');
@@ -183,15 +209,15 @@ async function extractScannedPdfWithGCV(pdfBase64) {
 
   } catch(e) {
     console.error('[OCR Pipeline] Error:', e.message);
-    // Fallback: simple single-pass Tesseract on full page
+    // Last resort: simple single-pass Tesseract on full page
     try {
       const pdfPath2 = path.join(tmpDir, 'input2.pdf');
-      if (!require('fs').existsSync(pdfPath2)) {
-        require('fs').writeFileSync(pdfPath2, Buffer.from(pdfBase64, 'base64'));
+      if (!fs.existsSync(pdfPath2)) {
+        fs.writeFileSync(pdfPath2, Buffer.from(pdfBase64, 'base64'));
       }
       const fallbackScript = `
 import fitz,base64,subprocess,json,tempfile,os
-doc=fitz.open('${tmpDir.replace(/\/g,'/')}/input.pdf')
+doc=fitz.open('${tmpDir.replace(/\\/g,'/')}/input.pdf')
 pages=[]
 for i in range(min(len(doc),3)):
     pix=doc[i].get_pixmap(matrix=fitz.Matrix(300/72,300/72),alpha=False)
@@ -205,7 +231,7 @@ doc.close()
 print(json.dumps({'pages':pages}))
 `.trim();
       const fbScript = path.join(tmpDir, 'fallback.py');
-      require('fs').writeFileSync(fbScript, fallbackScript);
+      fs.writeFileSync(fbScript, fallbackScript);
       const py2 = process.env.PMC_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
       const fbOut = execSync(`${py2} "${fbScript}"`, { timeout: 60000, maxBuffer: 10*1024*1024 });
       const fbData = JSON.parse(fbOut.toString());
@@ -216,7 +242,7 @@ print(json.dumps({'pages':pages}))
     } catch(e2) { console.error('[OCR Fallback] also failed:', e2.message); }
     return null;
   } finally {
-    try { require('fs').rmSync(tmpDir, { recursive: true }); } catch(e) {}
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch(e) {}
   }
 }
 
