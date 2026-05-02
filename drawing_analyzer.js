@@ -201,6 +201,14 @@ async function extractImage_GCV(imageB64, mimeType='image/png') {
 function buildContext(extracted) {
   const parts = [];
 
+  // ── FIX 1: drawing_context_text from server.js PDF pipeline ──
+  // This carries the full PyMuPDF spatial text extracted by buildDrawingContext()
+  // It was being saved in cvData but never read here — now it is.
+  if (extracted.drawing_context_text) {
+    parts.push('=== PDF EXTRACTED TEXT (server pipeline — primary source) ===');
+    parts.push(extracted.drawing_context_text);
+  }
+
   if (extracted.pymupdf) {
     const d = extracted.pymupdf;
     parts.push(`=== PDF TEXT (PyMuPDF — ${d.total_texts} items) ===`);
@@ -358,11 +366,23 @@ async function geminiAnalyzeDrawing(key, files, cvData, fetchFn) {
   }
 
   // ── Images ────────────────────────────────────────────────────
+  // FIX 3: Was only sending imgFiles[0] to GCV — now sends ALL tiles (up to 5)
+  // export-drawing passes 5 tiles (1 full page + 4 quadrant zooms) — all must be OCR'd
   const imgFiles = (files||[]).filter(f => f.type?.startsWith('image/'));
   if (imgFiles.length > 0) {
-    console.log(`[PMC] ${imgFiles.length} image(s) — running GCV OCR...`);
-    const gcv = await extractImage_GCV(imgFiles[0].b64, imgFiles[0].type||'image/png');
-    if (gcv) extracted.gcv_image = gcv;
+    console.log(`[PMC] ${imgFiles.length} image tile(s) — running GCV OCR on all...`);
+    const allTexts = [];
+    for (const imgFile of imgFiles.slice(0, 5)) {
+      const gcv = await extractImage_GCV(imgFile.b64, imgFile.type||'image/png');
+      if (gcv?.full_text) allTexts.push(gcv.full_text);
+    }
+    if (allTexts.length) {
+      extracted.gcv_image = {
+        full_text: allTexts.join('\n\n--- NEXT TILE ---\n\n'),
+        word_count: allTexts.length
+      };
+      console.log(`[PMC] GCV OCR: ${allTexts.length}/${imgFiles.length} tiles extracted`);
+    }
   }
 
   // ── DXF data from cvData ──────────────────────────────────────
@@ -373,9 +393,16 @@ async function geminiAnalyzeDrawing(key, files, cvData, fetchFn) {
   if (cvData?.wall_by_thickness_m2) extracted.dxf_walls = cvData.wall_by_thickness_m2;
   if (cvData?.block_counts) extracted.dxf_blocks = cvData.block_counts;
 
+  // ── FIX 2: drawing_context_text from server.js buildDrawingContext() ──
+  // server.js saves this in cvData but drawing_analyzer never read it — fixed now.
+  if (cvData?.drawing_context_text) {
+    extracted.drawing_context_text = cvData.drawing_context_text;
+    console.log(`[PMC] drawing_context_text received: ${cvData.drawing_context_text.length} chars`);
+  }
+
   // ── Build context ─────────────────────────────────────────────
   const context = buildContext(extracted);
-  const sources = [extracted.pymupdf&&'PyMuPDF', extracted.gcv_pdf&&'GCV-PDF', extracted.gcv_image&&'GCV-Image', extracted.dxf_texts&&'ezdxf'].filter(Boolean);
+  const sources = [extracted.drawing_context_text&&'ServerPipeline', extracted.pymupdf&&'PyMuPDF', extracted.gcv_pdf&&'GCV-PDF', extracted.gcv_image&&'GCV-Image', extracted.dxf_texts&&'ezdxf'].filter(Boolean);
   console.log(`[PMC] Context: ${context.length} chars from: ${sources.join(', ')||'none'}`);
 
   // ── Claude text-only ──────────────────────────────────────────
