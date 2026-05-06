@@ -925,7 +925,7 @@ ${JSON.stringify({
   schedule_tables: civilData.schedule_tables,
   all_texts: (civilData.all_texts || []).slice(0, 60000),
   dimension_values: (civilData.dimension_values || []).slice(0, 1000),
-  polyline_areas: (civilData.polyline_areas || []).slice(0, 20),
+  polyline_areas: (civilData.polyline_areas || []).slice(0, 1000),
   block_counts: civilData.block_counts,
 }, null, 2)}
 
