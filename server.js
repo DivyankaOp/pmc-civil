@@ -40,7 +40,7 @@ async function extractPdfText(pdfBase64) {
 import fitz, json, sys
 doc = fitz.open('${pdfPath}')
 pages = []
-for page_num in range(min(len(doc), 5)):
+for page_num in range(len(doc)):
     page = doc[page_num]
     blocks = page.get_text("dict")["blocks"]
     texts = []
@@ -91,7 +91,7 @@ async function extractLargePdfViaImageOCR(pdfBase64, gcvKey) {
 import fitz, base64, json
 doc = fitz.open('${pdfPath}')
 tiles = []
-for i in range(min(len(doc), 3)):
+for i in range(len(doc)):
     page = doc[i]
     pix = page.get_pixmap(matrix=fitz.Matrix(400/72, 400/72), alpha=False)
     tiles.append(base64.b64encode(pix.tobytes('png')).decode())
@@ -219,7 +219,7 @@ async function extractScannedPdfWithGCV(pdfBase64) {
 import fitz,base64,subprocess,json,tempfile,os
 doc=fitz.open('${tmpDir.replace(/\\/g,'/')}/input.pdf')
 pages=[]
-for i in range(min(len(doc),3)):
+for i in range(len(doc)):
     pix=doc[i].get_pixmap(matrix=fitz.Matrix(300/72,300/72),alpha=False)
     tmp=tempfile.NamedTemporaryFile(suffix='.png',delete=False)
     pix.save(tmp.name); tmp.close()
@@ -263,7 +263,7 @@ async function pdfToImageTiles(pdfBase64, tilesPerPage = 4, quadrants = true) {
 import fitz, json, base64
 doc = fitz.open('${pdfPath}')
 tiles = []
-for page_num in range(min(len(doc), 2)):
+for page_num in range(len(doc)):
     page = doc[page_num]
     mat = fitz.Matrix(400/72, 400/72)
     pix = page.get_pixmap(matrix=mat, alpha=False)
