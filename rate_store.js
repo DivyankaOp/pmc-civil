@@ -99,6 +99,13 @@ function learnRatesFromBOQ(boqItems, context = {}) {
     // Sanity check — skip absurd rates (could be total amounts mistaken for rates)
     if (rate > 10000000) continue; // skip >1 crore per unit (obviously wrong)
 
+    // OUTLIER GUARD: If existing rate known, reject if new rate is outside 0.5x–2.0x band
+    const existingCheck = learned.rates[makeKey(description, unit)];
+    if (existingCheck?.rate) {
+      const ratio = rate / existingCheck.rate;
+      if (ratio < 0.5 || ratio > 2.0) continue; // likely typing error, skip
+    }
+
     const key = makeKey(description, unit);
     if (!key) continue;
 
