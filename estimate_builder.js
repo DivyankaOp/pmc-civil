@@ -133,7 +133,7 @@ function writeAnnexure(ws, letter, title, items, bua) {
     const resolved = (it.rate == null || it.unit == null) ? lookupRate(it.particular) : null;
     const rate = it.rate ?? resolved?.rate ?? 0;
     const unit = it.unit ?? resolved?.unit ?? '';
-    const gstPct = it.gstPct ?? 0.18;
+    const gstPct = it.gstPct ?? it.gst ?? (it.gstPercent ? it.gstPercent / 100 : 0.18);
 
     row.getCell(1).value = i + 1;
     row.getCell(2).value = it.particular || '';
