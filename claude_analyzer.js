@@ -460,7 +460,7 @@ async function phase3_extractQuantities(files, meta, gcvTableContext='', layout=
   const imgParts = buildImageParts(files);
 
   // Cap GCV context to avoid token overflow in Phase 3 prompt
-  const gcvCapped = (gcvTableContext || '').slice(0, 2500);
+  const gcvCapped = (gcvTableContext || '').slice(0, 60000);
 
   // Build schedule location hints — prefer Phase 2 result, fallback to layout detector
   const schedLoc = meta?.schedule_table_locations
@@ -715,7 +715,7 @@ async function geminiAnalyzeDrawing(key, files, cvData, fetchFn) {
     gcvTableContext = `\n\nSCANNED PDF TABLE (GCV+Claude validated, confidence:${t.confidence||'?'}):\nUse ONLY these values — do not assume or calculate anything not present here.\nHeaders: ${headerLine}\n${rowLines}\n`;
     if (t.issues_fixed?.length) gcvTableContext += `Corrections applied: ${t.issues_fixed.join('; ')}\n`;
   } else if (cvData?.gcv_raw_text) {
-    gcvTableContext = `\n\nSCANNED PDF RAW TEXT (GCV):\n${cvData.gcv_raw_text.slice(0, 3000)}\nUse ONLY values present in this text.\n`;
+    gcvTableContext = `\n\nSCANNED PDF RAW TEXT (GCV):\n${cvData.gcv_raw_text.slice(0, 60000)}\nUse ONLY values present in this text.\n`;
   }
 
   // ── DETECT DRAWING LAYOUT AUTOMATICALLY ──────────────────────────
@@ -889,7 +889,7 @@ async function callClaudeAPI({ system, messages, maxTokens = 4096 }) {
         'Content-Type': 'application/json',
         'x-api-key': key,
         'anthropic-version': '2023-06-01',
-        'anthropic-beta': 'pdfs-2024-09-25',
+        'anthropic-beta': 'prompt-caching-2024-07-31,pdfs-2024-09-25',
       },
       body: JSON.stringify(body),
     });
@@ -923,8 +923,8 @@ ${JSON.stringify({
   wall_by_thickness: civilData.wall_by_thickness,
   element_counts: civilData.element_counts,
   schedule_tables: civilData.schedule_tables,
-  all_texts: (civilData.all_texts || []).slice(0, 80),
-  dimension_values: (civilData.dimension_values || []).slice(0, 30),
+  all_texts: (civilData.all_texts || []).slice(0, 2500),
+  dimension_values: (civilData.dimension_values || []).slice(0, 1000),
   polyline_areas: (civilData.polyline_areas || []).slice(0, 20),
   block_counts: civilData.block_counts,
 }, null, 2)}
