@@ -115,7 +115,7 @@ def extract_text_from_dwg_binary(dwg_path):
             unique_texts.append(t)
 
     results["texts"] = unique_texts[:2500]
-    results["layers"] = list(dict.fromkeys(results["layers"]))[:120]
+    results["layers"] = list(dict.fromkeys(results["layers"]))[:500]
     results["dims"] = list(dict.fromkeys(results["dims"]))[:1000]
     results["sheets"] = list(dict.fromkeys(results["sheets"]))[:50]
     results["xrefs"] = list(dict.fromkeys(results["xrefs"]))[:20]
@@ -312,7 +312,7 @@ def extract_ezdxf_meta(dxf_path):
     elif any(k in combined for k in ["SECTION", "ELEVATION", "ELEV", "CROSS"]):
         dtype = "SECTION"
 
-    return {"layers": layers, "texts": texts[:2500], "dimensions": dims[:1000],
+    return {"layers": layers, "texts": texts[:3000], "dimensions": dims[:1500],
             "scale": scale, "drawing_type": dtype, "sheets": sheet_names}
 
 
