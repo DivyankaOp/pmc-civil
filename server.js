@@ -1894,13 +1894,13 @@ FLOOR LEVELS:
 ${(civilData.floor_levels||[]).map(l=>`${l.label}=${l.level_m||'?'}m`).join('\n')||'none'}
 
 TEXT ANNOTATIONS:
-${civilData.all_texts.slice(0,100).join('\n')}
+${civilData.all_texts.slice(0,500).join('\n')}
 
 ROOM LABELS: ${(civilData.room_annotations||[]).map(r=>r.text).join(', ')||'none'}
 
-DIMENSIONS (top 40): ${civilData.dimension_values.slice(0,40).map(d=>`${d.value_m}m[${d.layer}]`).join(', ')}
+DIMENSIONS (top 200): ${civilData.dimension_values.slice(0,200).map(d=>`${d.value_m}m[${d.layer}]`).join(', ')}
 
-AREAS from polylines: ${civilData.polyline_areas.slice(0,20).map(p=>`${p.area_sqm}sqm(${p.layer})`).join(', ')}
+AREAS from polylines: ${civilData.polyline_areas.slice(0,100).map(p=>`${p.area_sqm}sqm(${p.layer})`).join(', ')}
 
 GUJARAT DSR 2025 RATES:
 ${ratesSummary}
