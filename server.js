@@ -1468,9 +1468,9 @@ app.post('/analyze-dwg', async (req, res) => {
         : '');
 
     // Always include extracted text + dimension data
-    const textSummary = (converterResult.texts || []).map(t => t.text).slice(0, 150).join(' | ');
+    const textSummary = (converterResult.texts || []).map(t => t.text).slice(0, 500).join(' | ');
     const dimSummary  = (converterResult.dimensions || [])
-      .filter(d => d.value).map(d => `${d.value}${d.text ? ' ('+d.text+')' : ''}`).slice(0, 80).join(', ');
+      .filter(d => d.value).map(d => `${d.value}${d.text ? ' ('+d.text+')' : ''}`).slice(0, 1000).join(', ');
     const layers = (converterResult.layers || []).join(', ');
 
     const prompt = `${visionHeader}You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience analyzing an AutoCAD drawing.
