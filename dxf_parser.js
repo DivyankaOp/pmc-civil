@@ -742,7 +742,7 @@ function extractCivilData(parsed, filename, legendArg) {
     room_annotations: [],
     dimension_values: dimValues,
     inline_dims:     inlineDims,
-    polyline_areas:  polylineAreas.slice(0, 200),
+    polyline_areas:  polylineAreas.slice(0, 1000),
     block_counts:    blockCounts,
     element_counts: {
       floor_levels_found: floorLevels.length,
