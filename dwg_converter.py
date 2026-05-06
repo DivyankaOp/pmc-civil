@@ -114,15 +114,15 @@ def extract_text_from_dwg_binary(dwg_path):
             seen.add(t["text"])
             unique_texts.append(t)
 
-    results["texts"] = unique_texts[:400]
+    results["texts"] = unique_texts[:2500]
     results["layers"] = list(dict.fromkeys(results["layers"]))[:120]
-    results["dims"] = list(dict.fromkeys(results["dims"]))[:120]
+    results["dims"] = list(dict.fromkeys(results["dims"]))[:1000]
     results["sheets"] = list(dict.fromkeys(results["sheets"]))[:50]
     results["xrefs"] = list(dict.fromkeys(results["xrefs"]))[:20]
     return results
 
 
-def render_dxf_to_png(dxf_path, png_path, dpi=120, tiled=False):
+def render_dxf_to_png(dxf_path, png_path, dpi=300, tiled=False):
     """Render DXF → PNG (modelspace + ALL paperspace layouts = multi-sheet support)."""
     import matplotlib
     matplotlib.use("Agg")
@@ -312,11 +312,11 @@ def extract_ezdxf_meta(dxf_path):
     elif any(k in combined for k in ["SECTION", "ELEVATION", "ELEV", "CROSS"]):
         dtype = "SECTION"
 
-    return {"layers": layers, "texts": texts[:300], "dimensions": dims[:200],
+    return {"layers": layers, "texts": texts[:2500], "dimensions": dims[:1000],
             "scale": scale, "drawing_type": dtype, "sheets": sheet_names}
 
 
-def run(input_path, output_png, dpi=120, tiled=False):
+def run(input_path, output_png, dpi=300, tiled=False):
     result = {
         "success": False, "png_path": None, "tiles": [],
         "layout_images": [], "texts": [], "dimensions": [],
