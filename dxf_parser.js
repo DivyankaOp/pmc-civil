@@ -1021,7 +1021,7 @@ function extractTotalAreaSqft(dxfContent) {
 //
 // Example output used to reconstruct footing/column schedule tables.
 // ═══════════════════════════════════════════════════════════════════
-function clusterTextsToTable(texts, yTol = 50, xTol = 80) {
+function clusterTextsToTable(texts, yTol = 150, xTol = 80) {
   if (!texts || !texts.length) return [];
 
   // Filter out empty/whitespace texts
