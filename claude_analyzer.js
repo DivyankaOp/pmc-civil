@@ -438,7 +438,7 @@ async function phase2_legendAndScale(files, cvData, gcvTableContext='', layout={
       ...imgParts,
       { type:'text', text:`${cv}\n${kb}${layoutHint}${gcvTableContext}\n\nTASK PHASE 2: Read ONLY the legend/symbol table, title block, and identify where schedule tables are located in the drawing. No quantities yet.\n\nCRITICAL RULES:\n1. Scale: read EXACTLY from title block (e.g. 1:100, 1:200). If not visible write null.\n2. Scale_factor: numeric part only (100 for 1:100). ALL dimensions sent to Phase 3 will be raw drawing units — Phase 3 multiplies by this factor.\n3. North direction: read compass or north arrow if present.\n4. Legend: read EVERY symbol in the legend table — hatch pattern name, its meaning, and the layer name printed next to it.\n5. If title block confidence is LOW, set scale to null so Phase 3 marks confidence LOW.\n6. If GCV table data is provided above, extract project/drawing info ONLY from those values — do not infer.\n7. DRAWING TYPE DETECTION: If you see steel column base plates, anchor bolts, braced bays, "BOD OF STEEL", "BASE PLATE", SLOPE annotations, CANOPY — set drawing_type to "RCC_FOOTING_INDUSTRIAL" and structural_system to "STEEL_FRAME_RCC_PEDESTAL".\n8. SCHEDULE TABLE LOCATIONS: Scan the full drawing and describe WHERE each schedule table appears. Phase 3 uses this to focus on the right area.\n9. CONCRETE + STEEL GRADE: Read from NOTES section or title block exactly as printed (e.g. M40, Fe500D).\n10. NOTES SECTION: Read every line of the NOTES box — critical spec info is here.\n\nReturn JSON:\n{"drawing_type":"","project_name":"","drawing_no":"","date":"","concrete_grade":"","steel_grade":"","scale":"1:100","scale_factor":100,"north_direction":"","structural_system":"","legend":[{"symbol":"","meaning":"","layer":"","hatch_pattern":""}],"annotation_layers":[],"floors_visible":[],"title_block_confidence":"HIGH|MEDIUM|LOW","legend_confidence":"HIGH|MEDIUM|LOW","schedule_tables_visible":["column_schedule","footing_schedule"],"schedule_table_locations":{"column_schedule":"describe location","footing_schedule":"describe location"},"general_notes":[],"notes":[]}` }
     ]}],
-    maxTokens: 4096
+    maxTokens: 8192
   });
 
   const meta = parseJSON(raw);
@@ -923,7 +923,7 @@ ${JSON.stringify({
   wall_by_thickness: civilData.wall_by_thickness,
   element_counts: civilData.element_counts,
   schedule_tables: civilData.schedule_tables,
-  all_texts: (civilData.all_texts || []).slice(0, 2500),
+  all_texts: (civilData.all_texts || []).slice(0, 60000),
   dimension_values: (civilData.dimension_values || []).slice(0, 1000),
   polyline_areas: (civilData.polyline_areas || []).slice(0, 20),
   block_counts: civilData.block_counts,
