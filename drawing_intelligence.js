@@ -618,12 +618,12 @@ function analyzeDrawing(dxfContent, filename) {
     },
 
     // For Gemini / AI prompt
-    all_texts_sample: [...new Set(scanned.texts.map(t => t.text))].slice(0, 100),
+    all_texts_sample: [...new Set(scanned.texts.map(t => t.text))].slice(0, 2000),
     layer_names: Object.keys(scanned.layers),
     block_names: Object.keys(scanned.blocks),
     unknown_layers: unknownLayers,
     unknown_blocks: unknownBlocks,
-    dims_sample: scanned.dims.slice(0, 50).map(d => ({ mm: d.value_mm, m: Math.round(d.value_mm/10)/100, layer: d.layer })),
+    dims_sample: scanned.dims.slice(0, 500).map(d => ({ mm: d.value_mm, m: Math.round(d.value_mm/10)/100, layer: d.layer })),
 
     // For BOQ Excel generation
     _scanned: scanned,
@@ -641,9 +641,9 @@ function buildAIPrompt(analyzed, ratesSummary) {
   const floorLevelStr = dd.floor_levels.map(l => `  ${l.label} = ${l.m > 0 ? '+' : ''}${l.m}m`).join('\n') || 'none found';
   const floorHtStr    = dd.floor_heights.map(l => `  ${l.name}: H = ${l.height_m}m`).join('\n') || 'none';
   const legendStr     = dd.legend_items.map(l => `  [${l.layer}] ${l.text} → ${l.category}${l.thk_mm ? ' ' + l.thk_mm + 'mm' : ''}`).join('\n') || 'none';
-  const layerStr      = dd.layer_summary.slice(0, 30).map(l => `  ${l.name} (${l.entity_count} entities) → ${l.category}${l.thk_mm ? ' ' + l.thk_mm + 'mm' : ''}`).join('\n');
+  const layerStr      = dd.layer_summary.slice(0, 100).map(l => `  ${l.name} (${l.entity_count} entities) → ${l.category}${l.thk_mm ? ' ' + l.thk_mm + 'mm' : ''}`).join('\n');
   const wallStr       = Object.entries(dd.wall_by_thickness_m2).map(([thk, sqm]) => `  ${thk}mm wall: ${sqm.toFixed(2)} m² plan area`).join('\n') || 'none';
-  const unknownStr    = dd.unknown_layers.slice(0, 10).map(l => `  "${l.name}" (${l.entity_count} entities) — meaning unknown`).join('\n') || 'none';
+  const unknownStr    = dd.unknown_layers.slice(0, 50).map(l => `  "${l.name}" (${l.entity_count} entities) — meaning unknown`).join('\n') || 'none';
 
   return `You are a senior PMC civil engineer analyzing a DXF drawing: "${dd.filename}"
 All data below is EXTRACTED DIRECTLY from the drawing file. Do NOT invent values.
@@ -694,7 +694,7 @@ ${unknownStr}
 ═══════════════════════════════════════════
 SAMPLE DIMENSIONS
 ═══════════════════════════════════════════
-${dd.dims_sample.slice(0, 30).map(d => `${d.mm}mm [${d.layer}]`).join(', ')}
+${dd.dims_sample.slice(0, 200).map(d => `${d.mm}mm [${d.layer}]`).join(', ')}
 
 RATES (Gujarat DSR 2025): ${ratesSummary}
 
