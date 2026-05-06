@@ -312,7 +312,7 @@ def extract_ezdxf_meta(dxf_path):
     elif any(k in combined for k in ["SECTION", "ELEVATION", "ELEV", "CROSS"]):
         dtype = "SECTION"
 
-    return {"layers": layers, "texts": texts[:3000], "dimensions": dims[:1500],
+    return {"layers": layers, "texts": texts[:2500], "dimensions": dims[:1000],
             "scale": scale, "drawing_type": dtype, "sheets": sheet_names}
 
 
@@ -427,7 +427,7 @@ if __name__ == "__main__":
         print(json.dumps({"error": "Usage: dwg_converter.py <input> <output.png> [dpi] [tiled]", "success": False}))
         sys.exit(1)
     try:
-        dpi_arg = int(sys.argv[3]) if len(sys.argv) > 3 else 120
+        dpi_arg = int(sys.argv[3]) if len(sys.argv) > 3 else 300
         tiled_arg = sys.argv[4].lower() in ("true", "1", "yes") if len(sys.argv) > 4 else False
         run(sys.argv[1], sys.argv[2], dpi=dpi_arg, tiled=tiled_arg)
     except Exception as e:
