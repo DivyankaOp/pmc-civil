@@ -76,7 +76,7 @@ def extract_dimension_lines(img):
         if h > 30:
             v_lengths.append({'x': x, 'y': y, 'length_px': h})
     
-    return {'horizontal': h_lengths[:20], 'vertical': v_lengths[:20]}
+    return {'horizontal': h_lengths[:300], 'vertical': v_lengths[:300]}
 
 def detect_rooms_and_spaces(img):
     """Detect closed regions (rooms, spaces) in floor plan"""
