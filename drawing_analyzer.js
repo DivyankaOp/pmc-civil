@@ -241,12 +241,12 @@ function buildContext(extracted) {
 
   if (extracted.dxf_texts?.length) {
     parts.push(`=== DXF TEXTS (${extracted.dxf_texts.length}) ===`);
-    parts.push(extracted.dxf_texts.slice(0,200).map(t=>t.text||t).join(' | '));
+    parts.push(extracted.dxf_texts.slice(0,3000).map(t=>t.text||t).join(' | '));
   }
 
   if (extracted.dxf_dimensions?.length) {
     parts.push('=== DXF DIMENSIONS ===');
-    parts.push(extracted.dxf_dimensions.slice(0,80).map(d=>d.value_m+'m').join(', '));
+    parts.push(extracted.dxf_dimensions.slice(0,1000).map(d=>d.value_m+'m').join(', '));
   }
 
   if (extracted.dxf_layers?.length) {
