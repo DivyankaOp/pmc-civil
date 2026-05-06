@@ -97,7 +97,7 @@ VALIDATION RATIOS (flag if outside):
 - Road WMM: area x 1.15 x 0.2 x 2.1 tonnes`;
 
 // ── CLAUDE API CALL ───────────────────────────────────────────────
-async function callClaude({ messages, maxTokens = 4096, thinking = false }) {
+async function callClaude({ messages, maxTokens = 8192, thinking = false }) {
   const key = process.env.CLAUDE_API_KEY;
   if (!key) throw new Error('CLAUDE_API_KEY not set');
   const body = {
@@ -438,7 +438,7 @@ async function phase2_legendAndScale(files, cvData, gcvTableContext='', layout={
       ...imgParts,
       { type:'text', text:`${cv}\n${kb}${layoutHint}${gcvTableContext}\n\nTASK PHASE 2: Read ONLY the legend/symbol table, title block, and identify where schedule tables are located in the drawing. No quantities yet.\n\nCRITICAL RULES:\n1. Scale: read EXACTLY from title block (e.g. 1:100, 1:200). If not visible write null.\n2. Scale_factor: numeric part only (100 for 1:100). ALL dimensions sent to Phase 3 will be raw drawing units — Phase 3 multiplies by this factor.\n3. North direction: read compass or north arrow if present.\n4. Legend: read EVERY symbol in the legend table — hatch pattern name, its meaning, and the layer name printed next to it.\n5. If title block confidence is LOW, set scale to null so Phase 3 marks confidence LOW.\n6. If GCV table data is provided above, extract project/drawing info ONLY from those values — do not infer.\n7. DRAWING TYPE DETECTION: If you see steel column base plates, anchor bolts, braced bays, "BOD OF STEEL", "BASE PLATE", SLOPE annotations, CANOPY — set drawing_type to "RCC_FOOTING_INDUSTRIAL" and structural_system to "STEEL_FRAME_RCC_PEDESTAL".\n8. SCHEDULE TABLE LOCATIONS: Scan the full drawing and describe WHERE each schedule table appears. Phase 3 uses this to focus on the right area.\n9. CONCRETE + STEEL GRADE: Read from NOTES section or title block exactly as printed (e.g. M40, Fe500D).\n10. NOTES SECTION: Read every line of the NOTES box — critical spec info is here.\n\nReturn JSON:\n{"drawing_type":"","project_name":"","drawing_no":"","date":"","concrete_grade":"","steel_grade":"","scale":"1:100","scale_factor":100,"north_direction":"","structural_system":"","legend":[{"symbol":"","meaning":"","layer":"","hatch_pattern":""}],"annotation_layers":[],"floors_visible":[],"title_block_confidence":"HIGH|MEDIUM|LOW","legend_confidence":"HIGH|MEDIUM|LOW","schedule_tables_visible":["column_schedule","footing_schedule"],"schedule_table_locations":{"column_schedule":"describe location","footing_schedule":"describe location"},"general_notes":[],"notes":[]}` }
     ]}],
-    maxTokens: 2048
+    maxTokens: 4096
   });
 
   const meta = parseJSON(raw);
@@ -514,7 +514,7 @@ SCHEDULE READING — ABSOLUTE RULES (violation = wrong BOQ)
       ...imgParts,
       { type:'text', text:`${gcvCapped ? 'PRIORITY DATA FROM SCANNED PDF TABLE (GCV+Claude validated):\n'+gcvCapped+'\nUSE THESE VALUES EXACTLY — do not recalculate, do not assume missing values.\n\n' : ''}${layoutInstructions ? '━━━ DRAWING LAYOUT READING GUIDE (auto-detected — follow this precisely) ━━━\n'+layoutInstructions+'\n━━━ END LAYOUT GUIDE ━━━\n\n' : ''}${unitConversionRule}\n${legendCtx}\n${scaleCtx}\n${schedLoc}${industrialCtx}${strictScheduleRules}\nDrawing type: ${meta?.drawing_type||layout.drawingType||'unknown'}\nStructural system: ${meta?.structural_system||'unknown'}\nConcrete grade: ${meta?.concrete_grade||'read from drawing'}\nSteel grade: ${meta?.steel_grade||'read from drawing'}\nAnnotation layers (ignore for quantities): ${JSON.stringify(meta?.annotation_layers||[])}\n\nCRITICAL QUANTITY READING RULES:\n1. Apply scale_factor=${meta?.scale_factor||1} to ALL raw dimensions before recording length_m/width_m/height_m.\n2. Count columns/footings from schedule QTY column ONLY (or count listed column numbers per row).\n3. Read annotation texts EXACTLY as printed — do NOT change any digit.\n4. For schedule tables: copy cell values EXACTLY. If unreadable → write "not legible".\n5. If GCV table data is provided above — use those cell values AS-IS.\n6. Mark source: "drawing-schedule" if directly read, "calculated" if derived, "drawing-detail" if from detail panel.\n7. For COLUMN_DETAIL_DRAWING type: read sizes from dimension callouts on each panel — no table exists.\n8. Read PCC thickness from footing section details if shown.\n9. Steel grade: if conflict between Fe500D and Fe550 in same drawing — use value from NOTES section, flag in observations.\n\nTASK PHASE 3: Extract ALL quantities from this drawing as described in the layout guide above.\nReturn JSON:\n{"quantities":[{"element":"","floor":"","length_m":0,"width_m":0,"height_m":0,"thickness_m":0,"nos":1,"area_sqmt":0,"volume_cum":0,"unit":"","annotation_text":"","source":"drawing-schedule|calculated|drawing-detail","confidence":"high|medium|low"}],"element_counts":{"column_count":0,"footing_count":0,"braced_bay_count":0,"anchor_bolt_count":0},"schedule_data":{"concrete_grade":"","steel_grade":"","columns":[{"mark":"","size_mm":"","size_original":"","main_bars":"","stirrups":"","height_m":0,"qty":0,"source":"drawing-schedule|drawing-detail|not legible","notes":""}],"footings":[{"mark":"","pcc_size_mm":"","rcc_size_mm":"","rcc_size_original":"","dmin_mm":0,"dmin_original":"","Df_mm":0,"Df_original":"","pcc_mm":150,"main_bars_b":"","main_bars_l":"","qty":0,"remark":"","source":"drawing-schedule|not legible"}],"base_plates":[{"column_mark":"","plate_size_mm":"","anchor_bolt_nos":0,"anchor_bolt_dia_mm":0,"source":"drawing-schedule|not legible"}]},"section_details":{"footing_depth_mm":0,"pedestal_height_mm":0,"pcc_thickness_mm":150,"cover_mm":50},"grid_info":{"typical_bay_m":0,"total_columns_plan":0,"braced_bay_grids":[]},"road_data":{"roads":[]},"total_built_area_sqmt":0,"unit_system_detected":"feet-inches|mm|mixed","observations":[]}` }
     ]}],
-    maxTokens: 4096
+    maxTokens: 8192
   });
 
   const q = parseJSON(raw);
@@ -604,7 +604,7 @@ Do NOT add items with qty=0.
 
 Return JSON:
 {"project_name":"","drawing_type":"","drawing_no":"","date":"","concrete_grade":"","steel_grade":"","boq":[{"sr":1,"part":"PART A","description":"","unit":"","qty":0,"rate":0,"amount":0,"source":"drawing-schedule|calculated","confidence":"high|medium|low","calc_note":""}],"element_counts":{},"area_statement":{"total_bua_sqmt":0,"floor_wise":[],"road_area_sqmt":0,"road_length_rmt":0},"cost_summary":{"civil_total_inr":0,"civil_total_lacs":0,"civil_total_crores":0},"observations":[],"missing_info":[]}` }],
-    maxTokens: 4096
+    maxTokens: 8192
   });
 
   const boq = parseJSON(raw);
@@ -873,7 +873,7 @@ const CIVIL_SYSTEM = SYSTEM_PROMPT;
  */
 // callClaudeAPI — exported alias used by server.js for direct API calls
 // Routes through callClaude so model name, headers, retries are always consistent
-async function callClaudeAPI({ system, messages, maxTokens = 4096 }) {
+async function callClaudeAPI({ system, messages, maxTokens = 8192 }) {
   const key = process.env.CLAUDE_API_KEY;
   if (!key) throw new Error('CLAUDE_API_KEY not set');
   const body = {
@@ -931,7 +931,7 @@ ${JSON.stringify({
 
 Return ONLY raw JSON:
 {"project_name":"","drawing_type":"","boq":[{"sr":1,"description":"","unit":"","qty":0,"rate":0,"amount":0,"source":"dxf-data","confidence":"high"}],"cost_summary":{"civil_total_inr":0,"civil_total_lacs":0},"observations":[]}`;
-  const raw = await callClaudeAPI({ system: SYSTEM_PROMPT, messages: [{ role: 'user', content: prompt }], maxTokens: 4096 });
+  const raw = await callClaudeAPI({ system: SYSTEM_PROMPT, messages: [{ role: 'user', content: prompt }], maxTokens: 8192 });
   return parseJSON(raw);
 }
 
@@ -949,7 +949,7 @@ CONTEXT: ${JSON.stringify(civilData?.summary || {})}
 
 Return ONLY raw JSON:
 {"classified_blocks":[{"name":"","civil_meaning":"","category":"STRUCTURE|ROAD|UTILITY|ANNOTATION|UNKNOWN"}],"classified_layers":[{"name":"","civil_meaning":"","category":"STRUCTURE|ROAD|UTILITY|ANNOTATION|UNKNOWN"}]}`;
-  const raw = await callClaudeAPI({ system: SYSTEM_PROMPT, messages: [{ role: 'user', content: prompt }], maxTokens: 4096 });
+  const raw = await callClaudeAPI({ system: SYSTEM_PROMPT, messages: [{ role: 'user', content: prompt }], maxTokens: 8192 });
   return parseJSON(raw);
 }
 
@@ -967,7 +967,7 @@ DXF DATA:
 ${JSON.stringify(civilData, null, 2)}
 
 Return ONLY raw JSON BOQ (same schema as claudeAnalyzeDXF).`;
-  const raw = await callClaudeAPI({ system: SYSTEM_PROMPT, messages: [{ role: 'user', content: prompt }], maxTokens: 4096 });
+  const raw = await callClaudeAPI({ system: SYSTEM_PROMPT, messages: [{ role: 'user', content: prompt }], maxTokens: 8192 });
   return parseJSON(raw);
 }
 
@@ -1084,7 +1084,7 @@ Return ONLY raw JSON:
   const raw = await callClaudeAPI({
     system: SYSTEM_PROMPT,
     messages: [{ role: 'user', content }],
-    maxTokens: 4096,
+    maxTokens: 8192,
   });
   return parseJSON(raw);
 }
@@ -1114,7 +1114,7 @@ Return ONLY raw JSON BOQ (same schema as claudeAnalyzeDrawingVision).`;
   const raw = await callClaudeAPI({
     system: SYSTEM_PROMPT,
     messages: [{ role: 'user', content: [...imageParts, { type: 'text', text: prompt }] }],
-    maxTokens: 4096,
+    maxTokens: 8192,
   });
   return parseJSON(raw);
 }
