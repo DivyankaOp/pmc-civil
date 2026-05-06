@@ -59,7 +59,7 @@ ADAPTIVE_BLOCK  = 31       # adaptive threshold block size
 ADAPTIVE_C      = 10       # adaptive threshold constant
 DENOISE_H       = 10       # NlMeans denoising strength
 MIN_LINE_LEN    = 2        # discard lines shorter than this
-MAX_PAGES       = 3        # max pages to process per PDF
+MAX_PAGES       = 999      # UNLOCKED: process all pages (was 3)
 
 
 # ── PREPROCESS ───────────────────────────────────────────────────
