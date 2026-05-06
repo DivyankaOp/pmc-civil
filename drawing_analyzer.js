@@ -136,7 +136,7 @@ async function extractScannedPDF_GCV(pdfB64) {
     const res = await fetch(`https://vision.googleapis.com/v1/files:annotate?key=${gcvKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ requests: [{ inputConfig: { content: pdfB64, mimeType: 'application/pdf' }, features: [{ type: 'DOCUMENT_TEXT_DETECTION' }], pages: [1,2,3,4,5] }] }),
+      body: JSON.stringify({ requests: [{ inputConfig: { content: pdfB64, mimeType: 'application/pdf' }, features: [{ type: 'DOCUMENT_TEXT_DETECTION' }] }] }),
       signal: AbortSignal.timeout(60000)
     });
     if (!res.ok) return null;
@@ -414,7 +414,7 @@ print(json.dumps(paths))
     const allTexts = [];
     const gcvAvailable = !!process.env.GOOGLE_CLOUD_VISION_API_KEY;
 
-    for (const imgFile of imgFiles.slice(0, 5)) {
+    for (const imgFile of imgFiles) {
       let tileText = null;
 
       // ── Try GCV first ──
