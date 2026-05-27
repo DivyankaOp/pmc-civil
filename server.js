@@ -20,15 +20,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ─── 1. CHAT ───────────────────────────────────────────────────────
 
-// PDF → high-res image tiles using Python/PyMuPDF
-// Returns array of base64 PNG strings (one per tile)
-// ── PDF TEXT EXTRACTION (vector PDF — NO image rendering needed) ─
-// Extracts text with X,Y coordinates directly from PDF using PyMuPDF.
-// For vector PDFs (exported from AutoCAD/ZWCAD) this gives 95-99% accuracy
-// with ZERO image tokens — 100x cheaper than sending images to Claude.
-// Falls back to base64 document for Claude if extraction fails.
 async function extractPdfText(pdfBase64) {
   const { execSync } = require('child_process');
   const fs = require('fs');
@@ -70,14 +62,6 @@ print(json.dumps({"pages": pages, "is_vector": any(len(p["texts"])>10 for p in p
   }
 }
 
-// ── SCANNED PDF → Google Cloud Vision (table-aware OCR) ──────────
-// Uses GCV Document AI / Vision API to detect cells, rows, columns.
-// Returns structured JSON that Claude can use to calculate BOQ — we do NOT
-// send the raw image to Claude directly (too many tokens, no table structure).
-// Cost: ~$1.50 per 1000 pages — effectively free for typical usage.
-
-// Large PDF fallback: PyMuPDF renders pages to PNG tiles → GCV images:annotate OCRs each tile
-// images:annotate has no PDF size limit — works for any large A0/A1 drawing
 async function extractLargePdfViaImageOCR(pdfBase64, gcvKey) {
   const { execSync } = require('child_process');
   const fs = require('fs');
@@ -87,7 +71,7 @@ async function extractLargePdfViaImageOCR(pdfBase64, gcvKey) {
   try {
     fs.writeFileSync(pdfPath, Buffer.from(pdfBase64, 'base64'));
 
-    // Render each page to PNG at 200 DPI (balance quality vs size for GCV)
+
     const script = `
 import fitz, base64, json
 doc = fitz.open('${pdfPath}')
@@ -230,8 +214,6 @@ print(json.dumps({'pages':pages}))
   }
 }
 
-// PDF → high-res PNG tiles (full page + 4 quadrant crops for small text)
-// quadrants = true → returns [full, TL, TR, BL, BR] per page (5x zoom coverage)
 async function pdfToImageTiles(pdfBase64, tilesPerPage = 4, quadrants = true) {
   const { execSync } = require('child_process');
   const fs = require('fs');
@@ -240,10 +222,7 @@ async function pdfToImageTiles(pdfBase64, tilesPerPage = 4, quadrants = true) {
   const pdfPath = tmpDir + '/input.pdf';
   try {
     fs.writeFileSync(pdfPath, Buffer.from(pdfBase64, 'base64'));
-    // DPI 250 for scanned drawings — schedule table cells need high resolution to be legible
-    // Previously 150 DPI was too low for A1/A0 scanned drawings — bar sizes, footing dims not readable
-    // Now: 250 DPI balances readability vs token cost — adds ~1 tile per page but schedule cells legible
-    const script = `
+   
 import fitz, json, base64
 doc = fitz.open('${pdfPath}')
 tiles = []
