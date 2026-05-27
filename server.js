@@ -134,16 +134,7 @@ print(json.dumps(tiles))
   }
 }
 
-// ── SCANNED PDF OCR — GCV first, Tesseract fallback ──────────────
-// Strategy (priority order):
-//   1. Google Cloud Vision (DOCUMENT_TEXT_DETECTION) — best table accuracy
-//      Called via extractLargePdfViaImageOCR() which renders PDF→PNG tiles then hits GCV API.
-//      Cost: ~$1.50/1000 pages — effectively free for typical usage.
-//      Enabled when GOOGLE_CLOUD_VISION_API_KEY env var is set.
-//   2. Tesseract multi-crop pipeline (ocr_pipeline.py) — zero cost fallback
-//      Used when GOOGLE_CLOUD_VISION_API_KEY is absent or GCV call fails.
-//      Does 400 DPI render + 6 crops + OpenCV preprocessing + PSM 6/11 dual pass.
-// Both paths return the same shape: { pages, is_gcv, engine }
+
 async function extractScannedPdfWithGCV(pdfBase64) {
   const gcvKey = process.env.GOOGLE_CLOUD_VISION_API_KEY;
 
@@ -164,14 +155,6 @@ async function extractScannedPdfWithGCV(pdfBase64) {
     console.log('[OCR] No GOOGLE_CLOUD_VISION_API_KEY — using Tesseract pipeline');
   }
 
-  // ── Path 2: Tesseract multi-crop pipeline ─────────────────────────
-  // Uses ocr_pipeline.py which does:
-  //   1. 400 DPI render (PyMuPDF)
-  //   2. 6 crops per page (full + schedule zones: btm-right, btm-left, right-third, btm-strip)
-  //   3. Preprocess each crop: grayscale → upscale → adaptive binarize → denoise (OpenCV)
-  //   4. Tesseract PSM 6 (table mode) + PSM 11 (sparse) on each crop
-  //   5. Merge + deduplicate all lines
-  // Result: 3-5x more text extracted vs simple full-page Tesseract
   const { execSync } = require('child_process');
   const fs = require('fs');
   const os = require('os');
@@ -290,10 +273,7 @@ print(json.dumps(tiles))
     try { require('fs').rmSync(tmpDir, { recursive: true }); } catch(e) {}
   }
 }
-// ─── DRAWING PDF READING — inject extracted text as context ───────
-// This is the KEY fix: Claude gets BOTH the visual image AND the
-// machine-extracted text side-by-side, so it can cross-reference.
-// Even if Claude's vision misses a small dimension, the text covers it.
+
 async function buildDrawingContext(pdfB64) {
   const parts = [];
   let extractedTextBlock = '';
@@ -322,10 +302,6 @@ async function buildDrawingContext(pdfB64) {
     console.log(`[drawing-context] Vector PDF: ${totalTexts} texts extracted`);
   }
 
-  // Step 2: ALWAYS run GCV — not just for scanned PDFs
-  // BUG FIX: PyMuPDF marks PDF as "vector" if it finds >10 texts (title block, axis labels)
-  // but schedule table cells are still not extractable — GCV was being skipped wrongly.
-  // Now: run GCV on ALL PDFs and merge with PyMuPDF text for complete coverage.
   let gcvBlock = '';
   const gcvResult = await extractScannedPdfWithGCV(pdfB64);
   if (gcvResult?.pages?.length) {
@@ -339,11 +315,7 @@ async function buildDrawingContext(pdfB64) {
     console.log('[drawing-context] GCV returned no data — check API key or drawing format');
   }
 
-  // Step 3: PNG tiles — ALWAYS send for scanned PDFs so Claude can visually read schedule tables
-  // FIX: Previously tiles were skipped when Tesseract extracted ANY text (hasGoodText=true).
-  // Problem: Tesseract gets title block text but misses table cell values (numbers, bar sizes).
-  // Solution: ALWAYS send PNG tiles alongside extracted text — Claude cross-references both.
-  // PNG tiles are only skipped for vector PDFs with substantial text (>2000 chars = full schedule).
+ 
   const hasFullText = (extractedTextBlock.length > 2000); // vector PDF with complete schedule
   const hasAnyText  = (gcvBlock.length > 200) || (extractedTextBlock.length > 200);
 
@@ -512,14 +484,11 @@ If a value is not above → write "not found in drawing".`
 });
 
 app.post('/gemini', async (req, res) => {
-  // ✅ FULLY CONVERTED TO CLAUDE — handles chat, PDF, images
   try {
     if (!process.env.CLAUDE_API_KEY) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
     const { body } = req.body;
 
-    // ✅ FIX: Use frontend mode-specific system prompt (drawing/estimate/boq/auto etc.)
-    // Previously CIVIL_SYSTEM was always used — ignoring the detailed drawing-mode prompt
-    // from frontend which has STEP 1-8 instructions for reading schedules, BOQ etc.
+    //
     const frontendSystem = body?.system_instruction?.parts?.[0]?.text;
     const systemToUse = (frontendSystem && frontendSystem.trim().length > 50) ? frontendSystem : CIVIL_SYSTEM;
 
@@ -569,10 +538,7 @@ app.post('/gemini', async (req, res) => {
 async function extractData(_key, files, userText, aiResponse) {
   const parts = [];
   
-  // If we have the AI response from chat, use it as primary input
-  // This avoids re-processing files and gives much better results
-  // STRATEGY: aiResponse (chat text) is PRIMARY source — it already has all data
-  // Only use files as fallback if no aiResponse
+
   const primaryText = aiResponse || userText || '';
 
   if (!aiResponse) {
