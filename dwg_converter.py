@@ -123,7 +123,22 @@ def extract_text_from_dwg_binary(dwg_path):
 
 
 def render_dxf_to_png(dxf_path, png_path, dpi=300, tiled=False):
-    """Render DXF → PNG (modelspace + ALL paperspace layouts = multi-sheet support)."""
+    """Render DXF → PNG (modelspace + ALL paperspace layouts = multi-sheet support).
+
+    FIXED: previously rendered at a fixed (16, 12) inch canvas regardless of the
+    drawing's actual complexity/aspect ratio, so dense sheets (grid of columns +
+    2 schedule tables + 8 detail panels, all on one A1 sheet — exactly the kind
+    of drawing this tool exists to read) got squashed into a low effective
+    resolution. Schedule-table digits became a handful of blurry pixels, so the
+    vision model was reading noise, not numbers.
+
+    FIXED: tiling was a naive fixed 2x2 quadrant split of that already-blurry
+    image, and only ran when the caller explicitly asked for `tiled=True`
+    (gated behind a "detail mode" toggle) — so by default nothing was tiled at
+    all. Now tiling always runs, the grid size scales with drawing complexity,
+    near-blank tiles are skipped, and every tile is capped to Claude's optimal
+    ~1568px edge (computed at BASE_DPI, not the same small default canvas).
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -137,19 +152,47 @@ def render_dxf_to_png(dxf_path, png_path, dpi=300, tiled=False):
     except Exception:
         try:
             doc = ezdxf.readfile(dxf_path)
-        except Exception as e:
+        except Exception:
             return False, [], []
 
     layout_images = []
 
-    def render_one(layout, out_path):
+    def entity_count(layout):
         try:
-            fig = plt.figure(figsize=(16, 12), dpi=dpi)
+            return sum(1 for _ in layout)
+        except Exception:
+            return 0
+
+    def render_one(layout, out_path, base_dpi):
+        try:
+            # Size the canvas to the layout's real extents/aspect ratio instead
+            # of a fixed (16, 12) box, and scale up for complex/dense sheets so
+            # small schedule-table text still has enough source pixels before
+            # we crop into tiles below.
+            n = entity_count(layout)
+            if n > 3000:
+                fig_w = 60
+            elif n > 1000:
+                fig_w = 44
+            elif n > 300:
+                fig_w = 30
+            else:
+                fig_w = 20
+
+            try:
+                ext_min, ext_max = layout.extents()
+                w = max(ext_max.x - ext_min.x, 1e-6)
+                h = max(ext_max.y - ext_min.y, 1e-6)
+                fig_h = max(8, min(fig_w * (h / w), 90))
+            except Exception:
+                fig_h = fig_w * 0.75
+
+            fig = plt.figure(figsize=(fig_w, fig_h), dpi=base_dpi)
             ax = fig.add_axes([0, 0, 1, 1])
             ctx = RenderContext(doc)
             out = MatplotlibBackend(ax)
             Frontend(ctx, out).draw_layout(layout, finalize=True)
-            fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+            fig.savefig(out_path, dpi=base_dpi, bbox_inches="tight", facecolor="white")
             plt.close(fig)
             return os.path.exists(out_path) and os.path.getsize(out_path) > 5000
         except Exception:
@@ -157,7 +200,7 @@ def render_dxf_to_png(dxf_path, png_path, dpi=300, tiled=False):
             return False
 
     # Modelspace
-    render_one(doc.modelspace(), png_path)
+    render_one(doc.modelspace(), png_path, dpi)
     if os.path.exists(png_path) and os.path.getsize(png_path) > 5000:
         layout_images.append({"name": "ModelSpace", "path": png_path})
 
@@ -168,7 +211,7 @@ def render_dxf_to_png(dxf_path, png_path, dpi=300, tiled=False):
         if layout.name.upper() == "MODEL":
             continue
         sheet_png = os.path.join(base_dir, f"{base_name}_sheet_{re.sub(r'[^A-Za-z0-9]','_',layout.name)}.png")
-        if render_one(layout, sheet_png):
+        if render_one(layout, sheet_png, dpi):
             layout_images.append({"name": layout.name, "path": sheet_png})
 
     # If model failed but sheets worked, copy first sheet as main
@@ -177,22 +220,59 @@ def render_dxf_to_png(dxf_path, png_path, dpi=300, tiled=False):
 
     main_ok = os.path.exists(png_path) and os.path.getsize(png_path) > 5000
 
-    # Tiles from main PNG
+    # Tiles from main PNG — ALWAYS generated now (not gated behind `tiled`,
+    # which used to mean dense drawings got read as one blurry flattened
+    # image by default). `tiled=False` now just means "skip the extra
+    # per-layout detail tiles below", the main sheet is still tiled.
     tiles = []
-    if tiled and main_ok:
+    if main_ok:
         try:
             from PIL import Image
+            MAX_EDGE = 1568
             img = Image.open(png_path)
             W, H = img.size
-            for row in range(2):
-                for col in range(2):
-                    x1, y1 = col * W // 2, row * H // 2
-                    x2, y2 = (col+1) * W // 2, (row+1) * H // 2
-                    tile = img.crop((x1, y1, x2, y2))
-                    tp = png_path.replace(".png", f"_tile_{row}{col}.png")
-                    tile.save(tp)
-                    tiles.append({"path": tp, "row": row, "col": col,
-                                  "position": f"{'Top' if row==0 else 'Bottom'}-{'Left' if col==0 else 'Right'}"})
+
+            # Grid scales with image size so dense sheets get finer slices;
+            # small/simple drawings don't get needlessly chopped up.
+            megapixels = (W * H) / 1_000_000
+            if megapixels > 40:
+                cols, rows = 4, 3
+            elif megapixels > 15:
+                cols, rows = 3, 2
+            elif megapixels > 4:
+                cols, rows = 2, 2
+            else:
+                cols, rows = 1, 1
+
+            if cols * rows > 1:
+                overlap = 0.06
+                for row in range(rows):
+                    for col in range(cols):
+                        x1 = max(0, int((col / cols - overlap) * W))
+                        x2 = min(W, int(((col + 1) / cols + overlap) * W))
+                        y1 = max(0, int((row / rows - overlap) * H))
+                        y2 = min(H, int(((row + 1) / rows + overlap) * H))
+                        tile = img.crop((x1, y1, x2, y2))
+
+                        # Skip near-blank tiles (mostly white paper, no content)
+                        gray = tile.convert("L")
+                        dark_px = sum(1 for px in gray.getdata() if px < 200)
+                        if dark_px < 80:
+                            continue
+
+                        if max(tile.size) > MAX_EDGE:
+                            scale = MAX_EDGE / max(tile.size)
+                            tile = tile.resize(
+                                (max(1, int(tile.size[0]*scale)), max(1, int(tile.size[1]*scale))),
+                                Image.LANCZOS
+                            )
+
+                        tp = png_path.replace(".png", f"_tile_{row}{col}.png")
+                        tile.convert("RGB").save(tp, "PNG")
+                        vpos = 'Top' if row == 0 else ('Bottom' if row == rows-1 else 'Middle')
+                        hpos = 'Left' if col == 0 else ('Right' if col == cols-1 else 'Center')
+                        tiles.append({"path": tp, "row": row, "col": col,
+                                      "position": f"{vpos}-{hpos}"})
         except Exception:
             pass
 
