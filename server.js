@@ -214,7 +214,7 @@ print(json.dumps({'pages':pages}))
   }
 }
 
-async function pdfToImageTiles(pdfBase64, tilesPerPage = 4, quadrants = true) {
+async function pdfToImageTiles(pdfBase64) {
   const { execSync } = require('child_process');
   const fs = require('fs');
   const os = require('os');
@@ -222,20 +222,66 @@ async function pdfToImageTiles(pdfBase64, tilesPerPage = 4, quadrants = true) {
   const pdfPath = tmpDir + '/input.pdf';
   try {
     fs.writeFileSync(pdfPath, Buffer.from(pdfBase64, 'base64'));
-   
-import fitz, json, base64
+
+    // FIXED: this template string was previously missing its own declaration
+    // (no "const script = `" before the python code), so it threw
+    // "script is not defined" on EVERY call, was silently caught below, and
+    // returned null. Net effect: Claude never received any image at all for
+    // scanned/rasterized drawings — only broken OCR text.
+    //
+    // ALSO FIXED: previously only cropped a hardcoded bottom-right quadrant,
+    // assuming that's where schedule tables live. Real drawings vary — this
+    // project's column/footing schedule sits top-right. We now render an
+    // overlapping 3x2 grid across the WHOLE sheet at high DPI, so whichever
+    // corner the table is actually in, it gets a sharp legible close-up.
+    // Blank tiles are skipped; every tile is capped to ~1568px (Claude's
+    // optimal edge) so text stays crisp instead of being crushed by
+    // whole-page downscaling.
+    const script = `
+import fitz, json, base64, io
+from PIL import Image
+
+MAX_EDGE = 1568
+RENDER_DPI = 400
+
+def encode_capped(pix):
+    img = Image.open(io.BytesIO(pix.tobytes('png')))
+    if max(img.size) > MAX_EDGE:
+        scale = MAX_EDGE / max(img.size)
+        img = img.resize((max(1, int(img.size[0]*scale)), max(1, int(img.size[1]*scale))), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format='PNG', optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
+
 doc = fitz.open('${pdfPath}')
 tiles = []
+mat = fitz.Matrix(RENDER_DPI/72, RENDER_DPI/72)
+
 for page_num in range(len(doc)):
     page = doc[page_num]
-    mat = fitz.Matrix(400/72, 400/72)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    tiles.append({'label': f'page_{page_num+1}_full', 'data': base64.b64encode(pix.tobytes('png')).decode()})
-    # Also add a zoomed crop of bottom-right (where schedules usually are)
     w, h = page.rect.width, page.rect.height
-    sched_rect = fitz.Rect(w*0.45, h*0.45, w, h)
-    pix2 = page.get_pixmap(matrix=mat, alpha=False, clip=sched_rect)
-    tiles.append({'label': f'page_{page_num+1}_schedule_zoom', 'data': base64.b64encode(pix2.tobytes('png')).decode()})
+
+    overview = page.get_pixmap(matrix=fitz.Matrix(150/72, 150/72), alpha=False)
+    tiles.append({'label': f'page_{page_num+1}_overview', 'data': encode_capped(overview)})
+
+    cols, rows = 3, 2
+    overlap = 0.06
+    for row in range(rows):
+        for col in range(cols):
+            x1 = max(0, (col / cols) - overlap) * w
+            x2 = min(1, ((col + 1) / cols) + overlap) * w
+            y1 = max(0, (row / rows) - overlap) * h
+            y2 = min(1, ((row + 1) / rows) + overlap) * h
+            pix = page.get_pixmap(matrix=mat, alpha=False, clip=fitz.Rect(x1, y1, x2, y2))
+
+            samp = pix.samples
+            step = max(1, len(samp) // 20000)
+            dark = sum(1 for i in range(0, len(samp), step) if samp[i] < 200)
+            if dark < 5:
+                continue
+
+            tiles.append({'label': f'page_{page_num+1}_r{row}c{col}', 'data': encode_capped(pix)})
+
 doc.close()
 print(json.dumps(tiles))
 `.trim();
@@ -243,7 +289,6 @@ print(json.dumps(tiles))
     fs.writeFileSync(scriptPath, script);
     const out = execSync(`python3 "${scriptPath}"`, { timeout: 120000, maxBuffer: 300 * 1024 * 1024 });
     const result = JSON.parse(out.toString());
-    // Return just the base64 data strings (backward-compatible)
     return result.map(t => typeof t === 'object' ? t.data : t);
   } catch(e) {
     console.error('PDF tile error:', e.message);
@@ -306,8 +351,15 @@ async function buildDrawingContext(pdfB64) {
       parts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
     }
     console.log(`[drawing-context] Sending ${pngTiles.length} PNG tiles (always-on for scanned PDF visual reading)`);
-  } else if (!hasAnyText) {
-    // No tiles AND no text — raw PDF fallback
+  } else {
+    // SAFETY NET: tile generation failed for some reason — always give Claude
+    // the raw PDF rather than leaving it with nothing but OCR text (this is
+    // the exact failure mode that used to cause silent number-guessing:
+    // pdfToImageTiles was throwing internally, returning null, and — since
+    // OCR text usually clears the 200-char bar even when garbled — no visual
+    // was ever attached). Now we always fall back to the raw PDF so Claude
+    // has *something* to actually look at.
+    console.warn('[drawing-context] PNG tiling failed — falling back to raw PDF document');
     parts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
   }
 
@@ -1324,8 +1376,14 @@ app.post('/analyze-dwg', async (req, res) => {
     } else {
       try {
         const py = process.env.PMC_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
-        const dpi = useDetail ? 300 : 250;  // Increased: 150/180 was too low for A0/A1 schedule tables
-        const tiledArg = useDetail ? 'true' : 'false';
+        // FIXED: tiling used to only run when the user explicitly enabled
+        // "detail mode" — so by default every DWG/DXF was flattened into one
+        // low-res image and small schedule-table numbers were unreadable.
+        // dwg_converter.py now always tiles the main sheet and scales the
+        // grid to the drawing's density; detailMode just requests a higher
+        // base render DPI on top of that for extra-dense sheets.
+        const dpi = useDetail ? 350 : 300;
+        const tiledArg = 'true';
         const out = execSync(
           `${py} "${scriptPath}" "${tmpIn}" "${tmpPng}" ${dpi} ${tiledArg}`,
           { timeout: 120000, maxBuffer: 20 * 1024 * 1024 }
@@ -1381,8 +1439,13 @@ app.post('/analyze-dwg', async (req, res) => {
       const pngB64 = fs.readFileSync(converterResult.png_path).toString('base64');
       parts.push({ inline_data: { mime_type: 'image/png', data: pngB64 } });
     }
-    if (useDetail && Array.isArray(converterResult.tiles)) {
+    // FIXED: was gated behind `useDetail`, so even when tiles were generated
+    // they were thrown away and never sent to Claude unless "detail mode"
+    // was on. Tiles are now always generated (see dwg_converter.py) and
+    // always sent.
+    if (Array.isArray(converterResult.tiles)) {
       for (const t of converterResult.tiles) {
+
         if (t.path && fs.existsSync(t.path)) {
           try {
             const tb = fs.readFileSync(t.path).toString('base64');
@@ -1407,8 +1470,8 @@ app.post('/analyze-dwg', async (req, res) => {
     }
 
     const nDetailTiles = (converterResult.tiles || []).length;
-    const visionHeader = useDetail && nDetailTiles
-      ? `MULTI-IMAGE INPUT: The user message includes ${1 + nDetailTiles} images in order: (1) full sheet render, then (2–${1 + nDetailTiles}) 2×2 quadrant crops of the SAME drawing (higher effective zoom for small text, legend, dimensions). Synthesize one coherent analysis; do not treat crops as different drawings.\n\n`
+    const visionHeader = nDetailTiles
+      ? `MULTI-IMAGE INPUT: The user message includes ${1 + nDetailTiles} images in order: (1) full sheet overview, then (2–${1 + nDetailTiles}) overlapping high-resolution crops covering the SAME sheet (higher effective zoom for small text, schedule tables, dimensions, legend). Cross-check any schedule/table numbers against the zoomed crop that contains them, not just the overview. Synthesize one coherent analysis; do not treat crops as different drawings.\n\n`
       : (parts.length > 0
         ? 'SINGLE-IMAGE INPUT: The drawing render is above this text. Read like CAD: title block, legend, dimensions, hatches, symbols, notes.\n\n'
         : '');
