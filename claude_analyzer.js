@@ -142,6 +142,98 @@ function parseJSON(raw) {
   catch(e) { console.error('[Claude] JSON parse fail:',e.message,clean.slice(0,200)); return null; }
 }
 
+// ════════════════════════════════════════════
+// SCHEDULE TABLE DEDUPLICATION — CODE-LEVEL SAFETY NET
+// ════════════════════════════════════════════
+// Why this exists: overlapping image tiles (deliberate ~6% overlap so
+// tables aren't cut in half at a tile boundary) mean Claude can legitimately
+// see the same schedule row in two different crops. The prompt tells it not
+// to double-count, but a prompt instruction is not a guarantee — it's still
+// possible for the model to list a row twice, or read it very slightly
+// differently in each crop. This function does NOT depend on Claude
+// following instructions: it deterministically merges rows by their actual
+// mark (C1, F2, etc.) in plain JS, AFTER the response comes back, so a
+// duplicate can never silently reach the BOQ/Excel.
+//
+// - Exact duplicate (same mark, same values) -> silently merged to one row.
+// - Same mark, DIFFERENT values -> NOT silently resolved (we can't know
+//   algorithmically which read is correct). Both are kept out of the count,
+//   the first is kept in the table, and the conflict is pushed into
+//   not_legible_fields + analysis._schedule_conflicts so it's visible to
+//   the engineer reviewing the output, same as any other "not legible" flag.
+function normMark(v) {
+  return String(v ?? '').toUpperCase().replace(/\s+/g, '').trim();
+}
+
+function dedupeByKey(rows, keyFields, label) {
+  if (!Array.isArray(rows) || rows.length === 0) return { rows: rows || [], conflicts: [] };
+  const byKey = new Map();
+  const conflicts = [];
+
+  for (const row of rows) {
+    const key = keyFields.map(f => normMark(row?.[f])).join('|');
+    if (!key.trim() || key.replace(/\|/g, '') === '') {
+      // No usable mark to key on — can't safely dedupe, keep row as-is.
+      byKey.set(Symbol(`unkeyed_${byKey.size}`), row);
+      continue;
+    }
+    const existing = byKey.get(key);
+    if (!existing) { byKey.set(key, row); continue; }
+
+    if (JSON.stringify(existing) === JSON.stringify(row)) {
+      continue; // identical duplicate from tile overlap — drop silently
+    }
+
+    const existingGood = existing?.source === 'drawing-schedule';
+    const rowGood = row?.source === 'drawing-schedule';
+    if (rowGood && !existingGood) {
+      byKey.set(key, row);
+    } else if (existingGood && !rowGood) {
+      // keep existing, drop the weaker read
+    } else {
+      // Both look equally credible but disagree — real conflict, don't guess.
+      conflicts.push({ key, label, a: existing, b: row });
+    }
+  }
+
+  return { rows: Array.from(byKey.values()), conflicts };
+}
+
+function dedupeScheduleTables(analysis) {
+  if (!analysis || typeof analysis !== 'object') return analysis;
+  const allConflicts = [];
+
+  const tables = [
+    ['column_schedule', ['col_mark', 'floor']],
+    ['footing_schedule', ['footing_mark']],
+    ['base_plate_schedule', ['column_mark']],
+  ];
+
+  for (const [field, keyFields] of tables) {
+    if (!Array.isArray(analysis[field])) continue;
+    const before = analysis[field].length;
+    const { rows, conflicts } = dedupeByKey(analysis[field], keyFields, field);
+    analysis[field] = rows;
+    allConflicts.push(...conflicts);
+    if (rows.length !== before) {
+      console.log(`[dedupe] ${field}: ${before} -> ${rows.length} rows (removed ${before - rows.length} tile-overlap duplicate(s))`);
+    }
+  }
+
+  if (allConflicts.length) {
+    console.warn(`[dedupe] ${allConflicts.length} conflicting duplicate read(s) — same mark, different values across tiles. Flagging for manual review.`);
+    analysis.not_legible_fields = [
+      ...(analysis.not_legible_fields || []),
+      ...allConflicts.map(c =>
+        `${c.label} "${c.key}" was read differently in two image tiles: ` +
+        `${JSON.stringify(c.a)} vs ${JSON.stringify(c.b)} — verify against original drawing.`)
+    ];
+    analysis._schedule_conflicts = allConflicts;
+  }
+
+  return analysis;
+}
+
 function buildImageParts(files) {
   return (files||[]).flatMap(f => {
     if (f.type?.startsWith('image/'))
@@ -1086,11 +1178,8 @@ Return ONLY raw JSON:
     messages: [{ role: 'user', content }],
     maxTokens: 8192,
   });
-  return parseJSON(raw);
+  return dedupeScheduleTables(parseJSON(raw));
 }
-
-/**
- * claudeAnalyzeDWGVision — analyse DWG converted to PNG tiles
  * server.js calls: claudeAnalyzeDWGVision(pngTiles, converterResult, filename)
  */
 async function claudeAnalyzeDWGVision(pngTiles, converterResult, filename) {
