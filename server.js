@@ -369,6 +369,25 @@ async function buildDrawingContext(pdfB64) {
     console.log(`[drawing-context] Scanned PDF — tiles + OCR text sent together for cross-reference`);
   }
 
+  // NEW: was missing entirely — Claude was receiving 7 separate images with
+  // no explanation of what they are. Without this it can (a) mistake tiles
+  // for separate drawings/pages, and (b) double-count anything caught in the
+  // ~6% overlap between adjacent crops (e.g. count a column twice because it
+  // appears in both the top-middle and top-right tile).
+  if (pngTiles?.length > 1) {
+    parts.push({
+      type: 'text',
+      text: `\n\nIMAGE SET NOTE: The ${pngTiles.length} images above are ALL of the SAME single drawing sheet — not separate drawings or pages.\n` +
+        `Image 1 is a full-sheet overview (lower resolution, for overall layout/structure).\n` +
+        `The remaining images are high-resolution zoomed crops of overlapping regions of that SAME sheet (~6% overlap between adjacent crops), provided ONLY so small text/numbers are legible.\n` +
+        `RULES:\n` +
+        `1. Because crops overlap, the same table row, column mark, or dimension may appear in more than one image. NEVER count or list it twice.\n` +
+        `2. For any quantity/count (columns, footings, etc.) — use the schedule table's QTY column (or a de-duplicated list of unique marks), NOT how many times you see something across the images.\n` +
+        `3. If one schedule table's rows are split across two adjacent crops, merge them into ONE table using the column headers as the guide — do not create duplicate rows.\n` +
+        `4. Use the overview to understand overall structure (how many tables exist, how many rows each has); use the zoomed crops only to read exact digits/values in those cells.\n\n`
+    });
+  }
+
   // Step 4: Inject extracted text with HARD instruction to use text only
   const contextText = [extractedTextBlock, gcvBlock].filter(Boolean).join('\n\n');
 
@@ -1471,7 +1490,12 @@ app.post('/analyze-dwg', async (req, res) => {
 
     const nDetailTiles = (converterResult.tiles || []).length;
     const visionHeader = nDetailTiles
-      ? `MULTI-IMAGE INPUT: The user message includes ${1 + nDetailTiles} images in order: (1) full sheet overview, then (2–${1 + nDetailTiles}) overlapping high-resolution crops covering the SAME sheet (higher effective zoom for small text, schedule tables, dimensions, legend). Cross-check any schedule/table numbers against the zoomed crop that contains them, not just the overview. Synthesize one coherent analysis; do not treat crops as different drawings.\n\n`
+      ? `MULTI-IMAGE INPUT: The ${1 + nDetailTiles} images above are ALL of the SAME single drawing sheet — image 1 is a full-sheet overview, the rest are high-resolution overlapping crops (~6% overlap between adjacent tiles) provided ONLY to make small text/schedule numbers legible.\n` +
+        `RULES:\n` +
+        `1. Because tiles overlap, the same column mark, table row, or dimension may appear in more than one image — NEVER count or list it twice.\n` +
+        `2. For any quantity/count (columns, footings, etc.) use the schedule table's QTY column or a de-duplicated list of unique marks — NOT how many times something appears across tiles.\n` +
+        `3. If a schedule table's rows are split across two adjacent tiles, merge into ONE table using column headers as the guide — do not duplicate rows.\n` +
+        `4. Use the overview for overall structure (how many tables/rows exist); use the zoomed tiles only to read exact digits in those cells.\n\n`
       : (parts.length > 0
         ? 'SINGLE-IMAGE INPUT: The drawing render is above this text. Read like CAD: title block, legend, dimensions, hatches, symbols, notes.\n\n'
         : '');
