@@ -1180,6 +1180,9 @@ Return ONLY raw JSON:
   });
   return dedupeScheduleTables(parseJSON(raw));
 }
+
+/**
+ * claudeAnalyzeDWGVision — analyse DWG converted to PNG tiles
  * server.js calls: claudeAnalyzeDWGVision(pngTiles, converterResult, filename)
  */
 async function claudeAnalyzeDWGVision(pngTiles, converterResult, filename) {
@@ -1205,7 +1208,7 @@ Return ONLY raw JSON BOQ (same schema as claudeAnalyzeDrawingVision).`;
     messages: [{ role: 'user', content: [...imageParts, { type: 'text', text: prompt }] }],
     maxTokens: 8192,
   });
-  return parseJSON(raw);
+  return dedupeScheduleTables(parseJSON(raw));
 }
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
@@ -1225,4 +1228,5 @@ module.exports = {
   claudeAnalyzeWithAnswers,
   claudeAnalyzeDrawingVision,
   claudeAnalyzeDWGVision,
+  dedupeScheduleTables, // exported so it's independently testable/verifiable
 };
