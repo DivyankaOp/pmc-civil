@@ -104,10 +104,32 @@ function detectScale(texts, dims, extents) {
 // STEP 3 — ROOM AREA EXTRACTION
 // ─────────────────────────────────────────────────────────────────
 // Room labels (TEXT entities) near closed polylines → room name + area
-function extractRooms(texts, polylines, scaleFactor) {
+//
+// FIX: previously accepted ANY closed polyline in the size window as a
+// candidate "room" — including wall hatch outlines, column pads, etc.
+// This was invisible before because this function was always being called
+// with polylines=[] (see buildSmartContext), so it never actually ran
+// against real data. Now that real geometry flows through, a wall hatch
+// polygon (e.g. a long thin 230mm-thick strip) can land in the 0.5–10000
+// sqm window just like a real room and get mislabeled. `layerMap` (already
+// computed elsewhere as dxfData.layer_map) lets us skip anything that's
+// categorised as wall/column/footing/annotation/etc. — only polylines with
+// NO known non-room category (typically room-boundary hatches, which are
+// usually on unmapped/generic layers) are treated as rooms.
+const NON_ROOM_CATEGORIES = new Set([
+  'wall', 'column', 'footing', 'annotation', 'dimension', 'grid',
+  'd_wall', 'rcc_pardi', 'ignore', 'parking', 'road', 'furniture',
+]);
+
+function extractRooms(texts, polylines, scaleFactor, layerMap = {}) {
   const rooms = [];
-  // Filter closed polylines with meaningful area
-  const closedPoly = polylines.filter(p => p.pts && p.pts.length >= 3);
+  // Filter closed polylines with meaningful area, excluding known non-room categories
+  const closedPoly = polylines.filter(p => {
+    if (!p.pts || p.pts.length < 3) return false;
+    const mapped = layerMap[p.layer];
+    if (mapped && NON_ROOM_CATEGORIES.has(mapped.cat || mapped.category)) return false;
+    return true;
+  });
 
   for (const poly of closedPoly) {
     const rawArea = shoelace(poly.pts);
@@ -145,7 +167,12 @@ function extractWallQuantities(polylines, layerMap, floorHeights, scaleFactor) {
 
   for (const poly of polylines) {
     const mapped = layerMap[poly.layer];
-    if (!mapped || mapped.category !== 'wall') continue;
+    // FIX: was checking mapped.category, but both dxf_parser.js's LAYER_MAP
+    // and drawing_intelligence.js's layer categoriser store the category
+    // under `.cat`, never `.category`. This meant the check was ALWAYS
+    // false — every wall polyline was skipped, independent of (and in
+    // addition to) the separate hardcoded-[] bug at the call site.
+    if (!mapped || mapped.cat !== 'wall') continue;
     const thk = mapped.thk_mm || 230;
 
     if (!wallsByThk[thk]) wallsByThk[thk] = { plan_area_mm2: 0, perimeter_mm: 0, count: 0, layers: new Set() };
@@ -444,16 +471,25 @@ function preDraftBOQ(wallQty, rooms, scheduleTables, floorLevels, floorHeights, 
 function buildSmartContext(dxfData, rates = {}) {
   const sf = dxfData.scale_factor || 1;
 
-  // Re-extract rooms with correct scale
+  // FIX: was mapping all_texts (plain strings) to {x:0,y:0} — every text
+  // collapsed onto the same point, so "nearest text to room centroid"
+  // matching in extractRooms() was meaningless. dxf_parser.js now exposes
+  // texts_with_position (real x/y per text) — use that when available.
   const rooms = extractRooms(
-    (dxfData.all_texts || []).map(t => typeof t === 'string' ? { text: t, x: 0, y: 0 } : t),
-    [], // polylines would need raw data — use dimension-based approach
-    sf
+    dxfData.texts_with_position?.length
+      ? dxfData.texts_with_position
+      : (dxfData.all_texts || []).map(t => typeof t === 'string' ? { text: t, x: 0, y: 0 } : t),
+    dxfData.polylines || [],
+    sf,
+    dxfData.layer_map || {}
   );
 
-  // Wall quantities with CORRECT formula
+  // FIX: was hardcoded to [] with a "need raw polylines from parser" comment
+  // — meaning wall masonry + plaster BOQ lines were ALWAYS empty/skipped in
+  // preDraftBOQ() for every DXF export via this path (buildSmartContext is
+  // called directly from /export-dxf-excel). Now wired to real geometry.
   const wallQty = extractWallQuantities(
-    [], // need raw polylines from parser
+    dxfData.polylines || [],
     dxfData.layer_map || {},
     dxfData.floor_heights || [],
     sf
@@ -607,7 +643,7 @@ function buildSmartContextFromAnalyzed(analyzed, rates = {}) {
   );
 
   // Room extraction from raw polylines + texts
-  const rooms = extractRooms(scanned.texts || [], scanned.polylines || [], sf);
+  const rooms = extractRooms(scanned.texts || [], scanned.polylines || [], sf, analyzed._layerMap || {});
 
   // Schedule tables from texts
   const scheduleTables = extractScheduleTables(scanned.texts || [], sf);
