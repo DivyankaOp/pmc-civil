@@ -655,6 +655,15 @@ function extractCivilData(parsed, filename, legendArg) {
 
   // ─── 11. UNIQUE TEXTS ────────────────────────────────────────────
   const uniqueTexts = [...new Set(allTexts.map(t => t.text.trim()))].filter(Boolean);
+  // FIX: all_texts below is a flat array of strings (kept as-is — other code
+  // reads it that way), but that means position is lost. extractRooms()
+  // needs each text's x/y to find the label nearest a room polygon's
+  // centroid. Without this, every text defaulted to (0,0) and "nearest
+  // text" matching was meaningless. Expose position separately instead of
+  // changing all_texts' existing shape.
+  const textsWithPosition = allTexts
+    .filter(t => t.text && t.text.trim())
+    .map(t => ({ text: t.text.trim(), x: t.x || 0, y: t.y || 0 }));
 
   // ─── 12. WALL BOQ ITEMS ─────────────────────────────────────────
   // For section drawing: wall volume = polyline plan area / thk × floor height
@@ -727,6 +736,23 @@ function extractCivilData(parsed, filename, legendArg) {
     floor_heights:   floorHeights,
     wall_notes:      wallNotes,
     wall_boq:        wallBOQ,
+    // FIX: previously this geometry was computed (shoelaceArea, wallAreas
+    // etc. above) then thrown away — only aggregate counts/areas survived
+    // into the returned object. smart_boq_engine.js's buildSmartContext()
+    // needed per-polygon points+layer to compute wall length/volume and
+    // room areas correctly, didn't have them, and was silently passed `[]`
+    // instead (see smart_boq_engine.js) — meaning wall masonry, plaster and
+    // room BOQ lines were ALWAYS empty for every DXF export. Exposing the
+    // real geometry here (same raw coordinate space as all_texts/dimension_values,
+    // i.e. NOT yet multiplied by unit_to_mm — callers combine with scale_factor
+    // the same way extractRooms/extractWallQuantities already expect) fixes that.
+    polylines: allPolylines
+      .filter(pl => pl.vertices && pl.vertices.length >= 3)
+      .map(pl => ({
+        pts: pl.vertices.map(v => [v.x, v.y]),
+        layer: pl.layer,
+        closed: !!pl.closed,
+      })),
     wall_by_thickness: Object.fromEntries(
       Object.entries(wallAreas).map(([thk, d]) => [
         thk + 'mm',
@@ -739,6 +765,7 @@ function extractCivilData(parsed, filename, legendArg) {
     layer_map:       LAYER_MAP,
     layer_names:     Object.keys(layerGroups).filter(Boolean),
     all_texts:       uniqueTexts,
+    texts_with_position: textsWithPosition,
     room_annotations: [],
     dimension_values: dimValues,
     inline_dims:     inlineDims,
