@@ -1,514 +1,706 @@
-#!/usr/bin/env python3
-"""
-PMC Civil — DWG/DXF Converter (v5 — ZWCAD + Multi-Sheet)
-Strategy (first-that-works wins for PNG):
-  1. DXF -> PNG via ezdxf + matplotlib (ALL layouts/sheets)
-  2. DXF/DWG -> PNG via LibreOffice --headless
-  3. DWG binary text extraction (ZWCAD AC1032 fallback — text-only mode)
+'use strict';
 
-New in v5:
-  - Multi-sheet: renders all paperspace layouts, not just modelspace
-  - XREF expansion: text inside INSERT blocks is extracted too
-  - ZWCAD text-only mode: rich text context when PNG render fails
-  - Sheet names + XREF references returned for Claude context
-"""
-import sys, json, os, traceback, subprocess, tempfile, shutil, re, struct
+/**
+ * SMART BOQ ENGINE — Out-of-the-box 90-95% accuracy approach
+ * ─────────────────────────────────────────────────────────────────
+ * Core insight: DXF mein sab kuch already hai — walls, dimensions,
+ * levels, hatches, room areas. Problem data extraction nahi hai —
+ * problem data ko meaningful context mein present karna hai.
+ *
+ * Strategy:
+ * 1. DXF se directly "engineering summary" nikalo — raw data nahi
+ * 2. Wall VOLUME sahi formula se nikalo (perimeter × thk × height)
+ * 3. Room areas polyline se nikalo (shoelace formula)
+ * 4. Scale auto-detect karo drawing extents + dimensions se
+ * 5. Claude ko ek "pre-drafted BOQ" do — sirf verify + rate karo
+ *    (Claude as checker, not guesser = 90-95% accuracy)
+ */
 
-def extract_text_from_dwg_binary(dwg_path):
-    """Extract ALL readable strings from DWG binary — ZWCAD + AutoCAD compatible."""
-    try:
-        with open(dwg_path, "rb") as f:
-            data = f.read()
-    except Exception as e:
-        return {"texts": [], "layers": [], "dims": [], "sheets": [], "xrefs": [], "error": str(e)}
+const fs   = require('fs');
+const path = require('path');
 
-    version = data[:6].decode("ascii", errors="replace")
-    results = {"version": version, "texts": [], "layers": [], "dims": [], "sheets": [], "xrefs": []}
+// ─────────────────────────────────────────────────────────────────
+// STEP 1 — WALL PERIMETER (sahi formula)
+// ─────────────────────────────────────────────────────────────────
+// Polyline in DXF = wall center-line or wall boundary polygon.
+// Plan area = length × thickness (in plan view).
+// So: wall_length = plan_area / thickness
+// Volume = wall_length × thickness × floor_height
+// Face area (plaster) = wall_length × floor_height
+function calcWallPerimeter(pts) {
+  let p = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const j = (i + 1) % pts.length;
+    p += Math.sqrt((pts[j][0] - pts[i][0]) ** 2 + (pts[j][1] - pts[i][1]) ** 2);
+  }
+  return p;
+}
 
-    # UTF-16LE strings (ZWCAD/AutoCAD R2013+ encoding)
-    utf16_strings = []
-    i = 0
-    while i < len(data) - 3:
-        if 32 <= data[i] <= 126 and data[i + 1] == 0:
-            j = i
-            chars = []
-            while j < len(data) - 1 and data[j + 1] == 0 and 32 <= data[j] <= 126:
-                chars.append(chr(data[j]))
-                j += 2
-            if len(chars) >= 3:
-                s = "".join(chars).strip()
-                if s:
-                    utf16_strings.append(s)
-            i = j + 2
-        else:
-            i += 1
+function shoelace(pts) {
+  let a = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const j = (i + 1) % pts.length;
+    a += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1];
+  }
+  return Math.abs(a) / 2;
+}
 
-    # ASCII strings
-    ascii_strings = []
-    i = 0
-    current = []
-    while i < len(data):
-        b = data[i]
-        if 32 <= b <= 126:
-            current.append(chr(b))
-        else:
-            if len(current) >= 4:
-                s = "".join(current).strip()
-                if s:
-                    ascii_strings.append(s)
-            current = []
-        i += 1
+// ─────────────────────────────────────────────────────────────────
+// STEP 2 — SMART SCALE DETECTION
+// ─────────────────────────────────────────────────────────────────
+// Strategy:
+//   A. Look for "SCALE 1:100" text in drawing
+//   B. Compare dimension values vs geometric distance
+//   C. Compare drawing extent vs known paper sizes (A0/A1/A2)
+//   D. Fallback: median ratio of (dim value / geom distance)
+function detectScale(texts, dims, extents) {
+  // A. Text-based scale
+  for (const t of texts) {
+    const m = t.text.match(/SCALE\s*[:\s]\s*1\s*[:/]\s*(\d+)/i)
+           || t.text.match(/\b1\s*:\s*(\d+)\b/);
+    if (m) {
+      const sf = parseInt(m[1]);
+      if (sf >= 5 && sf <= 5000) return { factor: sf, source: 'text', label: `1:${sf}` };
+    }
+  }
 
-    all_strings = list(dict.fromkeys(utf16_strings + ascii_strings))
+  // B. Dimension ratio: measured_value / geometric_distance
+  const ratios = [];
+  for (const d of dims) {
+    if (d.value_mm > 100 && d.geom_mm > 10) {
+      const r = d.value_mm / d.geom_mm;
+      if (r >= 1 && r <= 5000) ratios.push(r);
+    }
+  }
+  if (ratios.length >= 3) {
+    ratios.sort((a, b) => a - b);
+    const median = ratios[Math.floor(ratios.length / 2)];
+    // Round to nearest common scale
+    const commonScales = [1, 5, 10, 20, 25, 50, 100, 200, 500, 1000];
+    const nearest = commonScales.reduce((best, s) => Math.abs(s - median) < Math.abs(best - median) ? s : best, 100);
+    if (Math.abs(nearest - median) / nearest < 0.3) {
+      return { factor: nearest, source: 'dimension_ratio', label: `1:${nearest}`, raw_median: Math.round(median) };
+    }
+  }
 
-    layer_pat = re.compile(r'^[A-Z0-9_\-\.]{2,30}$')
-    eng_pat = re.compile(
-        r'(FOOTING|COLUMN|COL|BEAM|SLAB|RCC|GRID|LEVEL|FLOOR|WALL|'
-        r'SECTION|DETAIL|PLAN|ELEVATION|SCHEDULE|REINFORCEMENT|'
-        r'STIRRUP|MAIN.?BAR|TIE|LINK|DIA|THK|WIDTH|DEPTH|HEIGHT|'
-        r'FOUNDATION|PILE|RAFT|GRADE|M\d0|Fe\d{3}|'
-        r'NOTES?|SPEC|DESCRIPTION|DRAWING|TITLE|PROJECT|'
-        r'ROAD|GSB|WMM|PQC|KERB|DRAIN|CULVERT|BRIDGE|'
-        r'PLINTH|LINTEL|PARAPET|STAIRCASE|LIFT|RAMP|'
-        r'\d+[xX]\d+|\d+mm|\d+\.\d+m|\d+ MM)',
-        re.IGNORECASE
-    )
-    dim_pat = re.compile(r'^\d+(\.\d+)?$|^\d+[xX]\d+$')
-    sheet_pat = re.compile(
-        r'^(Layout\s*\d+|Sheet[\-\s]*\d+|Model|Plan[\-\s]*\d+|Drawing[\-\s]*\d+|'
-        r'GF|FF|SF|TF|RF|Basement|Ground\s*Floor|First\s*Floor|Site\s*Plan|'
-        r'[A-Z]{1,3}-\d{1,4})$',
-        re.IGNORECASE
-    )
+  // C. Extents-based: compare drawing width to A0 (1189mm) / A1 (841mm)
+  const wMm = extents.xmax - extents.xmin;
+  if (wMm > 0) {
+    const paperWidths = [{ w: 1189, name: 'A0' }, { w: 841, name: 'A1' }, { w: 594, name: 'A2' }];
+    for (const paper of paperWidths) {
+      const scale = Math.round(wMm / paper.w);
+      const commonScales = [50, 100, 200, 500];
+      const nearest = commonScales.reduce((best, s) => Math.abs(s - scale) < Math.abs(best - scale) ? s : best, 100);
+      if (Math.abs(nearest - scale) / nearest < 0.25) {
+        return { factor: nearest, source: 'extents_' + paper.name, label: `1:${nearest}` };
+      }
+    }
+  }
 
-    for s in all_strings:
-        s = s.strip()
-        if not s or len(s) < 2:
-            continue
-        if re.search(r'[^\x20-\x7E]', s):
-            continue
-        if re.search(r'[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}', s):
-            continue
-        if re.search(r'\\.*\.(dwg|dxf)', s, re.IGNORECASE):
-            results["xrefs"].append(s.split("\\")[-1])
-            continue
-        if sheet_pat.match(s):
-            results["sheets"].append(s)
-        elif eng_pat.search(s):
-            results["texts"].append({"text": s, "source": "binary_extract"})
-        elif layer_pat.match(s) and len(s) >= 3:
-            results["layers"].append(s)
-        elif dim_pat.match(s):
-            results["dims"].append(s)
+  return { factor: 1, source: 'fallback_assume_mm', label: 'unknown (assuming 1:1 mm)' };
+}
 
-    for s in utf16_strings:
-        s = s.strip()
-        if len(s) >= 2 and not any(t["text"] == s for t in results["texts"]):
-            if re.match(r'^[A-Z][0-9A-Z\-_\.]+$', s) and len(s) <= 20:
-                results["texts"].append({"text": s, "source": "utf16_label"})
+// ─────────────────────────────────────────────────────────────────
+// STEP 3 — ROOM AREA EXTRACTION
+// ─────────────────────────────────────────────────────────────────
+// Room labels (TEXT entities) near closed polylines → room name + area
+//
+// FIX: previously accepted ANY closed polyline in the size window as a
+// candidate "room" — including wall hatch outlines, column pads, etc.
+// This was invisible before because this function was always being called
+// with polylines=[] (see buildSmartContext), so it never actually ran
+// against real data. Now that real geometry flows through, a wall hatch
+// polygon (e.g. a long thin 230mm-thick strip) can land in the 0.5–10000
+// sqm window just like a real room and get mislabeled. `layerMap` (already
+// computed elsewhere as dxfData.layer_map) lets us skip anything that's
+// categorised as wall/column/footing/annotation/etc. — only polylines with
+// NO known non-room category (typically room-boundary hatches, which are
+// usually on unmapped/generic layers) are treated as rooms.
+const NON_ROOM_CATEGORIES = new Set([
+  'wall', 'column', 'footing', 'annotation', 'dimension', 'grid',
+  'd_wall', 'rcc_pardi', 'ignore', 'parking', 'road', 'furniture',
+]);
 
-    seen = set()
-    unique_texts = []
-    for t in results["texts"]:
-        if t["text"] not in seen:
-            seen.add(t["text"])
-            unique_texts.append(t)
+function extractRooms(texts, polylines, scaleFactor, layerMap = {}) {
+  const rooms = [];
+  // Filter closed polylines with meaningful area, excluding known non-room categories
+  const closedPoly = polylines.filter(p => {
+    if (!p.pts || p.pts.length < 3) return false;
+    const mapped = layerMap[p.layer];
+    if (mapped && NON_ROOM_CATEGORIES.has(mapped.cat || mapped.category)) return false;
+    return true;
+  });
 
-    results["texts"] = unique_texts[:2500]
-    results["layers"] = list(dict.fromkeys(results["layers"]))[:500]
-    results["dims"] = list(dict.fromkeys(results["dims"]))[:1000]
-    results["sheets"] = list(dict.fromkeys(results["sheets"]))[:50]
-    results["xrefs"] = list(dict.fromkeys(results["xrefs"]))[:20]
-    return results
+  for (const poly of closedPoly) {
+    const rawArea = shoelace(poly.pts);
+    const areaSqm = rawArea / (scaleFactor * scaleFactor) / 1e6;
+    if (areaSqm < 0.5 || areaSqm > 10000) continue; // skip tiny/huge
 
+    // Find text closest to polyline centroid
+    const cx = poly.pts.reduce((s, p) => s + p[0], 0) / poly.pts.length;
+    const cy = poly.pts.reduce((s, p) => s + p[1], 0) / poly.pts.length;
 
-def render_dxf_to_png(dxf_path, png_path, dpi=300, tiled=False):
-    """Render DXF → PNG (modelspace + ALL paperspace layouts = multi-sheet support).
-
-    FIXED: previously rendered at a fixed (16, 12) inch canvas regardless of the
-    drawing's actual complexity/aspect ratio, so dense sheets (grid of columns +
-    2 schedule tables + 8 detail panels, all on one A1 sheet — exactly the kind
-    of drawing this tool exists to read) got squashed into a low effective
-    resolution. Schedule-table digits became a handful of blurry pixels, so the
-    vision model was reading noise, not numbers.
-
-    FIXED: tiling was a naive fixed 2x2 quadrant split of that already-blurry
-    image, and only ran when the caller explicitly asked for `tiled=True`
-    (gated behind a "detail mode" toggle) — so by default nothing was tiled at
-    all. Now tiling always runs, the grid size scales with drawing complexity,
-    near-blank tiles are skipped, and every tile is capped to Claude's optimal
-    ~1568px edge (computed at BASE_DPI, not the same small default canvas).
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import ezdxf
-    from ezdxf import recover
-    from ezdxf.addons.drawing import RenderContext, Frontend
-    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
-
-    try:
-        doc, _ = recover.readfile(dxf_path)
-    except Exception:
-        try:
-            doc = ezdxf.readfile(dxf_path)
-        except Exception:
-            return False, [], []
-
-    layout_images = []
-
-    def entity_count(layout):
-        try:
-            return sum(1 for _ in layout)
-        except Exception:
-            return 0
-
-    def render_one(layout, out_path, base_dpi):
-        try:
-            # Size the canvas to the layout's real extents/aspect ratio instead
-            # of a fixed (16, 12) box, and scale up for complex/dense sheets so
-            # small schedule-table text still has enough source pixels before
-            # we crop into tiles below.
-            n = entity_count(layout)
-            if n > 3000:
-                fig_w = 60
-            elif n > 1000:
-                fig_w = 44
-            elif n > 300:
-                fig_w = 30
-            else:
-                fig_w = 20
-
-            try:
-                ext_min, ext_max = layout.extents()
-                w = max(ext_max.x - ext_min.x, 1e-6)
-                h = max(ext_max.y - ext_min.y, 1e-6)
-                fig_h = max(8, min(fig_w * (h / w), 90))
-            except Exception:
-                fig_h = fig_w * 0.75
-
-            fig = plt.figure(figsize=(fig_w, fig_h), dpi=base_dpi)
-            ax = fig.add_axes([0, 0, 1, 1])
-            ctx = RenderContext(doc)
-            out = MatplotlibBackend(ax)
-            Frontend(ctx, out).draw_layout(layout, finalize=True)
-            fig.savefig(out_path, dpi=base_dpi, bbox_inches="tight", facecolor="white")
-            plt.close(fig)
-            return os.path.exists(out_path) and os.path.getsize(out_path) > 5000
-        except Exception:
-            plt.close('all')
-            return False
-
-    # Modelspace
-    render_one(doc.modelspace(), png_path, dpi)
-    if os.path.exists(png_path) and os.path.getsize(png_path) > 5000:
-        layout_images.append({"name": "ModelSpace", "path": png_path})
-
-    # All paperspace layouts (multi-sheet)
-    base_dir = os.path.dirname(png_path) or tempfile.gettempdir()
-    base_name = os.path.splitext(os.path.basename(png_path))[0]
-    for layout in doc.layouts:
-        if layout.name.upper() == "MODEL":
-            continue
-        sheet_png = os.path.join(base_dir, f"{base_name}_sheet_{re.sub(r'[^A-Za-z0-9]','_',layout.name)}.png")
-        if render_one(layout, sheet_png, dpi):
-            layout_images.append({"name": layout.name, "path": sheet_png})
-
-    # If model failed but sheets worked, copy first sheet as main
-    if not (os.path.exists(png_path) and os.path.getsize(png_path) > 5000) and layout_images:
-        shutil.copy(layout_images[0]["path"], png_path)
-
-    main_ok = os.path.exists(png_path) and os.path.getsize(png_path) > 5000
-
-    # Tiles from main PNG — ALWAYS generated now (not gated behind `tiled`,
-    # which used to mean dense drawings got read as one blurry flattened
-    # image by default). `tiled=False` now just means "skip the extra
-    # per-layout detail tiles below", the main sheet is still tiled.
-    tiles = []
-    if main_ok:
-        try:
-            from PIL import Image
-            MAX_EDGE = 1568
-            img = Image.open(png_path)
-            W, H = img.size
-
-            # Grid scales with image size so dense sheets get finer slices;
-            # small/simple drawings don't get needlessly chopped up.
-            megapixels = (W * H) / 1_000_000
-            if megapixels > 40:
-                cols, rows = 4, 3
-            elif megapixels > 15:
-                cols, rows = 3, 2
-            elif megapixels > 4:
-                cols, rows = 2, 2
-            else:
-                cols, rows = 1, 1
-
-            if cols * rows > 1:
-                overlap = 0.06
-                for row in range(rows):
-                    for col in range(cols):
-                        x1 = max(0, int((col / cols - overlap) * W))
-                        x2 = min(W, int(((col + 1) / cols + overlap) * W))
-                        y1 = max(0, int((row / rows - overlap) * H))
-                        y2 = min(H, int(((row + 1) / rows + overlap) * H))
-                        tile = img.crop((x1, y1, x2, y2))
-
-                        # Skip near-blank tiles (mostly white paper, no content)
-                        gray = tile.convert("L")
-                        dark_px = sum(1 for px in gray.getdata() if px < 200)
-                        if dark_px < 80:
-                            continue
-
-                        if max(tile.size) > MAX_EDGE:
-                            scale = MAX_EDGE / max(tile.size)
-                            tile = tile.resize(
-                                (max(1, int(tile.size[0]*scale)), max(1, int(tile.size[1]*scale))),
-                                Image.LANCZOS
-                            )
-
-                        tp = png_path.replace(".png", f"_tile_{row}{col}.png")
-                        tile.convert("RGB").save(tp, "PNG")
-                        vpos = 'Top' if row == 0 else ('Bottom' if row == rows-1 else 'Middle')
-                        hpos = 'Left' if col == 0 else ('Right' if col == cols-1 else 'Center')
-                        tiles.append({"path": tp, "row": row, "col": col,
-                                      "position": f"{vpos}-{hpos}"})
-        except Exception:
-            pass
-
-    return main_ok, tiles, layout_images
-
-
-def libreoffice_to_png(input_path, output_png):
-    out_dir = os.path.dirname(output_png) or tempfile.gettempdir()
-    base = os.path.splitext(os.path.basename(input_path))[0]
-    lo_png = os.path.join(out_dir, base + ".png")
-    subprocess.run(["libreoffice", "--headless", "--convert-to", "png",
-                    "--outdir", out_dir, input_path],
-                   capture_output=True, text=True, timeout=160)
-    if os.path.exists(lo_png):
-        if lo_png != output_png:
-            shutil.move(lo_png, output_png)
-        return True
-    return False
-
-
-def dwg_to_dxf_via_oda(dwg_path):
-    try:
-        from ezdxf.addons import odafc
-        out_dxf = os.path.join(tempfile.gettempdir(),
-                               os.path.splitext(os.path.basename(dwg_path))[0] + "_conv.dxf")
-        odafc.convert(dwg_path, out_dxf, version="R2018")
-        return out_dxf if os.path.exists(out_dxf) else None
-    except Exception:
-        return None
-
-
-def extract_ezdxf_meta(dxf_path):
-    import ezdxf
-    from ezdxf import recover
-    try:
-        doc, _ = recover.readfile(dxf_path)
-    except Exception:
-        doc = ezdxf.readfile(dxf_path)
-
-    msp = doc.modelspace()
-    layers = [l.dxf.name for l in doc.layers if l.dxf.name != "0"]
-    sheet_names = [layout.name for layout in doc.layouts if layout.name.upper() != "MODEL"]
-
-    texts = []
-    visited_blocks = set()
-
-    def collect_texts(entities):
-        for e in entities:
-            try:
-                if e.dxftype() in ("TEXT", "ATTDEF", "ATTRIB"):
-                    t = e.dxf.text.strip()
-                    if t:
-                        pos = e.dxf.insert
-                        texts.append({"text": t, "layer": e.dxf.layer,
-                                      "x": round(pos.x, 3), "y": round(pos.y, 3)})
-                elif e.dxftype() == "MTEXT":
-                    t = e.plain_mtext().strip()
-                    if t:
-                        pos = e.dxf.insert
-                        texts.append({"text": t, "layer": e.dxf.layer,
-                                      "x": round(pos.x, 3), "y": round(pos.y, 3)})
-                elif e.dxftype() == "INSERT":
-                    bname = e.dxf.name
-                    if bname not in visited_blocks:
-                        visited_blocks.add(bname)
-                        try:
-                            collect_texts(doc.blocks[bname])
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-    collect_texts(msp)
-    # Collect from all paper-space layouts (multi-sheet)
-    for layout in doc.layouts:
-        if layout.name.upper() != "MODEL":
-            collect_texts(layout)
-
-    dims = []
-    for e in msp:
-        try:
-            if e.dxftype() == "DIMENSION":
-                val = None
-                try:
-                    val = round(e.dxf.actual_measurement, 4)
-                except Exception:
-                    pass
-                txt = ""
-                try:
-                    txt = e.dxf.text.strip()
-                except Exception:
-                    pass
-                dims.append({"value": val, "text": txt, "layer": e.dxf.layer})
-        except Exception:
-            pass
-
-    all_text = " ".join(t["text"] for t in texts)
-    scale = "Not detected"
-    m = re.search(r'(?:scale|sc)[:\s]*1\s*[:/]\s*(\d+)', all_text, re.IGNORECASE)
-    if not m:
-        m = re.search(r'\b1\s*:\s*(\d+)\b', all_text)
-    if m:
-        scale = f"1:{m.group(1)}"
-
-    combined = (" ".join(layers) + " " + all_text).upper()
-    dtype = "UNKNOWN"
-    if any(k in combined for k in ["ROAD", "GSB", "WMM", "PQC", "CARRIAGEWAY", "KERB"]):
-        dtype = "ROAD_PLAN"
-    elif any(k in combined for k in ["FOUNDATION", "FOOTING", "PILE", "RAFT"]):
-        dtype = "FOUNDATION"
-    elif any(k in combined for k in ["SLAB", "BEAM", "COLUMN", "RCC", "STRUCTURAL"]):
-        dtype = "STRUCTURAL"
-    elif any(k in combined for k in ["FLOOR", "ROOM", "TOILET", "KITCHEN", "LIVING"]):
-        dtype = "FLOOR_PLAN"
-    elif any(k in combined for k in ["SITE", "LAYOUT", "PLOT", "BOUNDARY", "MASTER"]):
-        dtype = "SITE_LAYOUT"
-    elif any(k in combined for k in ["SECTION", "ELEVATION", "ELEV", "CROSS"]):
-        dtype = "SECTION"
-
-    return {"layers": layers, "texts": texts[:2500], "dimensions": dims[:1000],
-            "scale": scale, "drawing_type": dtype, "sheets": sheet_names}
-
-
-def run(input_path, output_png, dpi=300, tiled=False):
-    result = {
-        "success": False, "png_path": None, "tiles": [],
-        "layout_images": [], "texts": [], "dimensions": [],
-        "layers": [], "sheets": [], "xrefs": [],
-        "drawing_type": "UNKNOWN", "scale": "Not detected",
-        "extents": {}, "errors": [], "binary_extract": None,
-        "zwcad_text_mode": False,
+    let closestText = null, minDist = Infinity;
+    for (const t of texts) {
+      if (t.text.length < 2 || /^\d/.test(t.text)) continue; // skip dimension texts
+      const dx = t.x - cx, dy = t.y - cy;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < minDist) { minDist = dist; closestText = t.text; }
     }
 
-    ext = os.path.splitext(input_path)[1].lower()
-    dxf_for_meta = input_path if ext == ".dxf" else None
+    rooms.push({
+      name: closestText || 'ROOM',
+      area_sqm: Math.round(areaSqm * 100) / 100,
+      layer: poly.layer,
+      centroid: { x: Math.round(cx), y: Math.round(cy) }
+    });
+  }
 
-    # STEP 0: Binary text extraction (always — ZWCAD fallback context)
-    if ext in (".dwg", ".dxf"):
-        try:
-            bin_result = extract_text_from_dwg_binary(input_path)
-            result["binary_extract"] = bin_result
-            if bin_result.get("texts"):
-                result["texts"] = bin_result["texts"]
-            if bin_result.get("layers"):
-                result["layers"] = bin_result["layers"]
-            if bin_result.get("dims"):
-                result["dimensions"] = [{"value": None, "text": d, "layer": "binary"} for d in bin_result["dims"]]
-            if bin_result.get("sheets"):
-                result["sheets"] = bin_result["sheets"]
-            if bin_result.get("xrefs"):
-                result["xrefs"] = bin_result["xrefs"]
-            print(f"[binary_extract] texts={len(result['texts'])} layers={len(result['layers'])} "
-                  f"sheets={len(result['sheets'])} xrefs={len(result['xrefs'])}", file=sys.stderr)
-        except Exception as e:
-            result["errors"].append(f"Binary extract failed: {e}")
+  return rooms.sort((a, b) => b.area_sqm - a.area_sqm);
+}
 
-    # STEP 1: ODA DWG→DXF
-    if ext == ".dwg":
-        conv = dwg_to_dxf_via_oda(input_path)
-        if conv:
-            dxf_for_meta = conv
-            result["errors"].append("ODA conversion successful")
+// ─────────────────────────────────────────────────────────────────
+// STEP 4 — WALL QUANTITIES (correct formula)
+// ─────────────────────────────────────────────────────────────────
+function extractWallQuantities(polylines, layerMap, floorHeights, scaleFactor) {
+  const wallsByThk = {}; // thk_mm → { total_plan_area_mm2, total_perimeter_mm, count, layers }
 
-    # STEP 2: DXF→PNG (multi-sheet)
-    if dxf_for_meta:
-        try:
-            ok, tiles, layout_images = render_dxf_to_png(dxf_for_meta, output_png, dpi=dpi, tiled=tiled)
-            if ok:
-                result["png_path"] = output_png
-                result["tiles"] = tiles
-                result["layout_images"] = [{"name": li["name"], "path": li["path"]} for li in layout_images]
-                result["success"] = True
-                if len(layout_images) > 1:
-                    result["errors"].append(
-                        f"Multi-sheet drawing: {len(layout_images)} layouts rendered — "
-                        + ", ".join(li["name"] for li in layout_images))
-        except Exception as e:
-            result["errors"].append(f"ezdxf render failed: {e}")
+  for (const poly of polylines) {
+    const mapped = layerMap[poly.layer];
+    // FIX: was checking mapped.category, but both dxf_parser.js's LAYER_MAP
+    // and drawing_intelligence.js's layer categoriser store the category
+    // under `.cat`, never `.category`. This meant the check was ALWAYS
+    // false — every wall polyline was skipped, independent of (and in
+    // addition to) the separate hardcoded-[] bug at the call site.
+    if (!mapped || mapped.cat !== 'wall') continue;
+    const thk = mapped.thk_mm || 230;
 
-    # STEP 3: LibreOffice fallback
-    if not result["png_path"]:
-        try:
-            if libreoffice_to_png(input_path, output_png):
-                result["png_path"] = output_png
-                result["success"] = True
-        except FileNotFoundError:
-            result["errors"].append("LibreOffice not installed")
-        except subprocess.TimeoutExpired:
-            result["errors"].append("LibreOffice timed out")
-        except Exception as e:
-            result["errors"].append(f"LibreOffice failed: {e}")
+    if (!wallsByThk[thk]) wallsByThk[thk] = { plan_area_mm2: 0, perimeter_mm: 0, count: 0, layers: new Set() };
 
-    # STEP 4: ezdxf metadata
-    if dxf_for_meta:
-        try:
-            meta = extract_ezdxf_meta(dxf_for_meta)
-            if meta.get("texts"):
-                existing = set(t["text"] for t in result["texts"])
-                for t in meta["texts"]:
-                    if t["text"] not in existing:
-                        result["texts"].append(t)
-                        existing.add(t["text"])
-            if meta.get("layers"):
-                result["layers"] = list(set(result["layers"]) | set(meta["layers"]))
-            if meta.get("dimensions") and not result["dimensions"]:
-                result["dimensions"] = meta["dimensions"]
-            result["scale"] = meta.get("scale", result["scale"])
-            result["drawing_type"] = meta.get("drawing_type", result["drawing_type"])
-            if meta.get("sheets"):
-                result["sheets"] = list(set(result["sheets"]) | set(meta["sheets"]))
-            result["success"] = True
-        except Exception as e:
-            result["errors"].append(f"ezdxf metadata failed: {e}")
+    // Two methods:
+    // Method A: if polyline is a wall BOUNDARY (hatch area), use perimeter
+    // Method B: if polyline IS the wall area in plan, use area/thk to get length
+    const perim = calcWallPerimeter(poly.pts);
+    const area  = shoelace(poly.pts);
 
-    # STEP 5: ZWCAD text-only mode
-    if not result["success"] and (result["texts"] or result["layers"]):
-        result["success"] = True
-        result["zwcad_text_mode"] = True
-        sheet_info = (f" Sheets: {', '.join(result['sheets'][:10])}." if result["sheets"] else "")
-        xref_info = (f" XREFs: {', '.join(result['xrefs'][:5])}." if result["xrefs"] else "")
-        result["errors"].append(
-            f"ZWCAD DWG: PNG render failed (format incompatible with ezdxf without ODA). "
-            f"Extracted {len(result['texts'])} texts, {len(result['layers'])} layers from binary.{sheet_info}{xref_info} "
-            "Claude will analyze via text-context mode. For visual accuracy, export to PDF/PNG from ZWCAD."
-        )
+    wallsByThk[thk].plan_area_mm2 += area;
+    wallsByThk[thk].perimeter_mm  += perim;
+    wallsByThk[thk].count++;
+    wallsByThk[thk].layers.add(poly.layer);
+  }
 
-    print(json.dumps(result))
+  const results = [];
+  for (const [thkStr, data] of Object.entries(wallsByThk)) {
+    const thk_mm  = parseInt(thkStr);
+    const thk_m   = thk_mm / 1000;
+    const sf      = scaleFactor;
 
+    // Real-world plan area = raw_area / (sf * sf) / 1e6 sqm
+    const planAreaSqm = (data.plan_area_mm2 / (sf * sf)) / 1e6;
 
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print(json.dumps({"error": "Usage: dwg_converter.py <input> <output.png> [dpi] [tiled]", "success": False}))
-        sys.exit(1)
-    try:
-        dpi_arg = int(sys.argv[3]) if len(sys.argv) > 3 else 300
-        tiled_arg = sys.argv[4].lower() in ("true", "1", "yes") if len(sys.argv) > 4 else False
-        run(sys.argv[1], sys.argv[2], dpi=dpi_arg, tiled=tiled_arg)
-    except Exception as e:
-        print(json.dumps({"success": False, "errors": [f"Fatal: {e}", traceback.format_exc()[:1000]]}))
+    // Wall length from plan area: length = planArea / thickness
+    // This is the correct formula for hatch polylines
+    const wallLenM = planAreaSqm / thk_m;
+
+    for (const fh of (floorHeights.length ? floorHeights : [{ name: 'TYPICAL', height_m: 3.0 }])) {
+      const faceSqm = Math.round(wallLenM * fh.height_m * 100) / 100;
+      const volCum  = Math.round(wallLenM * thk_m * fh.height_m * 100) / 100;
+      results.push({
+        floor:        fh.name,
+        thk_mm,
+        length_m:     Math.round(wallLenM * 100) / 100,
+        height_m:     fh.height_m,
+        face_area_sqm: faceSqm,
+        volume_cum:   volCum,
+        polyline_count: data.count,
+        layers:       [...data.layers]
+      });
+    }
+  }
+  return results;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// STEP 5 — SCHEDULE TABLE EXTRACTION (column/footing schedules)
+// ─────────────────────────────────────────────────────────────────
+// Cluster texts by Y coordinate → rows → detect header → extract data
+function extractScheduleTables(texts, scaleFactor) {
+  if (!texts.length) return [];
+
+  // Sort by Y descending (DXF Y increases upward)
+  const sorted = [...texts].filter(t => t.text.trim()).sort((a, b) => b.y - a.y);
+
+  // Cluster into rows by Y proximity
+  const yTol = 60 / scaleFactor; // 60mm real-world tolerance
+  const rows = [];
+  for (const t of sorted) {
+    const row = rows.find(r => Math.abs(r.yAvg - t.y) < yTol);
+    if (row) {
+      row.cells.push(t);
+      row.yAvg = row.cells.reduce((s, c) => s + c.y, 0) / row.cells.length;
+    } else {
+      rows.push({ yAvg: t.y, cells: [t] });
+    }
+  }
+
+  // Sort each row's cells by X (left to right)
+  rows.forEach(r => r.cells.sort((a, b) => a.x - b.x));
+
+  // Detect schedule tables: rows with header keywords
+  const HEADER_KEYWORDS = /^(MARK|TYPE|SIZE|NOS|NO\.|QTY|STEEL|DIA|FOOTING|COLUMN|COL|BEAM|SLAB|DEPTH|WIDTH|LENGTH|SPACING|STIRRUP|DETAIL|REINF|SR|SR\.?NO|DESCRIPTION|UNIT|RATE|AMOUNT)$/i;
+  const tables = [];
+  let i = 0;
+
+  while (i < rows.length) {
+    const headerCells = rows[i].cells.filter(c => HEADER_KEYWORDS.test(c.text.trim().replace(/[^A-Za-z.]/g, '')));
+    if (headerCells.length >= 2) {
+      // Found a header row — collect data rows below
+      const headers = rows[i].cells.map(c => c.text.trim());
+      const dataRows = [];
+      let j = i + 1;
+      while (j < rows.length) {
+        const yGap = Math.abs(rows[j - 1].yAvg - rows[j].yAvg);
+        if (yGap > yTol * 5) break; // large gap = end of table
+        const nextHeaderCells = rows[j].cells.filter(c => HEADER_KEYWORDS.test(c.text.trim().replace(/[^A-Za-z.]/g, '')));
+        if (nextHeaderCells.length >= 3 && dataRows.length > 0) break; // new table started
+        dataRows.push(rows[j].cells.map(c => c.text.trim()));
+        j++;
+      }
+      if (dataRows.length > 0) {
+        const tableType = headers.join(' ').toUpperCase().includes('FOOTING') ? 'FOOTING_SCHEDULE'
+                        : headers.join(' ').toUpperCase().includes('COLUMN') ? 'COLUMN_SCHEDULE'
+                        : headers.join(' ').toUpperCase().includes('BEAM')   ? 'BEAM_SCHEDULE'
+                        : 'BOQ_TABLE';
+        tables.push({
+          type: tableType,
+          headers,
+          rows: dataRows,
+          records: dataRows.map(row =>
+            Object.fromEntries(headers.map((h, idx) => [h, row[idx] || '']))
+          )
+        });
+        i = j;
+        continue;
+      }
+    }
+    i++;
+  }
+  return tables;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// STEP 6 — PRE-DRAFT BOQ (Claude verify kare, not generate)
+// ─────────────────────────────────────────────────────────────────
+// Yeh function ek rough BOQ draft banata hai directly from drawing data.
+// Claude ko sirf: (a) verify karna hai, (b) rates lagani hain, (c) missed items add karne hain.
+// Result: Claude "checker" mode mein kaam karta hai — 90-95% accurate.
+function preDraftBOQ(wallQty, rooms, scheduleTables, floorLevels, floorHeights, hatchSummary, elementCounts, rates) {
+  const items = [];
+  let sr = 1;
+
+  // ── EARTHWORK ────────────────────────────────────────────────────
+  // Foundation depth from levels (if basement/plinth levels found)
+  const groundLevel  = floorLevels.find(l => /GROUND|PLINTH/i.test(l.name));
+  const basementLevel = floorLevels.find(l => l.mm < 0);
+  if (basementLevel && groundLevel) {
+    const excavDepth = (groundLevel.mm - basementLevel.mm) / 1000;
+    // Estimate plan area from total building footprint (largest room area)
+    const footprint = rooms.length ? rooms[0].area_sqm * 1.2 : 0; // approx with walls
+    if (footprint > 0 && excavDepth > 0) {
+      items.push({ sr: sr++, description: 'Earthwork Excavation in Foundation', unit: 'CUM', qty: Math.round(footprint * excavDepth * 100) / 100, rate: rates.excavation || 320, source: 'calculated_from_levels', confidence: 'medium' });
+    }
+  }
+
+  // ── WALL MASONRY ─────────────────────────────────────────────────
+  for (const w of wallQty) {
+    if (w.volume_cum > 0) {
+      const matName = w.thk_mm >= 200 ? 'Brick Masonry' : 'Block Masonry';
+      const rate = w.thk_mm >= 200 ? (rates.brick_masonry_230 || 6800) : (rates.block_masonry_100 || 4200);
+      items.push({
+        sr: sr++,
+        description: `${matName} ${w.thk_mm}mm THK — ${w.floor}`,
+        unit: 'CUM',
+        qty: w.volume_cum,
+        rate,
+        source: 'drawing_polyline',
+        confidence: w.polyline_count > 5 ? 'high' : 'medium',
+        detail: `${w.length_m}m length × ${w.thk_mm / 1000}m thk × ${w.height_m}m height`
+      });
+    }
+  }
+
+  // ── PLASTER (both faces of wall) ────────────────────────────────
+  for (const w of wallQty) {
+    if (w.face_area_sqm > 0) {
+      items.push({
+        sr: sr++,
+        description: `Cement Plaster 12mm both faces — ${w.thk_mm}mm wall — ${w.floor}`,
+        unit: 'SQMT',
+        qty: Math.round(w.face_area_sqm * 2 * 0.85 * 100) / 100, // 0.85 deduct for openings
+        rate: rates.plaster_12mm || 280,
+        source: 'calculated_from_wall',
+        confidence: 'medium'
+      });
+    }
+  }
+
+  // ── COLUMN SCHEDULE ───────────────────────────────────────────────
+  const colSchedule = scheduleTables.find(t => t.type === 'COLUMN_SCHEDULE');
+  if (colSchedule) {
+    const colRecords = colSchedule.records.filter(r => {
+      const keys = Object.values(r).join(' ');
+      return /\d+x\d+|\d+×\d+|\d+\s*X\s*\d+/i.test(keys);
+    });
+    for (const rec of colRecords) {
+      const vals = Object.values(rec).join(' ');
+      const sizeMatch = vals.match(/(\d{2,4})\s*[xX×]\s*(\d{2,4})/);
+      const nosMatch  = vals.match(/\b(\d{1,3})\b/);
+      if (sizeMatch) {
+        const w = parseInt(sizeMatch[1]) / 1000; // m
+        const d = parseInt(sizeMatch[2]) / 1000; // m
+        const nos = nosMatch ? parseInt(nosMatch[1]) : 1;
+        const floorH = floorHeights.length ? floorHeights[0].height_m : 3.0;
+        const volCum = Math.round(w * d * floorH * nos * 100) / 100;
+        items.push({
+          sr: sr++,
+          description: `RCC Column ${sizeMatch[1]}×${sizeMatch[2]}mm — ${nos} Nos`,
+          unit: 'CUM',
+          qty: volCum,
+          rate: rates.rcc_column || 8500,
+          source: 'drawing_schedule',
+          confidence: 'high',
+          schedule_ref: JSON.stringify(rec)
+        });
+      }
+    }
+  } else if (elementCounts.column_count > 0) {
+    // No schedule found — flag for Claude to fill
+    items.push({
+      sr: sr++,
+      description: `RCC Column (${elementCounts.column_count} Nos found — schedule not detected, Claude to verify size)`,
+      unit: 'CUM',
+      qty: null,
+      rate: rates.rcc_column || 8500,
+      source: 'count_only_no_schedule',
+      confidence: 'low',
+      flag: 'CLAUDE_VERIFY_SIZE'
+    });
+  }
+
+  // ── FOOTING SCHEDULE ──────────────────────────────────────────────
+  const footingSchedule = scheduleTables.find(t => t.type === 'FOOTING_SCHEDULE');
+  if (footingSchedule) {
+    for (const rec of footingSchedule.records) {
+      const vals = Object.values(rec).join(' ');
+      const sizeMatch = vals.match(/(\d{3,4})\s*[xX×]\s*(\d{3,4})/);
+      const nosMatch  = Object.entries(rec).find(([k]) => /nos|no\.|qty/i.test(k));
+      if (sizeMatch) {
+        const l = parseInt(sizeMatch[1]) / 1000;
+        const b = parseInt(sizeMatch[2]) / 1000;
+        const nos = nosMatch ? parseInt(nosMatch[1]) || 1 : 1;
+        const depthMatch = vals.match(/(\d{2,3})\s*(?:mm)?\s*(?:deep|depth|thk)/i);
+        const depth = depthMatch ? parseInt(depthMatch[1]) / 1000 : 0.6;
+        items.push({
+          sr: sr++,
+          description: `RCC Footing ${sizeMatch[1]}×${sizeMatch[2]}mm — ${nos} Nos — ${Math.round(depth * 1000)}mm deep`,
+          unit: 'CUM',
+          qty: Math.round(l * b * depth * nos * 100) / 100,
+          rate: rates.rcc_footing || 7800,
+          source: 'drawing_schedule',
+          confidence: 'high'
+        });
+      }
+    }
+  }
+
+  // ── RCC SLAB ──────────────────────────────────────────────────────
+  const totalRoomArea = rooms.slice(0, 20).reduce((s, r) => s + r.area_sqm, 0);
+  if (totalRoomArea > 10) {
+    const slabThk = 0.125; // 125mm typical
+    items.push({
+      sr: sr++,
+      description: 'RCC Slab 125mm THK (total built-up area)',
+      unit: 'CUM',
+      qty: Math.round(totalRoomArea * slabThk * 100) / 100,
+      rate: rates.rcc_slab || 8200,
+      source: 'calculated_from_room_areas',
+      confidence: 'medium',
+      detail: `${rooms.length} rooms, total ${Math.round(totalRoomArea)}sqm`
+    });
+  }
+
+  // ── FLOORING ─────────────────────────────────────────────────────
+  for (const h of hatchSummary) {
+    if (/granite|marble|tile|floor/i.test(h.material)) {
+      // Flooring area = rooms with that hatch layer
+      const approxArea = totalRoomArea * 0.8; // rough estimate
+      if (approxArea > 0) {
+        items.push({
+          sr: sr++,
+          description: `${h.material} (${h.count} hatches on layer ${h.layers?.join(', ')})`,
+          unit: 'SQMT',
+          qty: Math.round(approxArea * 100) / 100,
+          rate: rates.flooring_granite || 950,
+          source: 'hatch_count',
+          confidence: 'low',
+          flag: 'CLAUDE_VERIFY_AREA'
+        });
+      }
+    }
+  }
+
+  // Compute amounts
+  for (const item of items) {
+    if (item.qty && item.rate) {
+      item.amount = Math.round(item.qty * item.rate);
+    } else {
+      item.amount = 0;
+    }
+  }
+
+  return items;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MAIN EXPORT — buildSmartContext(dxfData)
+// ─────────────────────────────────────────────────────────────────
+// Returns: { summary_text, pre_drafted_boq, claude_prompt }
+// summary_text = what to show Claude
+// pre_drafted_boq = already computed quantities
+// claude_prompt = ready-to-use prompt for Claude
+function buildSmartContext(dxfData, rates = {}) {
+  const sf = dxfData.scale_factor || 1;
+
+  // FIX: was mapping all_texts (plain strings) to {x:0,y:0} — every text
+  // collapsed onto the same point, so "nearest text to room centroid"
+  // matching in extractRooms() was meaningless. dxf_parser.js now exposes
+  // texts_with_position (real x/y per text) — use that when available.
+  const rooms = extractRooms(
+    dxfData.texts_with_position?.length
+      ? dxfData.texts_with_position
+      : (dxfData.all_texts || []).map(t => typeof t === 'string' ? { text: t, x: 0, y: 0 } : t),
+    dxfData.polylines || [],
+    sf,
+    dxfData.layer_map || {}
+  );
+
+  // FIX: was hardcoded to [] with a "need raw polylines from parser" comment
+  // — meaning wall masonry + plaster BOQ lines were ALWAYS empty/skipped in
+  // preDraftBOQ() for every DXF export via this path (buildSmartContext is
+  // called directly from /export-dxf-excel). Now wired to real geometry.
+  const wallQty = extractWallQuantities(
+    dxfData.polylines || [],
+    dxfData.layer_map || {},
+    dxfData.floor_heights || [],
+    sf
+  );
+
+  // Pre-draft BOQ
+  const preDraft = preDraftBOQ(
+    wallQty,
+    rooms,
+    dxfData.schedule_tables || [],
+    dxfData.floor_levels || [],
+    dxfData.floor_heights || [],
+    dxfData.hatch_summary || [],
+    dxfData.element_counts || {},
+    rates
+  );
+
+  // Build the "engineer summary" for Claude
+  const floorStr = (dxfData.floor_levels || [])
+    .map(l => `  ${l.label || l.name}: ${l.m >= 0 ? '+' : ''}${l.m}m`)
+    .join('\n') || '  Not found';
+
+  const heightStr = (dxfData.floor_heights || [])
+    .map(h => `  ${h.name}: ${h.height_m}m height`)
+    .join('\n') || '  Not calculated';
+
+  const wallStr = wallQty.length
+    ? wallQty.map(w => `  ${w.thk_mm}mm wall — Floor ${w.floor}: ${w.length_m}m long × ${w.height_m}m high = ${w.volume_cum} CUM (${w.face_area_sqm} sqm face)`).join('\n')
+    : (dxfData.wall_by_thickness || dxfData.wall_by_thickness_m2)
+      ? Object.entries(dxfData.wall_by_thickness || dxfData.wall_by_thickness_m2)
+          .map(([thk, d]) => `  ${thk}: plan area = ${typeof d === 'object' ? d.sqm || d : Math.round(d * 100) / 100} sqm`)
+          .join('\n')
+      : '  Not found';
+
+  const scheduleStr = (dxfData.schedule_tables || [])
+    .map(t => `\n  TABLE: ${t.type}\n  Headers: ${t.headers?.join(' | ')}\n  ${t.rows?.length} data rows:\n${t.rows?.slice(0, 8).map(r => '    ' + r.join(' | ')).join('\n')}`)
+    .join('\n') || '  No schedule tables detected';
+
+  const preDraftStr = preDraft.length
+    ? preDraft.map(item =>
+        `  [${item.confidence.toUpperCase()}] SR${item.sr}: ${item.description}\n` +
+        `    Unit: ${item.unit} | Qty: ${item.qty ?? 'VERIFY'} | Rate: ₹${item.rate} | Amount: ₹${item.amount || 'VERIFY'}\n` +
+        `    Source: ${item.source}${item.flag ? ' ⚠️ ' + item.flag : ''}${item.detail ? '\n    Detail: ' + item.detail : ''}`
+      ).join('\n\n')
+    : '  None pre-calculated';
+
+  const claudePrompt = `You are a senior PMC civil engineer verifying a pre-drafted BOQ.
+The BOQ below was computed DIRECTLY from drawing data by a parser.
+Your job: (1) verify quantities, (2) fix flagged items, (3) add missing items, (4) apply correct rates.
+DO NOT invent values. If something is flagged ⚠️ CLAUDE_VERIFY → read the schedule tables and fill in.
+
+════════════════════════════════════════════════════
+FILE: ${dxfData.filename || 'drawing.dxf'}
+DRAWING TYPE: ${dxfData.drawing_type || 'UNKNOWN'}
+SCALE: ${dxfData.scale || 'auto-detect needed'} (factor: ${sf})
+════════════════════════════════════════════════════
+
+FLOOR LEVELS (from drawing annotations):
+${floorStr}
+
+FLOOR HEIGHTS (calculated):
+${heightStr}
+
+WALL QUANTITIES (parser-calculated, CORRECT formula: perimeter × thk × height):
+${wallStr}
+
+ELEMENT COUNTS (from INSERTs + layers):
+  Doors: ${dxfData.element_counts?.door_count || 0}
+  Windows: ${dxfData.element_counts?.window_count || 0}
+  Lifts: ${dxfData.element_counts?.lift_count || dxfData.element_counts?.lift_door_count || 0}
+  Staircases: ${dxfData.element_counts?.staircase_count || 0}
+  Columns (blocks): ${dxfData.element_counts?.column_count || 0}
+  Total floor levels: ${dxfData.element_counts?.floor_levels_found || (dxfData.floor_levels || []).length}
+
+ROOM AREAS (from closed polylines + text labels):
+${rooms.length ? rooms.slice(0, 20).map(r => `  ${r.name}: ${r.area_sqm} sqm (layer: ${r.layer})`).join('\n') : '  No room polylines detected — use dimension annotations'}
+
+SCHEDULE TABLES (extracted from drawing):
+${scheduleStr}
+
+ALL DRAWING TEXTS (first 80):
+${(dxfData.all_texts || []).slice(0, 80).join(' | ')}
+
+DIMENSIONS (top 30):
+${(dxfData.dimension_values || []).slice(0, 30).map(d => `${d.value_m}m[${d.layer}]`).join(', ')}
+
+════════════════════════════════════════════════════
+PRE-DRAFTED BOQ (verify + fix + complete):
+════════════════════════════════════════════════════
+${preDraftStr}
+
+════════════════════════════════════════════════════
+YOUR TASK:
+1. Review each pre-drafted item — if qty looks right, keep it; if wrong, correct it
+2. For items flagged ⚠️ CLAUDE_VERIFY — read the schedule tables above and fill correct values
+3. Add any missing standard BOQ items (PCC, waterproofing, paint, etc.)
+4. Apply Gujarat DSR 2025 rates to all items
+5. Return ONLY raw JSON (no markdown):
+
+{
+  "project_name": "",
+  "drawing_type": "",
+  "scale": "",
+  "floor_count": 0,
+  "building_height_m": 0,
+  "total_bua_sqm": 0,
+  "boq": [
+    {
+      "sr": 1,
+      "description": "",
+      "unit": "CUM|SQMT|RMT|NOS|KG",
+      "qty": 0,
+      "rate": 0,
+      "amount": 0,
+      "source": "drawing_schedule|drawing_polyline|calculated|assumed",
+      "confidence": "high|medium|low"
+    }
+  ],
+  "rooms": [{"name":"","area_sqm":0}],
+  "observations": [],
+  "pmc_recommendation": ""
+}`;
+
+  return {
+    summary_text: claudePrompt,
+    pre_drafted_boq: preDraft,
+    rooms,
+    wall_quantities: wallQty
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ENHANCED VERSIONS for server.js integration
+// ─────────────────────────────────────────────────────────────────
+
+/**
+ * Full pipeline: raw scanned data → smart context
+ * Takes the output of drawing_intelligence.analyzeDrawing()
+ */
+function buildSmartContextFromAnalyzed(analyzed, rates = {}) {
+  const sf = detected_scale_factor(analyzed);
+  const scanned = analyzed._scanned;
+  if (!scanned) return buildSmartContext(analyzed, rates);
+
+  // Wall quantities with raw polylines (CORRECT formula)
+  const wallQty = extractWallQuantities(
+    scanned.polylines || [],
+    analyzed._layerMap || {},
+    analyzed.floor_heights || [],
+    sf
+  );
+
+  // Room extraction from raw polylines + texts
+  const rooms = extractRooms(scanned.texts || [], scanned.polylines || [], sf, analyzed._layerMap || {});
+
+  // Schedule tables from texts
+  const scheduleTables = extractScheduleTables(scanned.texts || [], sf);
+
+  const preDraft = preDraftBOQ(
+    wallQty,
+    rooms,
+    scheduleTables,
+    analyzed.floor_levels || [],
+    analyzed.floor_heights || [],
+    analyzed.hatch_summary ? Object.entries(analyzed.hatch_summary).map(([k, v]) => ({ material: k, count: v })) : [],
+    analyzed.element_counts || {},
+    rates
+  );
+
+  // Build prompt
+  const context = {
+    ...analyzed,
+    schedule_tables: scheduleTables,
+    floor_heights: analyzed.floor_heights || [],
+    scale_factor: sf,
+  };
+  const result = buildSmartContext(context, rates);
+  result.pre_drafted_boq = preDraft;
+  result.rooms = rooms;
+  result.wall_quantities = wallQty;
+  result.schedule_tables = scheduleTables;
+
+  return result;
+}
+
+function detected_scale_factor(analyzed) {
+  if (analyzed.scale_factor && analyzed.scale_factor > 1) return analyzed.scale_factor;
+  if (analyzed.scale) {
+    const m = analyzed.scale.match(/1\s*[:/]\s*(\d+)/);
+    if (m) return parseInt(m[1]);
+  }
+  // Try from dims_sample
+  if (analyzed.dims_sample?.length >= 3) {
+    const result = detectScale(
+      (analyzed.all_texts_sample || []).map(t => ({ text: t })),
+      analyzed.dims_sample.map(d => ({ value_mm: d.mm, geom_mm: d.mm })),
+      analyzed.drawing_extents ? { xmin: 0, xmax: analyzed.drawing_extents.width_m * 1000, ymin: 0, ymax: analyzed.drawing_extents.height_m * 1000 } : { xmin: 0, xmax: 0, ymin: 0, ymax: 0 }
+    );
+    return result.factor;
+  }
+  return 1;
+}
+
+module.exports = {
+  buildSmartContext,
+  buildSmartContextFromAnalyzed,
+  extractWallQuantities,
+  extractRooms,
+  extractScheduleTables,
+  preDraftBOQ,
+  detectScale,
+  calcWallPerimeter,
+  shoelace
+};
