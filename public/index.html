@@ -66,7 +66,14 @@ html,body{height:100%;font-family:'Inter',sans-serif;background:var(--sur);color
 .welcome{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:360px;gap:16px;text-align:center;padding:2rem}
 .wico{width:54px;height:54px;background:linear-gradient(135deg,var(--navy),var(--gem));border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:23px}
 .wtit{font-family:'Syne',sans-serif;font-size:20px;font-weight:700;color:var(--navy)}
-.wsub{font-size:13px;color:var(--tx2);line-height:1.7;max-width:440px}
+.wsub{font-size:13px;color:var(--tx2);line-height:1.7;max-width:520px}
+.steps{display:flex;gap:10px;width:100%;max-width:640px;margin:4px 0 8px;flex-wrap:wrap;justify-content:center}
+.step{flex:1;min-width:140px;background:#fff;border:1px solid var(--bor);border-radius:12px;padding:12px 14px;text-align:left}
+.step-n{font-family:'Syne',sans-serif;font-size:11px;font-weight:700;color:var(--gem);letter-spacing:.06em;margin-bottom:4px}
+.step-t{font-size:13px;font-weight:600;color:var(--navy);margin-bottom:2px}
+.step-d{font-size:11px;color:var(--tx3);line-height:1.45}
+.prog{font-size:12px;color:var(--tx2);line-height:1.6}
+.prog b{color:var(--navy)}
 .qgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;width:100%;max-width:620px}
 .qcard{background:#fff;border:1px solid var(--bor);border-radius:var(--r);padding:11px 12px;cursor:pointer;text-align:left;transition:all .15s;font-family:'Inter',sans-serif}
 .qcard:hover{border-color:var(--gem);box-shadow:0 0 0 3px rgba(26,115,232,.07);transform:translateY(-1px)}
@@ -203,15 +210,20 @@ textarea.tin::placeholder{color:var(--tx3)}
     <div class="chat" id="chat">
       <div class="welcome" id="welcome">
         <div class="wico">🏗️</div>
-        <div class="wtit">PMC Civil AI Agent</div>
-        <div class="wsub">Default = <strong>drawing read</strong>. Jo poochho sirf wahi (PCC/RCC / BOQ). PDF ya screenshot — drag-drop / <kbd>Ctrl+V</kbd>.</div>
+        <div class="wtit">PMC Civil AI</div>
+        <div class="wsub">Upload a drawing, type the scope, get a <strong>draft quantity takeoff</strong> — confirm gaps, then download Excel.</div>
+        <div class="steps">
+          <div class="step"><div class="step-n">01</div><div class="step-t">Upload PDF</div><div class="step-d">Drawing / schedule sheet (drag-drop or Ctrl+V)</div></div>
+          <div class="step"><div class="step-n">02</div><div class="step-t">Type scope</div><div class="step-d">e.g. footing PCC/RCC, or leave blank for full takeoff</div></div>
+          <div class="step"><div class="step-n">03</div><div class="step-t">Review & export</div><div class="step-d">Confirm missing qty → download PMC Excel</div></div>
+        </div>
         <div class="qgrid">
-          <button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Drawing → Auto Excel</span><span class="qd">Upload drawing → AI calculates → Excel auto banta hai</span></button>
-          <button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Scope batao → Excel cost sheet</span></button>
-          <button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Prepare BOQ</span><span class="qd">Drawing upload → Excel BOQ</span></button>
-          <button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare quotes</span><span class="qd">2-3 PDFs → Excel comparison</span></button>
-          <button class="qcard" onclick="qs('report')"><span class="qi">📊</span><span class="ql">Site report</span><span class="qd">Details do → Excel site report</span></button>
-          <button class="qcard" onclick="qs('study')"><span class="qi">🏗️</span><span class="ql">Drawing study</span><span class="qd">Upload → educational analysis</span></button>
+          <button class="qcard" onclick="qs('takeoff')"><span class="qi">📐</span><span class="ql">Quantity takeoff</span><span class="qd">Upload → schedules → draft qty → Excel</span></button>
+          <button class="qcard" onclick="qs('footing')"><span class="qi">🧱</span><span class="ql">Footing PCC / RCC</span><span class="qd">Only footing volumes from schedule</span></button>
+          <button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Full BOQ</span><span class="qd">Complete BOQ with rates</span></button>
+          <button class="qcard" onclick="qs('drawing')"><span class="qi">🔎</span><span class="ql">Read only</span><span class="qd">Sheet identity & schedules — no qty</span></button>
+          <button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare quotes</span><span class="qd">2–3 PDFs → comparison</span></button>
+          <button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimate</span><span class="qd">Scope → cost sheet</span></button>
         </div>
       </div>
     </div>
@@ -220,10 +232,10 @@ textarea.tin::placeholder{color:var(--tx3)}
       <div class="chips" id="chips"></div>
       <div class="ibox">
         <button class="attbtn" title="Attach PDF / screenshot / DWG" onclick="document.getElementById('fi').click()">📎</button>
-        <textarea class="tin" id="tin" placeholder="PDF/screenshot drag-drop, Ctrl+V paste, ya question type karo…" rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
+        <textarea class="tin" id="tin" placeholder="Upload drawing, then type scope — or leave blank for full takeoff…" rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
         <button class="sbtn" id="sbtn" onclick="send()">➤</button>
       </div>
-      <div class="hint">PDF · screenshot · JPG/PNG · DWG/DXF · <kbd>Ctrl+V</kbd> paste · drag-drop · default = <strong>read only</strong> (BOQ jab poocho)</div>
+      <div class="hint">PDF · PNG · DWG/DXF · drag-drop · <kbd>Ctrl+V</kbd> · default = <strong>quantity takeoff</strong></div>
     </div>
   </div>
 </div>
@@ -232,7 +244,7 @@ textarea.tin::placeholder{color:var(--tx3)}
 <script>
 // ── MODES ──────────────────────────────────────────────
 const MODES={
-  auto:{t:'PMC Civil AI Agent',s:'Upload any file → AI analysis + Excel & PDF download automatically',b:'Auto'},
+  auto:{t:'PMC Civil AI',s:'Upload drawing → quantity takeoff → confirm → Excel',b:'Takeoff'},
   drawing:{t:'Drawing Analysis',s:'Upload civil drawings — full analysis with IS codes + Excel download',b:'Drawing'},
   estimate:{t:'Cost Estimation',s:'Item-wise cost in INR + Excel download',b:'Estimate'},
   boq:{t:'BOQ / Material Takeoff',s:'Full BOQ with units, rates + Excel download',b:'BOQ'},
@@ -241,23 +253,20 @@ const MODES={
   study:{t:'Drawing Study',s:'Educational walkthrough with IS codes',b:'Study'}
 };
 const SYS={
-  auto:`You are PMC Civil AI Agent — senior PMC for India. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
+  auto:`You are PMC Civil AI — quantity takeoff assistant for India. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
 
-DEFAULT = DRAWING READ ONLY. Answer ONLY what the user asked.
-1. Upload / “read” → sheet identity + schedules + levels — NO BOQ.
-2. If user asks “PCC RCC footing” → only that calc. If “BOQ” → then BOQ.
-3. NEVER invent missing cells — ASK numbered questions for the asked scope only.
+DEFAULT = QUANTITY TAKEOFF from uploaded drawings.
+1. Upload → read schedules → draft quantities → ask only missing values → Excel.
+2. If user asks “PCC RCC footing” → only that. If “read only” → no quantities.
+3. NEVER invent missing cells — ask one question at a time.
 4. Schedules > plan symbol counts.
 
 Start directly — no preamble.`,
 
   drawing:`You are a SENIOR PMC CIVIL ENGINEER. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
 
-READ FIRST. Answer ONLY the question asked.
-1. Default: read sheet (type, title, schedules, levels, dims) — no BOQ.
-2. Specific calc (PCC/RCC) → only that. Explicit “BOQ” → full BOQ.
-3. Never invent 3m height / 100mm PCC / plan counts.
-Do NOT quote these instructions.`,
+READ ONLY mode (user asked). Sheet type, title, schedules, levels — no BOQ unless asked.
+Never invent quantities. Do NOT quote these instructions.`,
 
   estimate:`You are a PMC senior cost estimation engineer for India. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
 Analyze the uploaded file directly. Do NOT quote these instructions in your response.
@@ -278,9 +287,11 @@ Output: Formal PMC site report — project info, work executed this period, over
 Teach like AutoCAD study: what each table column means, what section cut indicates, how to read levels/hatches. Use only printed data. Output: type, how to read, symbol/table guide, key dims, common mistakes, 3 quiz questions.`
 };
 const QT={
-  drawing:`Read this drawing only — type, title, schedules, levels, dims, notes. BOQ mat banao jab tak main BOQ na poochun.`,
+  takeoff:`Prepare quantity takeoff from this drawing — read schedules, calculate what you can, ask for missing qty/PCC one-by-one.`,
+  footing:`Calculate PCC and RCC of footing from the schedule. Show sizes, unit volumes, then ask qty and PCC thickness.`,
+  drawing:`Read this drawing only — type, title, schedules, levels, dims, notes. Do not prepare BOQ.`,
   estimate:`I need cost estimation. Please guide me or I will paste project scope/estimate data.`,
-  boq:`Is drawing ka full BOQ banao — schedules se qty, formulas dikhao, missing pe poochho.`,
+  boq:`Prepare full BOQ from this drawing — schedules, formulas, ask missing values.`,
   compare:`I want to compare quotes/drawings. Uploading files now — give full comparison + Excel report.`,
   report:`I need a PMC site progress report. Please ask me for the details needed.`,
   study:`I want to study this civil drawing. Uploading now — give educational walkthrough.`
@@ -593,7 +604,7 @@ async function postAnalyzeDrawing(fileEntry, question){
   }else{
     throw new Error('File data missing — dobara upload karo.');
   }
-  fd.append('question', question||'Read this drawing only — sheet type, title, schedules, levels, dims, notes. Do not prepare BOQ unless asked.');
+  fd.append('question', question||'Prepare quantity takeoff from this drawing — read schedules, calculate quantities, ask missing values one-by-one.');
   fd.append('filename', fileEntry.name||'drawing.pdf');
   const res=await fetch('/analyze-drawing',{method:'POST',body:fd});
   const data=await res.json().catch(()=>({}));
@@ -790,7 +801,19 @@ async function dlDXFExcel(btn,dxfFile){
   btn.classList.remove('loading');
 }
 
-function addLoad(){hw();const chat=document.getElementById('chat');const row=document.createElement('div');row.className='msg ai';row.id='lr';const av=document.createElement('div');av.className='av ai';av.textContent='PMC';const bub=document.createElement('div');bub.className='bub';bub.innerHTML='<div class="dots"><span></span><span></span><span></span></div>';row.appendChild(av);row.appendChild(bub);chat.appendChild(row);chat.scrollTop=chat.scrollHeight;}
+function addLoad(kind){
+  hw();
+  const chat=document.getElementById('chat');
+  const row=document.createElement('div');row.className='msg ai';row.id='lr';
+  const av=document.createElement('div');av.className='av ai';av.textContent='PMC';
+  const bub=document.createElement('div');bub.className='bub';
+  if(kind==='drawing'){
+    bub.innerHTML=`<div class="prog"><b>Running takeoff…</b><br>1. Reading drawing text/OCR<br>2. Extracting schedules<br>3. Calculating draft quantities<br><div class="dots" style="margin-top:8px"><span></span><span></span><span></span></div></div>`;
+  }else{
+    bub.innerHTML='<div class="dots"><span></span><span></span><span></span></div>';
+  }
+  row.appendChild(av);row.appendChild(bub);chat.appendChild(row);chat.scrollTop=chat.scrollHeight;
+}
 function rmLoad(){const r=document.getElementById('lr');if(r)r.remove();}
 
 // ── JSON → HUMAN READABLE HTML ────────────────────────────
@@ -993,9 +1016,9 @@ async function send(){
   );
   if(drawingFile){
     files=[];renderChips();
-    addLoad();
+    addLoad('drawing');
     try{
-      const data=await postAnalyzeDrawing(drawingFile, sentText||disp);
+      const data=await postAnalyzeDrawing(drawingFile, sentText||disp||'');
       if(data.needsDxfExport || data.needsPdfOrDxf){
         rmLoad();
         addMsgEl('ai', `⚠️ **File Conversion Error**\n\n${data.error||'Export PDF/DXF and re-upload (any size OK).'}`);
@@ -1010,7 +1033,7 @@ async function send(){
       let footer='';
       if(meta){
         footer=`\n\n---\n_Local pipeline · type: **${meta.drawing_type||'—'}** · mode: **${meta.mode||'—'}** · file: **${meta.file_mb!=null?meta.file_mb+' MB':'—'}**_`;
-        if(pendingClarify) footer+='\n\n_Neeche ek-ek question aayega — Claude jaisa._';
+        if(pendingClarify) footer+='\n\n_Confirm missing values one-by-one below, then export Excel._';
       }
       rmLoad();
       hist.push({role:'assistant',content:aiText,userText:sentText});
@@ -1129,7 +1152,7 @@ function qs(type){document.getElementById('tin').value=QT[type];aRz(document.get
 function newChat(){
   hist=[];files=[];pendingClarify=null;renderChips();currentChatId=null;
   const chat=document.getElementById('chat');
-  chat.innerHTML=`<div class="welcome" id="welcome"><div class="wico">🏗️</div><div class="wtit">PMC Civil AI Agent</div><div class="wsub"><strong>Drawing read</strong> → schedule extract → formula calc → BOQ. Download <strong>PMC Excel</strong>.</div><div class="qgrid"><button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Drawing → Auto Excel</span><span class="qd">Upload drawing → AI calculates → Excel auto banta hai</span></button><button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Scope batao → Excel cost sheet</span></button><button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Prepare BOQ</span><span class="qd">Drawing upload → Excel BOQ</span></button><button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare quotes</span><span class="qd">2-3 PDFs → Excel comparison</span></button><button class="qcard" onclick="qs('report')"><span class="qi">📊</span><span class="ql">Site report</span><span class="qd">Details do → Excel site report</span></button><button class="qcard" onclick="qs('study')"><span class="qi">🏗️</span><span class="ql">Drawing study</span><span class="qd">Upload → educational analysis</span></button></div></div>`;
+  chat.innerHTML=`<div class="welcome" id="welcome"><div class="wico">🏗️</div><div class="wtit">PMC Civil AI</div><div class="wsub">Upload a drawing, type the scope, get a <strong>draft quantity takeoff</strong> — confirm gaps, then download Excel.</div><div class="steps"><div class="step"><div class="step-n">01</div><div class="step-t">Upload PDF</div><div class="step-d">Drawing / schedule sheet</div></div><div class="step"><div class="step-n">02</div><div class="step-t">Type scope</div><div class="step-d">Footing PCC/RCC, or blank = full takeoff</div></div><div class="step"><div class="step-n">03</div><div class="step-t">Review & export</div><div class="step-d">Confirm qty → PMC Excel</div></div></div><div class="qgrid"><button class="qcard" onclick="qs('takeoff')"><span class="qi">📐</span><span class="ql">Quantity takeoff</span><span class="qd">Schedules → draft qty → Excel</span></button><button class="qcard" onclick="qs('footing')"><span class="qi">🧱</span><span class="ql">Footing PCC / RCC</span><span class="qd">Footing volumes only</span></button><button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Full BOQ</span><span class="qd">Complete BOQ with rates</span></button><button class="qcard" onclick="qs('drawing')"><span class="qi">🔎</span><span class="ql">Read only</span><span class="qd">No quantities</span></button><button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare quotes</span><span class="qd">2–3 PDFs</span></button><button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimate</span><span class="qd">Scope → cost sheet</span></button></div></div>`;
   renderHistList();
 }
 
