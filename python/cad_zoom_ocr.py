@@ -76,19 +76,18 @@ def render_pdf_regions(pdf_path, out_dir):
 
         adaptive = _find_schedule_clips(page, w, h)
         if adaptive:
-            for ai, clip in enumerate(adaptive[:4]):
+            for ai, clip in enumerate(adaptive[:3]):
                 path = os.path.join(out_dir, f"{prefix}_sched{ai}.png")
-                _save_clip(page, clip, 240, path)
+                _save_clip(page, clip, 200, path)
                 paths.append((f"{prefix}_sched{ai}", path, pi))
         else:
-            # Fixed CAD-like bands when no vector schedule hits
-            bands = {
-                "zoom_top": (0, 0, w, h * 0.40, 220),
-                "zoom_right": (w * 0.50, 0, w, h * 0.72, 220),
-                "zoom_left": (0, h * 0.30, w * 0.55, h * 0.90, 220),
-                "zoom_title": (w * 0.40, h * 0.70, w, h, 200),
-            }
+            # Scanned CAD: fewer high-value crops (speed) — schedules usually top/right
             import fitz as _fitz
+            bands = {
+                "zoom_top_right": (w * 0.42, 0, w, h * 0.55, 200),
+                "zoom_mid_right": (w * 0.48, h * 0.20, w, h * 0.78, 200),
+                "zoom_left_detail": (0, h * 0.35, w * 0.50, h * 0.92, 190),
+            }
             for name, (x1, y1, x2, y2, dpi) in bands.items():
                 path = os.path.join(out_dir, f"{prefix}_{name}.png")
                 _save_clip(page, _fitz.Rect(x1, y1, x2, y2), dpi, path)
@@ -217,7 +216,8 @@ def main():
         # Prefer schedule-region text order; de-dupe
         full_text = "\n".join(dict.fromkeys(all_lines))
         hints = detect_hints(full_text)
-        print(json.dumps({
+        # ensure_ascii=True → safe for Windows Node stdout parsers
+        payload = {
             "success": True,
             "engine": "rapidocr+cad_zoom",
             "drawing_hints": hints,
@@ -229,14 +229,19 @@ def main():
                 "line_count": len(r["lines"]),
                 "box_count": r["box_count"],
             } for r in regions],
-            "boxes": all_boxes[:5000],
+            "boxes": all_boxes[:4000],
             "full_text": full_text,
             "char_count": len(full_text),
             "out_dir": out_dir,
-        }, ensure_ascii=False))
+        }
+        out_json = os.path.join(out_dir, "ocr_result.json")
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=True)
+        payload["result_path"] = out_json
+        print(json.dumps(payload, ensure_ascii=True))
         return 0
     except Exception as e:
-        print(json.dumps({"success": False, "error": str(e)}))
+        print(json.dumps({"success": False, "error": str(e)}, ensure_ascii=True))
         return 1
 
 
