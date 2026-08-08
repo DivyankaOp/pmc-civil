@@ -4,7 +4,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test:schedules": "node scripts/test_schedule_pipeline.js"
+    "test:schedules": "node scripts/test_schedule_pipeline.js",
+    "test:ocr-formats": "node scripts/test_format_tolerant_ocr.js"
   },
   "engines": {
     "node": ">=18.0.0"
