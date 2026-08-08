@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node server.js",
     "test:schedules": "node scripts/test_schedule_pipeline.js",
-    "test:ocr-formats": "node scripts/test_format_tolerant_ocr.js"
+    "test:ocr-formats": "node scripts/test_format_tolerant_ocr.js",
+    "test:civils": "node scripts/test_civils_features.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -16,6 +17,7 @@
     "exceljs": "^4.4.0",
     "express": "^4.18.2",
     "multer": "^2.2.0",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "pdf-lib": "^1.17.1"
   }
 }

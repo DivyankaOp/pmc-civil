@@ -23,6 +23,15 @@ const {
 } = require('./lib/schedule_pipeline');
 const { runCadZoomOcrFromBase64, runCadZoomOcrOnFile } = require('./lib/cad_local_reader');
 const { buildSpatialScheduleText } = require('./lib/spatial_tables');
+const { buildAnnotatedTakeoffPdf } = require('./lib/annotated_takeoff_pdf');
+const {
+  createProject,
+  getProject,
+  addSheet,
+  summarize,
+  mergeProjectMarkdown,
+  removeSheet,
+} = require('./lib/project_store');
 const multer = require('multer');
 const fs = require('fs');
 const os = require('os');
@@ -2199,6 +2208,7 @@ app.post('/analyze-drawing', (req, res) => {
           analysis: scheduleBundle.markdown,
           extracted: scheduleBundle.extracted,
           clarifications: scheduleBundle.clarifications,
+          measure: scheduleBundle.measure || scheduleBundle.qa?.measure || null,
           combined_text: (ctx.combinedText || '').slice(0, 80000),
           filename,
           schedule_first: {
@@ -2207,13 +2217,14 @@ app.post('/analyze-drawing', (req, res) => {
             drawing_type: scheduleBundle.typeInfo?.drawing_type,
             boq_items: scheduleBundle.boqResult?.boq?.length || 0,
             status: scheduleBundle.qa?.meta?.status || scheduleBundle.qa?.status || (scheduleBundle.needsUserInput ? 'DRAFT' : 'FINAL'),
-            mode: scheduleBundle.needsUserInput ? 'ask-user' : (scheduleBundle.qa?.meta?.intent || 'read-calc'),
+            mode: scheduleBundle.needsUserInput ? 'ask-user' : (scheduleBundle.qa?.meta?.intent || 'takeoff'),
             tokens: 0,
             file_mb: Number(sizeMb),
             needs_user_input: !!scheduleBundle.needsUserInput,
             questions: scheduleBundle.clarifications?.questions || [],
             spatial_tables: (ctx.spatialTables || []).length,
             text_chars: (ctx.combinedText || '').length,
+            measure_items: (scheduleBundle.measure || scheduleBundle.qa?.measure)?.items?.length || 0,
           },
         };
         if (!scheduleBundle.needsUserInput) {
@@ -2255,6 +2266,138 @@ app.post('/analyze-drawing', (req, res) => {
       if (tmpPath) {
         try { fs.unlinkSync(tmpPath); } catch (_) {}
       }
+    }
+  });
+});
+
+// ─── ANNOTATED TAKEOFF PDF ───────────────────────────────────────
+app.post('/export-annotated-pdf', async (req, res) => {
+  try {
+    const { markdown, extracted, measure, title, b64, filename } = req.body || {};
+    if (!markdown && !extracted) {
+      return res.status(400).json({ error: 'Need markdown or extracted takeoff data' });
+    }
+    let pdfBytes = null;
+    if (b64) {
+      pdfBytes = Buffer.from(b64, 'base64');
+    }
+    const out = await buildAnnotatedTakeoffPdf({
+      pdfBytes,
+      markdown: markdown || '',
+      extracted: extracted || null,
+      measure: measure || null,
+      title: title || filename || 'PMC Quantity Takeoff',
+    });
+    const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="PMC_Takeoff_Annotated_${today}.pdf"`);
+    return res.send(out.bytes);
+  } catch (e) {
+    console.error('[/export-annotated-pdf]', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── MULTI-SHEET PROJECT WORKSPACE ───────────────────────────────
+app.post('/project/create', (req, res) => {
+  const p = createProject(req.body?.name);
+  res.json({ success: true, project: summarize(p) });
+});
+
+app.get('/project/:id', (req, res) => {
+  const p = getProject(req.params.id);
+  if (!p) return res.status(404).json({ error: 'Project not found or expired' });
+  res.json({ success: true, project: summarize(p) });
+});
+
+app.post('/project/:id/add-sheet', (req, res) => {
+  try {
+    const result = addSheet(req.params.id, req.body || {});
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.delete('/project/:id/sheet/:sheetId', (req, res) => {
+  const project = removeSheet(req.params.id, req.params.sheetId);
+  if (!project) return res.status(404).json({ error: 'Project not found' });
+  res.json({ success: true, project });
+});
+
+app.get('/project/:id/merge', (req, res) => {
+  const merged = mergeProjectMarkdown(req.params.id);
+  if (!merged) return res.status(404).json({ error: 'Project not found' });
+  res.json({ success: true, ...merged });
+});
+
+// Analyze drawing AND add to project in one call
+app.post('/project/analyze-sheet', (req, res) => {
+  uploadDrawing.single('file')(req, res, async (err) => {
+    if (err) return res.status(400).json({ error: err.message });
+    let tmpPath = req.file?.path;
+    try {
+      const question = (req.body?.question || '').trim();
+      const filename = req.file?.originalname || 'drawing.pdf';
+      let projectId = req.body?.projectId || '';
+      if (!tmpPath) return res.status(400).json({ error: 'No file' });
+
+      const ctx = await buildDrawingContextFromFile(tmpPath, {
+        question: question || 'Prepare quantity takeoff from this drawing',
+        filename,
+        mime: req.file?.mimetype,
+      });
+      const scheduleBundle = ctx.scheduleFirst;
+      if (!projectId || !getProject(projectId)) {
+        projectId = createProject(req.body?.projectName || 'Takeoff project').id;
+      }
+      const sizeMb = (fs.statSync(tmpPath).size / (1024 * 1024)).toFixed(1);
+      const { project, sheet } = addSheet(projectId, {
+        filename,
+        drawing_type: scheduleBundle?.typeInfo?.drawing_type,
+        schedule_rows: scheduleBundle?.extracted?.total_schedule_rows || 0,
+        markdown: scheduleBundle?.markdown || '',
+        extracted: scheduleBundle?.extracted || null,
+        measure: scheduleBundle?.measure || scheduleBundle?.qa?.measure || null,
+        question,
+        file_mb: Number(sizeMb),
+        combined_text: ctx.combinedText || '',
+      });
+
+      // Keep a small b64 for annotate if file <= 15MB
+      let b64 = null;
+      try {
+        const st = fs.statSync(tmpPath);
+        if (st.size <= 15 * 1024 * 1024) b64 = fs.readFileSync(tmpPath).toString('base64');
+      } catch (_) {}
+
+      return res.json({
+        success: true,
+        project,
+        sheet,
+        analysis: scheduleBundle?.markdown,
+        content: [{ type: 'text', text: scheduleBundle?.markdown || '' }],
+        extracted: scheduleBundle?.extracted,
+        clarifications: scheduleBundle?.clarifications,
+        measure: scheduleBundle?.measure || scheduleBundle?.qa?.measure || null,
+        combined_text: (ctx.combinedText || '').slice(0, 80000),
+        b64,
+        schedule_first: {
+          drawing_type: scheduleBundle?.typeInfo?.drawing_type,
+          mode: scheduleBundle?.needsUserInput ? 'ask-user' : 'takeoff',
+          needs_user_input: !!scheduleBundle?.needsUserInput,
+          questions: scheduleBundle?.clarifications?.questions || [],
+          project_id: project.id,
+          sheet_id: sheet.id,
+          tokens: 0,
+          file_mb: Number(sizeMb),
+        },
+      });
+    } catch (e) {
+      console.error('[/project/analyze-sheet]', e.message);
+      return res.status(500).json({ error: e.message });
+    } finally {
+      if (tmpPath) try { fs.unlinkSync(tmpPath); } catch (_) {}
     }
   });
 });
@@ -2314,9 +2457,9 @@ app.get('/health', (req, res) => {
     status: 'ok',
     claude_key_set: !!claudeKey,
     claude_preview: claudeKey ? claudeKey.slice(0, 12) + '...' : 'NOT SET ❌',
-    pipeline: 'Civils.ai-style: READ drawing → formula takeoff → DRAFT/FINAL BOQ (spatial+OCR+ask-user)',
+    pipeline: 'Takeoff: READ → measure/schedules → DRAFT → confirm → Excel/annotated PDF · multi-sheet project',
     max_upload_mb: 500,
-    routes: ['/analyze-drawing','/resolve-clarifications','/claude','/gemini','/export-excel','/export-pdf','/export-drawing','/analyze-dxf','/export-dxf-excel','/drawing-to-excel','/update-area-from-dxf','/fill-template-from-drawing','/analyze-dwg','/classify-dxf','/analyze-with-answers','/rates-stats'],
+    routes: ['/analyze-drawing','/resolve-clarifications','/export-annotated-pdf','/project/create','/project/analyze-sheet','/claude','/gemini','/export-excel','/export-pdf','/export-drawing','/analyze-dxf','/export-dxf-excel','/drawing-to-excel','/update-area-from-dxf','/fill-template-from-drawing','/analyze-dwg','/classify-dxf','/analyze-with-answers','/rates-stats'],
     dwg_support: 'ZWCAD + AutoCAD — prefer PDF/DXF; size up to 500MB via /analyze-drawing'
   });
 });
