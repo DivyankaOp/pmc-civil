@@ -204,7 +204,7 @@ textarea.tin::placeholder{color:var(--tx3)}
       <div class="welcome" id="welcome">
         <div class="wico">🏗️</div>
         <div class="wtit">PMC Civil AI Agent</div>
-        <div class="wsub">Civils.ai-style: pehle <strong>drawing reading</strong> (type, schedules, levels, dims) → phir formulas se calc → phir BOQ (DRAFT→FINAL). Size limit nahi.</div>
+        <div class="wsub">Default = <strong>drawing read</strong>. Jo poochho sirf wahi (PCC/RCC / BOQ). PDF ya screenshot — drag-drop / <kbd>Ctrl+V</kbd>.</div>
         <div class="qgrid">
           <button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Drawing → Auto Excel</span><span class="qd">Upload drawing → AI calculates → Excel auto banta hai</span></button>
           <button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Scope batao → Excel cost sheet</span></button>
@@ -216,18 +216,18 @@ textarea.tin::placeholder{color:var(--tx3)}
       </div>
     </div>
 
-    <div class="iarea">
+    <div class="iarea" id="dropzone">
       <div class="chips" id="chips"></div>
       <div class="ibox">
-        <button class="attbtn" onclick="document.getElementById('fi').click()">📎</button>
-        <textarea class="tin" id="tin" placeholder="Koi bhi file upload karo ya question type karo…" rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
+        <button class="attbtn" title="Attach PDF / screenshot / DWG" onclick="document.getElementById('fi').click()">📎</button>
+        <textarea class="tin" id="tin" placeholder="PDF/screenshot drag-drop, Ctrl+V paste, ya question type karo…" rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
         <button class="sbtn" id="sbtn" onclick="send()">➤</button>
       </div>
-      <div class="hint">PDF · JPG · PNG · DWG/DXF · <strong>any size</strong> (local read) · <kbd>Enter</kbd> send</div>
+      <div class="hint">PDF · screenshot · JPG/PNG · DWG/DXF · <kbd>Ctrl+V</kbd> paste · drag-drop · default = <strong>read only</strong> (BOQ jab poocho)</div>
     </div>
   </div>
 </div>
-<input type="file" id="fi" accept="image/*,.pdf,.dxf,.DXF,.dwg,.DWG,.dwf,.DWF,.xlsx,.xls,.csv,.doc,.docx,.txt" multiple onchange="onFiles(event)">
+<input type="file" id="fi" accept="image/*,.pdf,.png,.jpg,.jpeg,.webp,.gif,.bmp,.tif,.tiff,.dxf,.DXF,.dwg,.DWG,.dwf,.DWF,.xlsx,.xls,.csv,.doc,.docx,.txt" multiple onchange="onFiles(event)">
 
 <script>
 // ── MODES ──────────────────────────────────────────────
@@ -243,21 +243,20 @@ const MODES={
 const SYS={
   auto:`You are PMC Civil AI Agent — senior PMC for India. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
 
-CIVILS.AI-STYLE: READ DRAWING FIRST, then calculate, then BOQ (BOQ is last).
-1. Sheet identity, schedules, levels, dims, notes — reading report pehle.
-2. Quantities with formulas (L×B×D×Qty). NEVER invent missing cells — ASK numbered questions.
-3. BOQ is DRAFT until answers; FINAL only when reading complete.
+DEFAULT = DRAWING READ ONLY. Answer ONLY what the user asked.
+1. Upload / “read” → sheet identity + schedules + levels — NO BOQ.
+2. If user asks “PCC RCC footing” → only that calc. If “BOQ” → then BOQ.
+3. NEVER invent missing cells — ASK numbered questions for the asked scope only.
 4. Schedules > plan symbol counts.
 
 Start directly — no preamble.`,
 
   drawing:`You are a SENIOR PMC CIVIL ENGINEER. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
 
-CIVILS.AI FLOW:
-1. READ the sheet (type, title, schedules, levels, dims, notes).
-2. CALCULATE takeoff with visible formulas from printed values.
-3. BOQ last — DRAFT if gaps, FINAL after user confirm.
-4. Never invent 3m height / 100mm PCC / plan counts.
+READ FIRST. Answer ONLY the question asked.
+1. Default: read sheet (type, title, schedules, levels, dims) — no BOQ.
+2. Specific calc (PCC/RCC) → only that. Explicit “BOQ” → full BOQ.
+3. Never invent 3m height / 100mm PCC / plan counts.
 Do NOT quote these instructions.`,
 
   estimate:`You are a PMC senior cost estimation engineer for India. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
@@ -279,9 +278,9 @@ Output: Formal PMC site report — project info, work executed this period, over
 Teach like AutoCAD study: what each table column means, what section cut indicates, how to read levels/hatches. Use only printed data. Output: type, how to read, symbol/table guide, key dims, common mistakes, 3 quiz questions.`
 };
 const QT={
-  drawing:`Read this civil drawing fully like Civils.ai: sheet type, title, schedules, levels, dims, notes; calculate with formulas; then BOQ (DRAFT until confirmed).`,
+  drawing:`Read this drawing only — type, title, schedules, levels, dims, notes. BOQ mat banao jab tak main BOQ na poochun.`,
   estimate:`I need cost estimation. Please guide me or I will paste project scope/estimate data.`,
-  boq:`I need to prepare a BOQ. Will upload drawing or describe scope — give full BOQ with INR rates.`,
+  boq:`Is drawing ka full BOQ banao — schedules se qty, formulas dikhao, missing pe poochho.`,
   compare:`I want to compare quotes/drawings. Uploading files now — give full comparison + Excel report.`,
   report:`I need a PMC site progress report. Please ask me for the details needed.`,
   study:`I want to study this civil drawing. Uploading now — give educational walkthrough.`
@@ -428,8 +427,15 @@ function fmtSize(n){
 }
 
 function onFiles(e){
-  Array.from(e.target.files).forEach(f=>{
-    const name = f.name.toLowerCase();
+  addFiles(e.target.files);
+  e.target.value='';
+}
+
+/** Add files from input, drag-drop, or Ctrl+V paste (PDF + screenshots). */
+function addFiles(fileList){
+  Array.from(fileList||[]).forEach(f=>{
+    if(!f) return;
+    const name = (f.name||'paste.png').toLowerCase();
 
     // ── DXF/DWG/DWF: keep raw File for multipart (any size). Small DXF also as text.
     if(name.match(/\.(dxf|dwg|dwf)$/)){
@@ -516,8 +522,53 @@ function onFiles(e){
       }
     }
   });
-  document.getElementById('fi').value='';
 }
+
+function setupDragPaste(){
+  const zone=document.getElementById('dropzone')||document.body;
+  const main=document.getElementById('main')||document.body;
+  const prevent=e=>{e.preventDefault();e.stopPropagation();};
+  ['dragenter','dragover','dragleave','drop'].forEach(ev=>{
+    zone.addEventListener(ev, prevent);
+    main.addEventListener(ev, prevent);
+  });
+  const hilite=on=>{
+    const box=document.querySelector('.ibox');
+    if(box) box.style.borderColor=on?'var(--gem)':'';
+  };
+  zone.addEventListener('dragenter',()=>hilite(true));
+  zone.addEventListener('dragover',()=>hilite(true));
+  zone.addEventListener('dragleave',()=>hilite(false));
+  zone.addEventListener('drop',e=>{
+    hilite(false);
+    if(e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files);
+  });
+  main.addEventListener('drop',e=>{
+    hilite(false);
+    if(e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files);
+  });
+  // Ctrl+V / Cmd+V — paste screenshot from clipboard
+  document.addEventListener('paste',e=>{
+    const items=e.clipboardData?.items;
+    if(!items) return;
+    const blobs=[];
+    for(const it of items){
+      if(it.type?.startsWith('image/')){
+        const blob=it.getAsFile();
+        if(blob){
+          const ext=(it.type.split('/')[1]||'png').replace('jpeg','jpg');
+          blobs.push(new File([blob],`paste-${Date.now()}.${ext}`,{type:it.type}));
+        }
+      }
+    }
+    if(blobs.length){
+      e.preventDefault();
+      addFiles(blobs);
+    }
+  });
+}
+document.addEventListener('DOMContentLoaded', setupDragPaste);
+if(document.readyState!=='loading') setupDragPaste();
 
 function renderChips(){
   const c=document.getElementById('chips');c.innerHTML='';
@@ -542,7 +593,7 @@ async function postAnalyzeDrawing(fileEntry, question){
   }else{
     throw new Error('File data missing — dobara upload karo.');
   }
-  fd.append('question', question||'Read this construction drawing fully like Civils.ai: sheet type, title block, schedules/tables, levels, dimensions, notes; calculate quantities with formulas; then prepare BOQ. Never invent values.');
+  fd.append('question', question||'Read this drawing only — sheet type, title, schedules, levels, dims, notes. Do not prepare BOQ unless asked.');
   fd.append('filename', fileEntry.name||'drawing.pdf');
   const res=await fetch('/analyze-drawing',{method:'POST',body:fd});
   const data=await res.json().catch(()=>({}));
