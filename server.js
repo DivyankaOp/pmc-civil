@@ -2191,7 +2191,8 @@ app.post('/analyze-drawing', (req, res) => {
       });
       const scheduleBundle = ctx.scheduleFirst;
 
-      if (scheduleBundle?.answeredLocally && scheduleBundle.markdown) {
+      // ALWAYS return local read/ask-user first — never drop clarifications via Claude polish
+      if (scheduleBundle?.markdown) {
         const payload = {
           success: true,
           content: [{ type: 'text', text: scheduleBundle.markdown }],
@@ -2206,12 +2207,13 @@ app.post('/analyze-drawing', (req, res) => {
             drawing_type: scheduleBundle.typeInfo?.drawing_type,
             boq_items: scheduleBundle.boqResult?.boq?.length || 0,
             status: scheduleBundle.qa?.meta?.status || scheduleBundle.qa?.status || (scheduleBundle.needsUserInput ? 'DRAFT' : 'FINAL'),
-            mode: scheduleBundle.needsUserInput ? 'ask-user' : 'read-calc-boq',
+            mode: scheduleBundle.needsUserInput ? 'ask-user' : (scheduleBundle.qa?.meta?.intent || 'read-calc'),
             tokens: 0,
             file_mb: Number(sizeMb),
             needs_user_input: !!scheduleBundle.needsUserInput,
             questions: scheduleBundle.clarifications?.questions || [],
             spatial_tables: (ctx.spatialTables || []).length,
+            text_chars: (ctx.combinedText || '').length,
           },
         };
         if (!scheduleBundle.needsUserInput) {
@@ -2225,37 +2227,26 @@ app.post('/analyze-drawing', (req, res) => {
         return res.json(payload);
       }
 
-      // Weak extract: optional Claude polish on TEXT only (never re-upload huge PDF)
-      if (process.env.CLAUDE_API_KEY && scheduleBundle?.markdown) {
-        try {
-          const polished = await polishWithClaude(callClaudeAPI, {
-            markdown: scheduleBundle.markdown,
-            extracted: scheduleBundle.extracted,
-            system: CIVIL_SYSTEM,
-          });
-          return res.json({
-            success: true,
-            content: [{ type: 'text', text: polished || scheduleBundle.markdown }],
-            analysis: polished || scheduleBundle.markdown,
-            schedule_first: {
-              quality: scheduleBundle.extracted?.quality,
-              drawing_type: scheduleBundle.typeInfo?.drawing_type,
-              mode: 'claude-assisted-text',
-              file_mb: Number(sizeMb),
-            },
-          });
-        } catch (e) {
-          console.warn('[/analyze-drawing] Claude polish failed:', e.message);
-        }
-      }
-
-      const fallback = scheduleBundle?.markdown
-        || `Drawing received (${sizeMb} MB) but local extract was weak.\n\nPlease:\n1. Export a clearer PDF from CAD\n2. Or ask a specific question (e.g. footing sizes, levels)\n3. Answer clarification questions if shown`;
+      const fallback = `Drawing received (${sizeMb} MB) but local extract was weak.\n\nPlease:\n1. Export a clearer PDF from CAD\n2. Or type footing lines: Mark LxB Depth Qty\n3. Or ask again after screenshot of schedule table`;
       return res.json({
         success: true,
         content: [{ type: 'text', text: fallback }],
         analysis: fallback,
-        schedule_first: { mode: 'weak-extract', file_mb: Number(sizeMb), tokens: 0 },
+        clarifications: {
+          questions: [{
+            id: 'footing_schedule_paste',
+            question: 'SCHEDULE OF FOOTING type karo — har line: `F1 2600x1800 900 12`',
+            why: 'Extract empty',
+          }],
+        },
+        extracted: { schedules: { footings: [], columns: [] }, quality: 'poor', total_schedule_rows: 0 },
+        schedule_first: {
+          mode: 'weak-extract',
+          file_mb: Number(sizeMb),
+          tokens: 0,
+          needs_user_input: true,
+          questions: [{ id: 'footing_schedule_paste', question: 'SCHEDULE OF FOOTING type karo' }],
+        },
       });
     } catch (e) {
       console.error('[/analyze-drawing]', e.message);
