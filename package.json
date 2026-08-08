@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test:schedules": "node scripts/test_schedule_pipeline.js"
   },
   "engines": {
     "node": ">=18.0.0"

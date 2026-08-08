@@ -4,21 +4,27 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 const path = require('path');
 const ExcelJS = require('exceljs');
-const { dataPath, scriptsPath } = require('./paths');
-const { extractDrawingData, buildDrawingExcel } = require('./server_drawing');
-const { geminiAnalyzeDrawing, runCVAnalysis, RATES } = require('./drawing_analyzer');
-const { parseDXF, extractCivilData, extractTotalAreaSqft, attachScheduleTables } = require('./dxf_parser');
-const { buildExcelFromDrawing, getDrawingPrompt } = require('./drawing_to_excel');
-const { buildDXFExcel } = require('./dxf_to_excel');
-const { analyzeDrawing, buildAIPrompt } = require('./drawing_intelligence');
-const { claudeAnalyzeDXF, claudeClassifySymbols, claudeAnalyzeWithAnswers, claudeAnalyzeDrawingVision, claudeAnalyzeDWGVision, callClaudeAPI, CIVIL_SYSTEM, parseJSON } = require('./claude_analyzer');
-const { learnRatesFromBOQ, learnRatesFromMarkdown, getRatesSummary, getRatesMap, getLearnedRateStats } = require('./rate_store');
-const { buildSmartContextFromAnalyzed, buildSmartContext } = require('./smart_boq_engine');
+const { dataPath, scriptsPath, publicDir } = require('./paths');
+const { extractDrawingData, buildDrawingExcel } = require('./lib/server_drawing');
+const { geminiAnalyzeDrawing, runCVAnalysis, RATES } = require('./lib/drawing_analyzer');
+const { parseDXF, extractCivilData, extractTotalAreaSqft, attachScheduleTables } = require('./lib/dxf_parser');
+const { buildExcelFromDrawing, getDrawingPrompt } = require('./lib/drawing_to_excel');
+const { buildDXFExcel } = require('./lib/dxf_to_excel');
+const { analyzeDrawing, buildAIPrompt } = require('./lib/drawing_intelligence');
+const { claudeAnalyzeDXF, claudeClassifySymbols, claudeAnalyzeWithAnswers, claudeAnalyzeDrawingVision, claudeAnalyzeDWGVision, callClaudeAPI, CIVIL_SYSTEM, parseJSON } = require('./lib/claude_analyzer');
+const { learnRatesFromBOQ, learnRatesFromMarkdown, getRatesSummary, getRatesMap, getLearnedRateStats } = require('./lib/rate_store');
+const { buildSmartContextFromAnalyzed, buildSmartContext } = require('./lib/smart_boq_engine');
+const {
+  runScheduleFirstLocal,
+  polishWithClaude,
+  combineExtractedText,
+} = require('./lib/schedule_pipeline');
+const { runCadZoomOcrFromBase64 } = require('./lib/cad_local_reader');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(publicDir()));
 
 
 async function extractPdfText(pdfBase64) {
@@ -149,7 +155,7 @@ async function extractScannedPdfWithGCV(pdfBase64) {
     const outPath = path.join(tmpDir, 'ocr_out.json');
     fs.writeFileSync(pdfPath, Buffer.from(pdfBase64, 'base64'));
 
-    const scriptPath = path.join(__dirname, 'ocr_pipeline.py');
+    const scriptPath = scriptsPath('ocr_pipeline.py');
     const py = process.env.PMC_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
 
     execSync(`${py} "${scriptPath}" "${pdfPath}" "${outPath}"`, {
@@ -298,152 +304,121 @@ print(json.dumps(tiles))
   }
 }
 
-async function buildDrawingContext(pdfB64) {
+/**
+ * Text-first drawing context (Civils.ai-style).
+ * Default: NO image tiles (saves tokens).
+ * Vision fallback: 1 overview + up to 2 crops only when schedule text is weak.
+ */
+async function buildDrawingContext(pdfB64, opts = {}) {
+  const forceVision = opts.forceVision === true;
   const parts = [];
   let extractedTextBlock = '';
+  const plainLines = [];
 
-  // Step 1: Extract text with XY coordinates (vector PDF)
   const extracted = await extractPdfText(pdfB64);
   const isVector = extracted?.is_vector;
 
   if (isVector && extracted.pages?.length) {
-    // Build a spatial text map — group by Y position (rows)
-    const textLines = [];
     for (const page of extracted.pages) {
       const byY = {};
       for (const t of (page.texts || [])) {
-        const row = Math.round(t.y / 15) * 15; // 15px tolerance per row
+        const row = Math.round(t.y / 15) * 15;
         if (!byY[row]) byY[row] = [];
         byY[row].push(t);
       }
       for (const row of Object.keys(byY).sort((a, b) => Number(a) - Number(b))) {
         const line = byY[row].sort((a, b) => a.x - b.x).map(t => t.text).join('  ');
-        if (line.trim()) textLines.push(line);
+        if (line.trim()) plainLines.push(line);
       }
     }
     const totalTexts = extracted.total_texts || 0;
-    extractedTextBlock = `=== MACHINE-EXTRACTED TEXT FROM DRAWING (${totalTexts} items — read left-to-right, top-to-bottom) ===\nIMPORTANT: These are ALL text labels, dimensions, and annotations in this drawing. Use these as your primary data source.\n\n${textLines.join('\n')}\n=== END EXTRACTED TEXT ===`;
+    extractedTextBlock = `=== MACHINE-EXTRACTED TEXT FROM DRAWING (${totalTexts} items) ===\n${plainLines.join('\n')}\n=== END EXTRACTED TEXT ===`;
     console.log(`[drawing-context] Vector PDF: ${totalTexts} texts extracted`);
   }
 
   let gcvBlock = '';
-  const gcvResult = await extractScannedPdfWithGCV(pdfB64);
-  if (gcvResult?.pages?.length) {
-    gcvBlock = gcvResult.pages.map((p, i) => {
-      const rotNote = p.is_rotated ? ' [rotated]' : '';
-      return `=== PAGE ${i+1}${rotNote} (pipe-separated columns) ===\n${p.raw_text}`;
-    }).join('\n\n');
-    gcvBlock = `=== SCANNED PDF TABLE DATA (Google Cloud Vision — read cell by cell) ===\n${gcvBlock}\n=== END TABLE DATA ===`;
-    console.log(`[drawing-context] GCV: ${gcvResult.pages.length} pages extracted (always-on mode)`);
-  } else {
-    console.log('[drawing-context] GCV returned no data — check API key or drawing format');
-  }
-
- 
-  const hasFullText = (extractedTextBlock.length > 2000); // vector PDF with complete schedule
-  const hasAnyText  = (gcvBlock.length > 200) || (extractedTextBlock.length > 200);
-
-  // Always render high-res PNG tiles for visual reading
-  const pngTiles = await pdfToImageTiles(pdfB64);
-
-  if (pngTiles?.length) {
-    for (const tile of pngTiles) {
-      parts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
+  let cadZoomText = '';
+  let cadHints = [];
+  // Scanned CAD PDFs: local CAD-zoom OCR first (zero Claude tokens). GCV only as optional add-on.
+  const vectorThin = plainLines.join('\n').length < 400;
+  if (vectorThin || forceVision) {
+    try {
+      console.log('[drawing-context] Running local CAD-zoom OCR (RapidOCR)...');
+      const zoom = runCadZoomOcrFromBase64(pdfB64, 'application/pdf');
+      if (zoom?.success && zoom.full_text) {
+        cadZoomText = zoom.full_text;
+        cadHints = zoom.drawing_hints || [];
+        plainLines.push(...String(zoom.full_text).split('\n'));
+        console.log(`[drawing-context] CAD-zoom OCR: ${zoom.char_count || cadZoomText.length} chars | hints=${cadHints.join(',')}`);
+      } else {
+        console.warn('[drawing-context] CAD-zoom OCR failed:', zoom?.error || 'empty');
+      }
+    } catch (e) {
+      console.warn('[drawing-context] CAD-zoom OCR error:', e.message);
     }
-    console.log(`[drawing-context] Sending ${pngTiles.length} PNG tiles (always-on for scanned PDF visual reading)`);
+
+    // Optional cloud GCV only if local OCR still weak AND key present
+    if ((cadZoomText.length < 200) && process.env.GOOGLE_CLOUD_VISION_API_KEY) {
+      const gcvResult = await extractScannedPdfWithGCV(pdfB64);
+      if (gcvResult?.pages?.length) {
+        const gcvLines = [];
+        gcvBlock = gcvResult.pages.map((p, i) => {
+          const rotNote = p.is_rotated ? ' [rotated]' : '';
+          const pageText = p.raw_text || p.text || '';
+          gcvLines.push(...String(pageText).split('\n'));
+          return `=== PAGE ${i + 1}${rotNote} ===\n${pageText}`;
+        }).join('\n\n');
+        gcvBlock = `=== SCANNED PDF OCR (GCV) ===\n${gcvBlock}\n=== END OCR ===`;
+        plainLines.push(...gcvLines);
+        console.log(`[drawing-context] GCV fallback: ${gcvResult.pages.length} pages`);
+      }
+    }
   } else {
-    // SAFETY NET: tile generation failed for some reason — always give Claude
-    // the raw PDF rather than leaving it with nothing but OCR text (this is
-    // the exact failure mode that used to cause silent number-guessing:
-    // pdfToImageTiles was throwing internally, returning null, and — since
-    // OCR text usually clears the 200-char bar even when garbled — no visual
-    // was ever attached). Now we always fall back to the raw PDF so Claude
-    // has *something* to actually look at.
-    console.warn('[drawing-context] PNG tiling failed — falling back to raw PDF document');
-    parts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
+    console.log('[drawing-context] Skipping OCR — vector text sufficient');
   }
 
-  if (hasFullText) {
-    console.log(`[drawing-context] Vector PDF with full text (${extractedTextBlock.length} chars) — tiles sent as visual supplement`);
+  const combinedText = combineExtractedText([plainLines.join('\n'), extractedTextBlock, gcvBlock, cadZoomText]);
+  const userQuestion = opts.question || '';
+  const local = runScheduleFirstLocal(combinedText, {
+    filename: opts.filename || 'drawing.pdf',
+    question: userQuestion,
+    hints: cadHints,
+  });
+  console.log(`[drawing-context] type=${local.typeInfo?.drawing_type} schedule=${local.extracted.quality} rows=${local.extracted.total_schedule_rows} localQA=${!!local.answeredLocally}`);
+
+  // Vision to Claude only if local Q&A failed AND OCR still weak
+  const needVision = forceVision || (local.needsClaude && local.needsVision);
+
+  if (needVision) {
+    const pngTiles = await pdfToImageTiles(pdfB64);
+    // Cap: overview (first) + up to 2 densest crops — not full 3x2 grid
+    const limited = (pngTiles || []).slice(0, 3);
+    if (limited.length) {
+      for (const tile of limited) {
+        parts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
+      }
+      console.log(`[drawing-context] Vision fallback: ${limited.length} image(s) (capped)`);
+      if (limited.length > 1) {
+        parts.push({
+          type: 'text',
+          text: `IMAGE NOTE: ${limited.length} images of the SAME sheet — image 1 overview, rest table crops. Use schedule QTY column only. Never double-count overlap.`,
+        });
+      }
+    } else {
+      console.warn('[drawing-context] Tile render failed — attaching raw PDF as last resort');
+      parts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
+    }
   } else {
-    console.log(`[drawing-context] Scanned PDF — tiles + OCR text sent together for cross-reference`);
+    console.log('[drawing-context] Text-only mode — zero image tokens');
   }
 
-  // NEW: was missing entirely — Claude was receiving 7 separate images with
-  // no explanation of what they are. Without this it can (a) mistake tiles
-  // for separate drawings/pages, and (b) double-count anything caught in the
-  // ~6% overlap between adjacent crops (e.g. count a column twice because it
-  // appears in both the top-middle and top-right tile).
-  if (pngTiles?.length > 1) {
-    parts.push({
-      type: 'text',
-      text: `\n\nIMAGE SET NOTE: The ${pngTiles.length} images above are ALL of the SAME single drawing sheet — not separate drawings or pages.\n` +
-        `Image 1 is a full-sheet overview (lower resolution, for overall layout/structure).\n` +
-        `The remaining images are high-resolution zoomed crops of overlapping regions of that SAME sheet (~6% overlap between adjacent crops), provided ONLY so small text/numbers are legible.\n` +
-        `RULES:\n` +
-        `1. Because crops overlap, the same table row, column mark, or dimension may appear in more than one image. NEVER count or list it twice.\n` +
-        `2. For any quantity/count (columns, footings, etc.) — use the schedule table's QTY column (or a de-duplicated list of unique marks), NOT how many times you see something across the images.\n` +
-        `3. If one schedule table's rows are split across two adjacent crops, merge them into ONE table using the column headers as the guide — do not create duplicate rows.\n` +
-        `4. Use the overview to understand overall structure (how many tables exist, how many rows each has); use the zoomed crops only to read exact digits/values in those cells.\n\n`
-    });
-  }
+  // Structured schedules + BOQ (deterministic) — primary payload
+  parts.push({
+    type: 'text',
+    text: `${local.markdown}\n\n=== RAW EXTRACTED TEXT (reference) ===\n${combinedText.slice(0, 50000)}\n=== END RAW TEXT ===\n\nRULES: Use ONLY schedule values above for quantities. Never invent sizes/qty. Prefer drawing-schedule source.`,
+  });
 
-  // Step 4: Inject extracted text with HARD instruction to use text only
-  const contextText = [extractedTextBlock, gcvBlock].filter(Boolean).join('\n\n');
-
-  // FIX: Full structural schema + strict rules injected for BOTH text and image fallback paths
-  const strictScheduleRules = `
-═══════════════════════════════════════════════════════════
-COLUMN / FOOTING SCHEDULE READING — ABSOLUTE RULES
-═══════════════════════════════════════════════════════════
-1. ONLY read values PHYSICALLY PRINTED in the schedule table cells.
-2. Column/Pedestal sizes: copy EXACT printed value (e.g. 300x300, 230x450).
-   - NEVER output 400x400, 500x500 unless those numbers appear in the drawing.
-3. Main bars / stirrups: copy EXACTLY (e.g. 8-12O, 4-16O, 10T16).
-   - NEVER output bar sizes not printed in the schedule.
-4. Column schedule and Footing schedule are COMPLETELY SEPARATE tables.
-5. Qty: use ONLY the qty column in the schedule. NEVER count from plan view.
-6. Unclear/unreadable cell -> write "not legible" — NEVER guess.
-7. Source: "drawing-schedule" for schedule values, "calculated" for derived.
-8. INDUSTRIAL DRAWING (base plates, anchor bolts, braced bays):
-   - Column Schedule = RCC PEDESTAL schedule only
-   - Read base plate + anchor bolt details from detail panels
-═══════════════════════════════════════════════════════════
-
-Return ONLY raw JSON (no markdown, no explanation):
-{
-  "drawing_type": "",
-  "project_name": "",
-  "drawing_no": "",
-  "scale": "",
-  "concrete_grade": "",
-  "steel_grade": "",
-  "structural_system": "",
-  "column_schedule": [{"col_mark":"","size_mm":"","main_bars":"","stirrups":"","qty":0,"floor":"","height_m":0,"source":"drawing-schedule|not legible"}],
-  "footing_schedule": [{"footing_mark":"","pcc_size_mm":"","rcc_size_mm":"","depth_mm":0,"pcc_thickness_mm":150,"main_bars_x":"","main_bars_y":"","qty":0,"pedestal_size_mm":"","source":"drawing-schedule|not legible"}],
-  "base_plate_schedule": [{"column_mark":"","plate_size_mm":"","anchor_bolt_nos":0,"anchor_bolt_dia_mm":0,"source":"drawing-schedule|not legible"}],
-  "section_details": {"footing_depth_mm":0,"pedestal_height_mm":0,"pcc_thickness_mm":150,"cover_mm":50},
-  "grid_info": {"typical_bay_m":0,"total_columns_plan":0,"braced_bay_grids":[]},
-  "boq": [{"sr":1,"part":"PART A","description":"","unit":"","qty":0,"rate":0,"amount":0,"source":"drawing-schedule|calculated","confidence":"high|medium|low","calc_note":""}],
-  "cost_summary": {"civil_total_inr":0,"civil_total_lacs":0},
-  "observations": [],
-  "not_legible_fields": []
-}`;
-
-  if (contextText) {
-    parts.push({
-      type: 'text',
-      text: `\n\nCRITICAL INSTRUCTION — READ THIS FIRST:\nThe following is MACHINE-EXTRACTED TEXT directly from the drawing file using PyMuPDF/GCV.\nThis is 100% accurate — every character below was PRINTED on the drawing.\nYOU MUST use ONLY this extracted text for all schedule tables, dimensions, and values.\nDO NOT use vision/image reading. DO NOT guess or assume any value not present below.\nIf a value is not in this text → write "not found in drawing".\n\n${contextText}\n\nEND OF EXTRACTED TEXT.\nReminder: Use ONLY the values above.\n${strictScheduleRules}`
-    });
-  } else {
-    // No text extracted — warn Claude but still give full schema
-    parts.push({
-      type: 'text',
-      text: `\n\nWARNING: Text extraction from this drawing FAILED (scanned/rasterized PDF).\nYou are viewing PNG images of the drawing above.\nFor ANY value you cannot clearly read from the image → write "not legible — original DWG file required".\nDO NOT assume, estimate, or invent any dimension, bar count, footing size, or quantity.\nOnly report values you can read with 100% certainty from the image.\n${strictScheduleRules}`
-    });
-  }
-
-  return parts;
+  return { parts, scheduleFirst: local, combinedText, needsVision: needVision };
 }
 
 // ─── DIRECT CLAUDE CHAT ROUTE (no Gemini wrapper) ────────────────
@@ -453,9 +428,22 @@ app.post('/claude', async (req, res) => {
     const { system, messages, max_tokens } = req.body;
     if (!messages?.length) return res.status(400).json({ error: 'No messages.' });
     const systemToUse = (system && system.trim().length > 50) ? system : CIVIL_SYSTEM;
+    const maxTokens = Math.min(Number(max_tokens) || 4096, 4096);
 
-    // ── PDF DRAWING FIX: Replace PDF with visual tiles + extracted text ──
+    let scheduleBundle = null;
     const processedMessages = [];
+    // Pull last user text question for local Q&A routing
+    let userQuestion = '';
+    for (const msg of messages) {
+      if (!Array.isArray(msg.content)) {
+        if (msg.role === 'user' && typeof msg.content === 'string') userQuestion = msg.content;
+        continue;
+      }
+      for (const part of msg.content) {
+        if (part.type === 'text' && part.text) userQuestion = part.text;
+      }
+    }
+
     for (const msg of messages) {
       if (!Array.isArray(msg.content)) { processedMessages.push(msg); continue; }
 
@@ -463,58 +451,49 @@ app.post('/claude', async (req, res) => {
       for (const part of msg.content) {
         if (part.type === 'document' && part.source?.media_type === 'application/pdf') {
           const pdfB64 = part.source.data;
-          console.log('[/claude] PDF detected — building drawing context (GCV + PyMuPDF + tiles)');
+          console.log('[/claude] PDF — local CAD-zoom + multi-type study (tokens only if needed)');
           try {
-            const drawingParts = await buildDrawingContext(pdfB64);
-            newParts.push(...drawingParts);
+            const ctx = await buildDrawingContext(pdfB64, { question: userQuestion, filename: 'upload.pdf' });
+            scheduleBundle = ctx.scheduleFirst;
+            newParts.push(...ctx.parts);
           } catch (e) {
             console.error('[/claude] Drawing context build failed:', e.message);
             newParts.push(part);
           }
         } else if (part.type === 'image' && part.source?.type === 'base64') {
-          // BUG FIX: Image drawings (PNG/JPG) were going directly to Claude without GCV OCR
-          // Now: run GCV image OCR first, inject text, then send image as fallback
           const imgB64 = part.source.data;
-          const imgMime = part.source.media_type || 'image/png';
-          console.log('[/claude] Image drawing — running GCV OCR...');
+          console.log('[/claude] Image — local CAD-zoom OCR first');
           try {
-            const gcvKey = process.env.GOOGLE_CLOUD_VISION_API_KEY;
-            if (gcvKey) {
-              const gcvRes = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${gcvKey}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ requests: [{ image: { content: imgB64 }, features: [{ type: 'DOCUMENT_TEXT_DETECTION' }] }] }),
-                signal: AbortSignal.timeout(30000)
-              });
-              if (gcvRes.ok) {
-                const gcvData = await gcvRes.json();
-                const ocrText = gcvData.responses?.[0]?.fullTextAnnotation?.text || '';
-                if (ocrText.trim().length > 50) {
-                  console.log(`[/claude] GCV image OCR: ${ocrText.length} chars extracted`);
-                  newParts.push({
-                    type: 'text',
-                    text: `CRITICAL INSTRUCTION: Use ONLY this GCV-extracted text for all values. DO NOT guess from image.
-
-=== IMAGE OCR TEXT ===
-${ocrText}
-=== END OCR TEXT ===
-If a value is not above → write "not found in drawing".`
-                  });
-                  // Still send image but OCR text takes priority
-                  newParts.push(part);
-                } else {
-                  // OCR got nothing — send image with warning
-                  newParts.push(part);
-                  newParts.push({ type: 'text', text: 'WARNING: OCR extracted no text from this image. Only report values you can read with 100% certainty. Anything unclear → "not legible".' });
+            let ocrText = '';
+            try {
+              const zoom = runCadZoomOcrFromBase64(imgB64, part.source.media_type || 'image/png');
+              if (zoom?.success) ocrText = zoom.full_text || '';
+            } catch (_) {}
+            if (!ocrText || ocrText.length < 40) {
+              const gcvKey = process.env.GOOGLE_CLOUD_VISION_API_KEY;
+              if (gcvKey) {
+                const gcvRes = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${gcvKey}`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ requests: [{ image: { content: imgB64 }, features: [{ type: 'DOCUMENT_TEXT_DETECTION' }] }] }),
+                  signal: AbortSignal.timeout(30000)
+                });
+                if (gcvRes.ok) {
+                  const gcvData = await gcvRes.json();
+                  ocrText = gcvData.responses?.[0]?.fullTextAnnotation?.text || '';
                 }
-              } else {
-                newParts.push(part);
               }
+            }
+            if (ocrText.trim().length > 40) {
+              scheduleBundle = runScheduleFirstLocal(ocrText, { filename: 'upload.png', question: userQuestion });
+              newParts.push({ type: 'text', text: scheduleBundle.markdown });
+              if (scheduleBundle.needsClaude && scheduleBundle.needsVision) newParts.push(part);
             } else {
               newParts.push(part);
+              newParts.push({ type: 'text', text: 'WARNING: Local OCR got little text. Read only what is clearly visible. Never invent schedule qty.' });
             }
           } catch (e) {
-            console.error('[/claude] Image GCV failed:', e.message);
+            console.error('[/claude] Image OCR failed:', e.message);
             newParts.push(part);
           }
         } else {
@@ -524,9 +503,58 @@ If a value is not above → write "not found in drawing".`
       processedMessages.push({ ...msg, content: newParts });
     }
 
-    const raw = await callClaudeAPI({ system: systemToUse, messages: processedMessages, maxTokens: max_tokens || 8192 });
-    try { learnRatesFromMarkdown(raw, { filename: 'chat', drawing_type: 'GENERAL' }); } catch(e) {}
-    return res.json({ content: [{ type: 'text', text: raw }] });
+    // Fast path: local multi-type Q&A — NEVER invent; ask user if unclear
+    if (scheduleBundle?.answeredLocally && scheduleBundle.markdown) {
+      // If we need user answers, do NOT call Claude (saves tokens + prevents guessing)
+      if (scheduleBundle.needsUserInput) {
+        console.log('[/claude] Asking user — ZERO Claude tokens (no assumptions)');
+        return res.json({
+          content: [{ type: 'text', text: scheduleBundle.markdown }],
+          schedule_first: {
+            quality: scheduleBundle.extracted?.quality,
+            rows: scheduleBundle.extracted?.total_schedule_rows,
+            drawing_type: scheduleBundle.typeInfo?.drawing_type,
+            mode: 'ask-user',
+            tokens: 0,
+            needs_user_input: true,
+            questions: scheduleBundle.clarifications?.questions || [],
+          },
+        });
+      }
+
+      console.log('[/claude] Local-only short-circuit — ZERO Claude tokens');
+      try {
+        learnRatesFromMarkdown(scheduleBundle.markdown, {
+          filename: 'chat',
+          drawing_type: scheduleBundle.typeInfo?.drawing_type || scheduleBundle.boqResult?.drawing_type,
+        });
+      } catch (e) {}
+      return res.json({
+        content: [{ type: 'text', text: scheduleBundle.markdown }],
+        schedule_first: {
+          quality: scheduleBundle.extracted?.quality,
+          rows: scheduleBundle.extracted?.total_schedule_rows,
+          drawing_type: scheduleBundle.typeInfo?.drawing_type,
+          boq_items: scheduleBundle.boqResult?.boq?.length || 0,
+          mode: 'local-only',
+          tokens: 0,
+          needs_user_input: false,
+        },
+      });
+    }
+
+    // Weak extract: ONE Claude call with already-capped parts (few/no images)
+    const raw = await callClaudeAPI({ system: systemToUse, messages: processedMessages, maxTokens });
+    try { learnRatesFromMarkdown(raw, { filename: 'chat', drawing_type: scheduleBundle?.typeInfo?.drawing_type || 'GENERAL' }); } catch (e) {}
+    return res.json({
+      content: [{ type: 'text', text: raw }],
+      schedule_first: scheduleBundle ? {
+        quality: scheduleBundle.extracted?.quality,
+        rows: scheduleBundle.extracted?.total_schedule_rows,
+        drawing_type: scheduleBundle.typeInfo?.drawing_type,
+        mode: 'claude-assisted',
+      } : { mode: 'claude-only' },
+    });
   } catch (e) {
     console.error('[/claude]', e.message);
     return res.status(500).json({ error: e.message });
@@ -552,11 +580,10 @@ app.post('/gemini', async (req, res) => {
         } else if (part.inline_data) {
           const mt = part.inline_data.mime_type;
           if (mt === 'application/pdf') {
-            // Use unified drawing context builder (images + extracted text)
-            console.log('[/gemini] PDF — using buildDrawingContext');
+            console.log('[/gemini] PDF — schedule-first buildDrawingContext');
             try {
-              const drawingParts = await buildDrawingContext(part.inline_data.data);
-              claudeParts.push(...drawingParts);
+              const ctx = await buildDrawingContext(part.inline_data.data);
+              claudeParts.push(...ctx.parts);
             } catch (e) {
               console.error('[/gemini] buildDrawingContext failed:', e.message);
               claudeParts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: part.inline_data.data } });
@@ -973,50 +1000,56 @@ app.post('/export-drawing', async (req, res) => {
       catch(e) { console.log('CV skipped:', e.message); }
     }
 
-    // Step 2: Build drawing context — images + extracted text (replaces complex PDF pipeline)
-    // Uses buildDrawingContext() which: extracts vector text, renders quadrant tiles, adds GCV if scanned
+    // Step 2: Schedule-first from PDF text (Civils.ai-style)
+    let drawingData = null;
     const pdfFiles = (files||[]).filter(f => f.type === 'application/pdf' || f.name?.match(/\.pdf$/i));
     if (pdfFiles.length > 0) {
       try {
-        const drawingParts = await buildDrawingContext(pdfFiles[0].b64);
-        // Extract PNG tiles from drawingParts and add to files array for geminiAnalyzeDrawing
-        const pdfIdx = files.findIndex(f => f.type === 'application/pdf' || f.name?.match(/\.pdf$/i));
-        if (pdfIdx >= 0) files.splice(pdfIdx, 1);
-        let tileCount = 0;
-        for (const part of drawingParts) {
-          if (part.type === 'image' && part.source?.type === 'base64') {
-            files.push({ type: 'image/png', b64: part.source.data, name: `pdf_tile_${++tileCount}.png` });
-          }
-          // Extract the text context and add to cvData
-          // FIX: Previously only set for 'MACHINE-EXTRACTED TEXT' — scanned PDFs use
-          // 'WARNING:' text part with Tesseract OCR data embedded → was never passed to
-          // geminiAnalyzeDrawing(), so scanned drawings got 0 context. Now capture ALL text parts.
-          if (part.type === 'text' && part.text?.length > 50) {
-            cvData.drawing_context_text = (cvData.drawing_context_text || '') + '\n' + part.text;
+        const ctx = await buildDrawingContext(pdfFiles[0].b64);
+        cvData.drawing_context_text = ctx.combinedText || '';
+        cvData.schedule_first = ctx.scheduleFirst;
+        if (ctx.scheduleFirst?.boqResult?.boq?.length) {
+          drawingData = {
+            ...ctx.scheduleFirst.boqResult,
+            elements: (ctx.scheduleFirst.boqResult.boq || []).map((item, i) => ({
+              id: `E${String(i + 1).padStart(3, '0')}`,
+              type: 'STRUCTURE',
+              name: item.description,
+              quantities: { volume_cum: item.unit === 'cum' ? item.qty : 0, steel_kg: item.unit === 'kg' ? item.qty : 0 },
+              cost_inr: { total: item.amount || 0, per_unit: item.rate || 0 },
+              confidence: item.confidence,
+              annotation_found: item.source,
+            })),
+            prepared_by: 'PMC Civil AI — Schedule-first Pipeline',
+          };
+          console.log(`[export-drawing] Schedule-first BOQ: ${drawingData.boq.length} items`);
+        }
+        // Only keep overview image(s) if schedules were weak
+        if (ctx.needsVision) {
+          let tileCount = 0;
+          for (const part of ctx.parts) {
+            if (part.type === 'image' && part.source?.type === 'base64' && tileCount < 2) {
+              files.push({ type: 'image/png', b64: part.source.data, name: `pdf_tile_${++tileCount}.png` });
+            }
           }
         }
-        console.log(`[export-drawing] PDF → ${tileCount} tiles via buildDrawingContext`);
-      } catch(e) {
-        console.warn('[export-drawing] buildDrawingContext failed:', e.message);
+      } catch (e) {
+        console.warn('[export-drawing] schedule-first failed:', e.message);
       }
     }
 
-    // Step 2b: Single-call Claude analysis (was 4-phase, now 1 call)
-    let drawingData = null;
-    if (files?.length > 0) {
+    // Step 2b: Fallback — text-only Claude analyzer (no 5-phase vision)
+    if (!drawingData && files?.length > 0) {
       drawingData = await geminiAnalyzeDrawing(key, files, cvData, fetch);
     }
 
-    // Step 3: Fallback to text-based extraction if needed
     if (!drawingData) {
       drawingData = await extractDrawingData(key, files, userText, aiResponse, fetch);
     }
 
-    // Add CV metadata to drawing data
     drawingData.cv_analysis = cvData;
-    drawingData.prepared_by = 'PMC Civil AI Agent';
+    drawingData.prepared_by = drawingData.prepared_by || 'PMC Civil AI Agent';
 
-    // Step 4: Build multi-sheet Excel
     const wb = await buildDrawingExcel(drawingData);
     const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
     const pname = (drawingData.project_name||'Drawing').replace(/[^a-zA-Z0-9_]/g,'_').slice(0,20);
@@ -1195,7 +1228,7 @@ app.post('/update-area-from-dxf', async (req, res) => {
     if (!totalAreaSqft || totalAreaSqft <= 0)
       return res.status(400).json({ error: 'No closed polylines found in DXF. Area calculate nahi hui.' });
 
-    const estimatePath = path.join(__dirname, 'data', 'templates', 'UPDATED-OVERALL-ESTIMATE-MODESTAA-10.04.2026.xlsx');
+    const estimatePath = dataPath('templates', 'UPDATED-OVERALL-ESTIMATE-MODESTAA-10.04.2026.xlsx');
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.readFile(estimatePath);
 
@@ -1251,7 +1284,7 @@ app.post('/fill-template-from-drawing', async (req, res) => {
 
     // ── HIGH-RISE: use MODESTAA template, fill only drawing-derived cells ──
     if (ptype === 'high_rise_residential') {
-      const estimatePath = path.join(__dirname, 'data', 'templates', 'UPDATED-OVERALL-ESTIMATE-MODESTAA-10.04.2026.xlsx');
+      const estimatePath = dataPath('templates', 'UPDATED-OVERALL-ESTIMATE-MODESTAA-10.04.2026.xlsx');
       const wb = new ExcelJS.Workbook();
       await wb.xlsx.readFile(estimatePath);
 
@@ -1439,7 +1472,7 @@ app.post('/analyze-dwg', async (req, res) => {
       try {
         const outDir = path.dirname(converterResult.png_path);
         const baseName = path.basename(converterResult.png_path, path.extname(converterResult.png_path));
-        const tileScript = path.join(__dirname, 'scripts', 'tile_only.py');
+        const tileScript = scriptsPath('tile_only.py');
         const py = process.env.PMC_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
         const tout = execSync(
           `${py} "${tileScript}" "${converterResult.png_path}" "${outDir}" "${baseName}"`,
@@ -1452,133 +1485,99 @@ app.post('/analyze-dwg', async (req, res) => {
       }
     }
 
-    // Collect all PNG tiles: main + detail tiles + additional layout sheets
+    // Schedule-first from converter text; images only if schedules weak (token save)
+    const textSummary = (converterResult.texts || []).map(t => t.text).slice(0, 2000).join('\n');
+    const dimSummary  = (converterResult.dimensions || [])
+      .filter(d => d.value).map(d => `${d.value}${d.text ? ' ('+d.text+')' : ''}`).slice(0, 500).join(', ');
+    const layers = (converterResult.layers || []).join(', ');
+    const dwgText = [textSummary, dimSummary, layers].filter(Boolean).join('\n');
+    const scheduleBundle = runScheduleFirstLocal(dwgText, {
+      filename: filename || 'drawing.dwg',
+      question: 'study drawing: identify type, levels, schedules, tables',
+      hints: [],
+    });
+    console.log(`[DWG] type=${scheduleBundle.typeInfo?.drawing_type} schedule=${scheduleBundle.extracted.quality} rows=${scheduleBundle.extracted.total_schedule_rows} localQA=${!!scheduleBundle.answeredLocally}`);
+
     const parts = [];
+    // Always keep overview PNG
     if (converterResult.png_path && fs.existsSync(converterResult.png_path)) {
       const pngB64 = fs.readFileSync(converterResult.png_path).toString('base64');
-      parts.push({ inline_data: { mime_type: 'image/png', data: pngB64 } });
+      if (scheduleBundle.needsVision || useDetail) {
+        parts.push({ inline_data: { mime_type: 'image/png', data: pngB64 } });
+      }
     }
-    // FIXED: was gated behind `useDetail`, so even when tiles were generated
-    // they were thrown away and never sent to Claude unless "detail mode"
-    // was on. Tiles are now always generated (see dwg_converter.py) and
-    // always sent.
-    if (Array.isArray(converterResult.tiles)) {
+    // Cap detail tiles to 2 when vision needed
+    let tileKept = 0;
+    if ((scheduleBundle.needsVision || useDetail) && Array.isArray(converterResult.tiles)) {
       for (const t of converterResult.tiles) {
-
+        if (tileKept >= 2) {
+          try { if (t.path) fs.unlinkSync(t.path); } catch (e) {}
+          continue;
+        }
         if (t.path && fs.existsSync(t.path)) {
           try {
             const tb = fs.readFileSync(t.path).toString('base64');
             parts.push({ inline_data: { mime_type: 'image/png', data: tb } });
+            tileKept++;
             try { fs.unlinkSync(t.path); } catch (e) {}
-          } catch (e) { /* skip bad tile */ }
+          } catch (e) { /* skip */ }
         }
       }
-    }
-    // NEW: Add additional layout/sheet images (multi-sheet support)
-    for (const li of (converterResult.layout_images || [])) {
-      if (li.path && fs.existsSync(li.path) && li.path !== converterResult.png_path) {
-        try {
-          const lb = fs.readFileSync(li.path).toString('base64');
-          parts.push({ inline_data: { mime_type: 'image/png', data: lb } });
-          try { fs.unlinkSync(li.path); } catch (e) {}
-        } catch (e) { /* skip */ }
+    } else if (Array.isArray(converterResult.tiles)) {
+      for (const t of converterResult.tiles) {
+        try { if (t.path) fs.unlinkSync(t.path); } catch (e) {}
       }
+    }
+    for (const li of (converterResult.layout_images || [])) {
+      try { if (li.path && li.path !== converterResult.png_path) fs.unlinkSync(li.path); } catch (e) {}
     }
     if (converterResult.png_path) {
       try { fs.unlinkSync(converterResult.png_path); } catch (e) {}
     }
 
-    const nDetailTiles = (converterResult.tiles || []).length;
-    const visionHeader = nDetailTiles
-      ? `MULTI-IMAGE INPUT: The ${1 + nDetailTiles} images above are ALL of the SAME single drawing sheet — image 1 is a full-sheet overview, the rest are high-resolution overlapping crops (~6% overlap between adjacent tiles) provided ONLY to make small text/schedule numbers legible.\n` +
-        `RULES:\n` +
-        `1. Because tiles overlap, the same column mark, table row, or dimension may appear in more than one image — NEVER count or list it twice.\n` +
-        `2. For any quantity/count (columns, footings, etc.) use the schedule table's QTY column or a de-duplicated list of unique marks — NOT how many times something appears across tiles.\n` +
-        `3. If a schedule table's rows are split across two adjacent tiles, merge into ONE table using column headers as the guide — do not duplicate rows.\n` +
-        `4. Use the overview for overall structure (how many tables/rows exist); use the zoomed tiles only to read exact digits in those cells.\n\n`
-      : (parts.length > 0
-        ? 'SINGLE-IMAGE INPUT: The drawing render is above this text. Read like CAD: title block, legend, dimensions, hatches, symbols, notes.\n\n'
-        : '');
+    let analysisRaw = null;
 
-    // Always include extracted text + dimension data
-    const textSummary = (converterResult.texts || []).map(t => t.text).slice(0, 500).join(' | ');
-    const dimSummary  = (converterResult.dimensions || [])
-      .filter(d => d.value).map(d => `${d.value}${d.text ? ' ('+d.text+')' : ''}`).slice(0, 1000).join(', ');
-    const layers = (converterResult.layers || []).join(', ');
-
-    const prompt = `${visionHeader}You are a SENIOR PMC CIVIL ENGINEER with 20 years India experience analyzing an AutoCAD drawing.
-(Use every image in this user message, if any, together with the extracted text list below.)
-
-FILE: ${filename}
-LAYERS FOUND: ${layers || 'See image'}
-ALL TEXT IN DRAWING: ${textSummary || 'See image'}
-DIMENSIONS FOUND: ${dimSummary || 'See image'}
-${converterResult.error ? 'Render note: ' + converterResult.error : ''}
-
-══════════════════════════════════════════════════════
-STEP 1 — READ LEGEND / SYMBOL TABLE FROM DRAWING
-══════════════════════════════════════════════════════
-Every drawing has a legend box. Find it and read:
-- Each symbol/hatch pattern and its label (e.g. "230MM THK. BRICK WALL", "100MM BLOCK WALL", "RCC PARDI")
-- Map each hatch/color/pattern to its material meaning
-- Note which AutoCAD LAYER corresponds to each element type
-- If no legend, infer from layer names (e.g. "AR-HATCH 230 MM BRICK WALL" = 230mm brick wall)
-
-══════════════════════════════════════════════════════
-STEP 2 — READ TITLE BLOCK
-══════════════════════════════════════════════════════
-Project name, drawing number, scale, date, architect/engineer.
-If not visible: write "Not shown in drawing" — do NOT invent.
-
-══════════════════════════════════════════════════════
-STEP 3 — IDENTIFY DRAWING TYPE & READ ALL FLOOR LEVELS
-══════════════════════════════════════════════════════
-Drawing type: SECTION / ELEVATION / FLOOR_PLAN / STRUCTURAL / SITE_PLAN / FOUNDATION
-Read every floor level annotation (e.g. "+7590 MM LEVEL", "THIRD BASEMENT LEVEL").
-Calculate floor heights between consecutive levels.
-
-══════════════════════════════════════════════════════
-STEP 4 — EXTRACT QUANTITIES BASED ON WHAT YOU SEE
-══════════════════════════════════════════════════════
-Use the legend you read in Step 1 to identify elements.
-For SECTION drawing: wall lengths × thickness × floor height = volume
-For FLOOR PLAN: room areas, wall lengths, openings count
-For STRUCTURAL: column sizes, beam dimensions, slab thickness
-For SITE/ROAD: road lengths × widths
-
-Calculate:
-| Element | Nos | Length (m) | Width/Thk (m) | Height (m) | Qty | Unit |
-
-══════════════════════════════════════════════════════
-STEP 5 — BOQ WITH GUJARAT DSR 2025 RATES (+ PMC LEARNED RATES)
-══════════════════════════════════════════════════════
-${getRatesSummary({ maxItems: 35 })}
-
-══════════════════════════════════════════════════════
-STEP 6 — PMC OBSERVATIONS
-══════════════════════════════════════════════════════
-IS code compliance, design comments, missing information, recommendations.
-
-CRITICAL RULES:
-- Read from drawing — do NOT invent values not visible
-- If something not visible: state "Not shown in drawing"  
-- Date = today's actual date, not from drawing unless shown
-- Work floor by floor if it's a section/multi-floor drawing`;
-
-    parts.push({ text: prompt });
-
-    // ✅ FIX: Claude Vision replaces Gemini for DWG analysis (ZWCAD compatible)
-    const pngTiles = [];
-    for (const p of parts.filter(p => p.inline_data?.mime_type === 'image/png')) {
-      pngTiles.push(p.inline_data.data);
-    }
-    let analysisRaw;
-    try {
-      analysisRaw = await claudeAnalyzeDWGVision(pngTiles, converterResult, filename);
-      console.log('[DWG] Claude vision analysis done');
-    } catch(e) {
-      console.error('Claude DWG analysis fail:', e.message);
-      analysisRaw = null;
+    // Fast path: local multi-type Q&A — skip Claude vision when possible
+    if (scheduleBundle.answeredLocally && !scheduleBundle.needsClaude) {
+      console.log('[DWG] Local Q&A short-circuit — ZERO Claude vision tokens');
+      analysisRaw = {
+        ...(scheduleBundle.boqResult || {}),
+        drawing_type: scheduleBundle.typeInfo?.drawing_type,
+        column_schedule: (scheduleBundle.boqResult?.schedule_data?.columns || []).map(c => ({
+          col_mark: c.mark, size_mm: c.size_mm, main_bars: c.main_bars, stirrups: c.stirrups, qty: c.qty, source: c.source,
+        })),
+        footing_schedule: (scheduleBundle.boqResult?.schedule_data?.footings || []).map(f => ({
+          footing_mark: f.mark, pcc_size_mm: f.pcc_size_mm, rcc_size_mm: f.rcc_size_mm,
+          depth_mm: f.depth_mm, main_bars_x: f.main_bars_x, main_bars_y: f.main_bars_y, qty: f.qty, source: f.source,
+        })),
+        _markdown: scheduleBundle.markdown,
+      };
+    } else if (!parts.length && scheduleBundle.markdown) {
+      // DWG binary-only (no PNG): return local study + tip to export PDF/DXF for zoom OCR
+      analysisRaw = {
+        ...(scheduleBundle.boqResult || {}),
+        drawing_type: scheduleBundle.typeInfo?.drawing_type || 'GENERAL_DRAWING',
+        _markdown: `${scheduleBundle.markdown}\n\n> **Note:** Native DWG did not render to PNG on this server. For AutoCAD-like zoom reading of tables/sections, export from ZWCAD/AutoCAD as **PDF or DXF** and re-upload.`,
+      };
+    } else {
+      const pngTiles = parts.filter(p => p.inline_data?.mime_type === 'image/png').map(p => p.inline_data.data);
+      try {
+        if (pngTiles.length) {
+          analysisRaw = await claudeAnalyzeDWGVision(pngTiles.slice(0, 3), {
+            ...converterResult,
+            texts: converterResult.texts,
+            _schedule_markdown: scheduleBundle.markdown,
+          }, filename);
+          console.log('[DWG] Claude vision (capped tiles) done');
+        } else {
+          analysisRaw = scheduleBundle.boqResult;
+          analysisRaw._markdown = scheduleBundle.markdown;
+        }
+      } catch (e) {
+        console.error('Claude DWG analysis fail:', e.message);
+        analysisRaw = scheduleBundle.boqResult;
+        if (analysisRaw) analysisRaw._markdown = scheduleBundle.markdown;
+      }
     }
 
     // FIX: claudeAnalyzeDWGVision returns parsed JSON object (via parseJSON).
@@ -1684,27 +1683,26 @@ CRITICAL RULES:
       return lines.join('\n');
     }
 
-    const analysisMarkdown = analysisRaw ? boqToMarkdown(analysisRaw) : null;
+    const analysisMarkdown = analysisRaw?._markdown
+      || (analysisRaw ? boqToMarkdown(analysisRaw) : null)
+      || scheduleBundle.markdown;
 
     const fallbackAnalysis =
       `## DWG/DXF File: ${filename}\n\n` +
-      `**PNG rendered:** ${converterResult.png_path ? "Yes" : "No"}\n` +
+      `**Schedule quality:** ${scheduleBundle.extracted.quality}\n` +
       `**Layers:** ${layers || "none"}\n` +
-      `**Texts found:** ${(converterResult.texts||[]).length}\n` +
-      `**Dimensions found:** ${(converterResult.dimensions||[]).length}\n\n` +
-      (textSummary ? `**Annotations:**\n${textSummary}\n` : "") +
-      (dimSummary ? `**Dimensions:**\n${dimSummary}\n` : "") +
-      "\n> ZWCAD/AutoCAD DWG analyzed by Claude Vision AI.";
+      `**Texts found:** ${(converterResult.texts||[]).length}\n\n` +
+      scheduleBundle.markdown +
+      "\n> Schedule-first DWG pipeline (Civils.ai-style).";
 
     // Cleanup temp input
     try { fs.unlinkSync(tmpIn); } catch(e) {}
 
-    // ── Auto-learn rates from markdown analysis ──────
     if (analysisMarkdown) {
       try {
         const learnedCount = learnRatesFromMarkdown(analysisMarkdown, {
           filename,
-          drawing_type: converterResult.drawing_type || 'UNKNOWN',
+          drawing_type: converterResult.drawing_type || scheduleBundle.boqResult?.drawing_type || 'UNKNOWN',
         });
         if (learnedCount > 0) console.log(`[rate_store] Learned ${learnedCount} rates from DWG`);
       } catch (e) { console.warn('[rate_store] learn failed:', e.message); }
@@ -1713,10 +1711,15 @@ CRITICAL RULES:
     res.json({
       success: true,
       analysis: analysisMarkdown || fallbackAnalysis,
-      structured: analysisRaw || null,   // raw JSON for Excel export
+      structured: analysisRaw || scheduleBundle.boqResult || null,
       converter: converterResult,
       detailMode: useDetail,
-      quadrantTiles: nDetailTiles,
+      quadrantTiles: tileKept,
+      schedule_first: {
+        quality: scheduleBundle.extracted.quality,
+        rows: scheduleBundle.extracted.total_schedule_rows,
+        mode: scheduleBundle.needsVision ? 'vision-assisted' : 'local',
+      },
       ai_engine: 'Claude Vision (ZWCAD compatible)',
     });
   } catch (err) {
@@ -1980,7 +1983,7 @@ Generate complete BOQ. Return ONLY raw JSON:
 app.get('/rates-stats', (req, res) => {
   try {
     const stats = getLearnedRateStats();
-    const baseCount = Object.keys(require('./rate_store').loadBaseRates()).length;
+    const baseCount = Object.keys(require('./lib/rate_store').loadBaseRates()).length;
     res.json({ ...stats, base_dsr_items: baseCount, message: 'PMC Rate Store stats' });
   } catch(e) {
     res.status(500).json({ error: e.message });
@@ -1994,9 +1997,9 @@ app.get('/health', (req, res) => {
     status: 'ok',
     claude_key_set: !!claudeKey,
     claude_preview: claudeKey ? claudeKey.slice(0, 12) + '...' : 'NOT SET ❌',
-    migration: '12/12 routes on Claude — 100% complete',
-    routes: ['/gemini','/export-excel','/export-pdf','/export-drawing','/analyze-dxf','/export-dxf-excel','/drawing-to-excel','/update-area-from-dxf','/fill-template-from-drawing','/analyze-dwg','/classify-dxf','/analyze-with-answers','/rates-stats'],
-    dwg_support: 'ZWCAD + AutoCAD via Claude Vision'
+    pipeline: 'local-first multi-type (CAD-zoom OCR → type detect → Q&A/BOQ; Claude only if needed)',
+    routes: ['/claude','/gemini','/export-excel','/export-pdf','/export-drawing','/analyze-dxf','/export-dxf-excel','/drawing-to-excel','/update-area-from-dxf','/fill-template-from-drawing','/analyze-dwg','/classify-dxf','/analyze-with-answers','/rates-stats'],
+    dwg_support: 'ZWCAD + AutoCAD — schedule-first + capped vision'
   });
 });
 
@@ -2007,6 +2010,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n✅ PMC Civil AI Agent on port ${PORT}`);
   console.log(`🔑 CLAUDE_API_KEY: ${process.env.CLAUDE_API_KEY ? 'SET ✅' : 'NOT SET ❌'}`);
-  console.log('✅ ALL 12 ROUTES: 100% Claude — zero Gemini dependencies');
-  console.log('🏗️  ZWCAD .dwg support: via Claude Vision (99%+ accuracy)');
+  console.log('✅ Local-first: CAD-zoom OCR → drawing type → Q&A/BOQ (Claude only if needed)');
+  console.log('🏗️  PDF/DXF/DWG/ZWCAD: multi-type sheets (section, footing, plan, elevation…)');
 });

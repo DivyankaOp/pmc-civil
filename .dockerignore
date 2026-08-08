@@ -9,16 +9,9 @@ npm-debug.log
 Thumbs.db
 test_estimate.xlsx
 t.xlsx
-# Exclude stray dwg/dxf dumps but keep the MODESTAA template xlsx.
 *.dwg
 *.dxf
-# Exclude only the original space-named template; the hyphenated one (used at runtime) is kept.
+pmc-civil-main (1)
 UPDATED OVERALL ESTIMATE MODESTAA 10.04.2026.xlsx
-
-test_estimate.xlsx
-t.xlsx
-# Exclude stray dwg/dxf dumps but keep the MODESTAA template xlsx.
-*.dwg
-*.dxf
-# Exclude only the original space-named template; the hyphenated one (used at runtime) is kept.
-UPDATED OVERALL ESTIMATE MODESTAA 10.04.2026.xlsx
+data/rates-learned.json
+data/user_questions.txt

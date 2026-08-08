@@ -1,0 +1,22 @@
+node_modules/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db
+test_estimate.xlsx
+t.xlsx
+*.dwg
+*.dxf
+data/rates-learned.json
+data/user_questions.txt
+UPDATED OVERALL ESTIMATE MODESTAA 10.04.2026.xlsx
+
+# Local OCR/render dumps (large; regenerate as needed)
+data/fixtures/bhagyeshree/
+data/fixtures/b_sections/
+data/fixtures/bhagyeshree_extract.txt
+
+# Old nested zip extract
+pmc-civil-main (1)/
