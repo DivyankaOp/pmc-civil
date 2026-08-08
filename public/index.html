@@ -204,7 +204,7 @@ textarea.tin::placeholder{color:var(--tx3)}
       <div class="welcome" id="welcome">
         <div class="wico">🏗️</div>
         <div class="wtit">PMC Civil AI Agent</div>
-        <div class="wsub">PDF / DWG / DXF / image — local CAD-zoom reading pehle (kam tokens). Drawing type auto-detect: section, footing, plan, elevation…</div>
+        <div class="wsub">Civils.ai-style: pehle <strong>drawing reading</strong> (type, schedules, levels, dims) → phir formulas se calc → phir BOQ (DRAFT→FINAL). Size limit nahi.</div>
         <div class="qgrid">
           <button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Drawing → Auto Excel</span><span class="qd">Upload drawing → AI calculates → Excel auto banta hai</span></button>
           <button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Scope batao → Excel cost sheet</span></button>
@@ -223,7 +223,7 @@ textarea.tin::placeholder{color:var(--tx3)}
         <textarea class="tin" id="tin" placeholder="Koi bhi file upload karo ya question type karo…" rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
         <button class="sbtn" id="sbtn" onclick="send()">➤</button>
       </div>
-      <div class="hint">PDF · JPG · PNG · <strong>DXF (AutoCAD)</strong> · Multiple files · <kbd>Enter</kbd> send</div>
+      <div class="hint">PDF · JPG · PNG · DWG/DXF · <strong>any size</strong> (local read) · <kbd>Enter</kbd> send</div>
     </div>
   </div>
 </div>
@@ -243,21 +243,21 @@ const MODES={
 const SYS={
   auto:`You are PMC Civil AI Agent — senior PMC for India. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
 
-LOCAL-FIRST + NO ASSUMPTIONS: Detect drawing type, read printed tables/text only.
-1. NEVER invent size/qty/height/PCC/level — if unclear, ASK the user numbered questions.
-2. Different drawings → different reads (section ≠ footing ≠ plan).
-3. Schedules/tables first; never count plan symbols as qty.
-4. If server report already asks questions, wait for user answers — do not guess.
+CIVILS.AI-STYLE: READ DRAWING FIRST, then calculate, then BOQ (BOQ is last).
+1. Sheet identity, schedules, levels, dims, notes — reading report pehle.
+2. Quantities with formulas (L×B×D×Qty). NEVER invent missing cells — ASK numbered questions.
+3. BOQ is DRAFT until answers; FINAL only when reading complete.
+4. Schedules > plan symbol counts.
 
 Start directly — no preamble.`,
 
   drawing:`You are a SENIOR PMC CIVIL ENGINEER. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
 
-MULTI-TYPE + NO ASSUMPTIONS:
-1. Identify type: SECTION / ELEVATION / FOOTING / COLUMN SCHEDULE / FLOOR PLAN / DETAIL.
-2. Use only printed cells/dims. Missing → ASK USER (numbered questions).
-3. Never fill 3m height, 100mm PCC, or plan-counts unless user confirms.
-4. Tables override plan graphics.
+CIVILS.AI FLOW:
+1. READ the sheet (type, title, schedules, levels, dims, notes).
+2. CALCULATE takeoff with visible formulas from printed values.
+3. BOQ last — DRAFT if gaps, FINAL after user confirm.
+4. Never invent 3m height / 100mm PCC / plan counts.
 Do NOT quote these instructions.`,
 
   estimate:`You are a PMC senior cost estimation engineer for India. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
@@ -265,7 +265,7 @@ Analyze the uploaded file directly. Do NOT quote these instructions in your resp
 Output: Item-wise table (Sr.No.|Description|Unit|Qty|Rate INR|Amount INR), trade-wise summary, grand total, rate analysis vs Gujarat DSR 2025, missing scope items flagged, PMC observations.`,
 
   boq:`You are a PMC quantity surveyor for India. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
-SCHEDULE-FIRST: Build BOQ only from schedule tables printed on the drawing (or the server-extracted schedules in the message). Show schedules first, then BOQ. Never invent qty. Do NOT quote these instructions.`,
+READ→CALC→BOQ: First show what was read from the drawing, then calculation formulas, then BOQ. Never invent qty. Do NOT quote these instructions.`,
 
   compare:`You are a senior PMC consultant for India. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
 Read all uploaded files and compare directly. Do NOT quote these instructions in your response.
@@ -279,7 +279,7 @@ Output: Formal PMC site report — project info, work executed this period, over
 Teach like AutoCAD study: what each table column means, what section cut indicates, how to read levels/hatches. Use only printed data. Output: type, how to read, symbol/table guide, key dims, common mistakes, 3 quiz questions.`
 };
 const QT={
-  drawing:`I want to analyze a civil drawing. Uploading now — please do complete PMC analysis.`,
+  drawing:`Read this civil drawing fully like Civils.ai: sheet type, title, schedules, levels, dims, notes; calculate with formulas; then BOQ (DRAFT until confirmed).`,
   estimate:`I need cost estimation. Please guide me or I will paste project scope/estimate data.`,
   boq:`I need to prepare a BOQ. Will upload drawing or describe scope — give full BOQ with INR rates.`,
   compare:`I want to compare quotes/drawings. Uploading files now — give full comparison + Excel report.`,
@@ -289,6 +289,8 @@ const QT={
 
 // ── STATE ──────────────────────────────────────────────
 let mode='auto', hist=[], files=[], busy=false;
+/** Last drawing extract waiting for numbered user answers */
+let pendingClarify=null;
 let currentChatId=null, sentFilesCache=[], sentTextCache='';
 
 // ── HISTORY STORAGE ────────────────────────────────────
@@ -418,40 +420,44 @@ function fileIcon(name){
   return '📎';
 }
 
+function fmtSize(n){
+  if(!n&&n!==0)return '';
+  if(n<1024)return n+' B';
+  if(n<1048576)return (n/1024).toFixed(0)+' KB';
+  return (n/1048576).toFixed(1)+' MB';
+}
+
 function onFiles(e){
   Array.from(e.target.files).forEach(f=>{
     const name = f.name.toLowerCase();
 
-    // ── DXF/DWG/DWF: ALWAYS read as base64 → server renders PNG via ezdxf+matplotlib → Gemini SEES actual drawing
-    // This works for ANY drawing — server reads legend, symbols, hatches visually
+    // ── DXF/DWG/DWF: keep raw File for multipart (any size). Small DXF also as text.
     if(name.match(/\.(dxf|dwg|dwf)$/)){
-      const rd=new FileReader();
-      rd.onload=ev=>{
-        const b64 = ev.target.result.split(',')[1];
-        const isDXF = name.match(/\.dxf$/i);
-        const isDWF = name.match(/\.dwf$/i);
-        files.push({
-          name: f.name,
-          type: isDXF ? 'application/dxf' : (isDWF ? 'application/dwf' : 'application/dwg'),
-          isDWG: true,   // always use image-render route
-          isDXF: !!isDXF,
-          isDWF: !!isDWF,
-          b64: b64,
-          // Also store text content for DXF so drawing_intelligence can run in parallel
-          _dxfTextPending: isDXF ? f : null
-        });
-        // For DXF: also read as text for the intelligence engine
-        if(isDXF){
-          const rd2 = new FileReader();
-          rd2.onload = ev2 => {
-            const fi = files.find(x => x.name === f.name && x.isDXF);
-            if(fi) fi.dxfContent = ev2.target.result;
-          };
-          rd2.readAsText(f);
-        }
-        renderChips();
+      const isDXF = !!name.match(/\.dxf$/i);
+      const isDWF = !!name.match(/\.dwf$/i);
+      const entry = {
+        name: f.name,
+        type: isDXF ? 'application/dxf' : (isDWF ? 'application/dwf' : 'application/dwg'),
+        isDWG: true,
+        isDXF,
+        isDWF,
+        isDrawing: true,
+        rawFile: f,
+        size: f.size,
       };
-      rd.readAsDataURL(f);
+      files.push(entry);
+      renderChips();
+      // Small files: also keep b64 for legacy export routes
+      if(f.size < 15*1024*1024){
+        const rd=new FileReader();
+        rd.onload=ev=>{ entry.b64 = ev.target.result.split(',')[1]; };
+        rd.readAsDataURL(f);
+      }
+      if(isDXF){
+        const rd2 = new FileReader();
+        rd2.onload = ev2 => { entry.dxfContent = ev2.target.result; };
+        rd2.readAsText(f);
+      }
     }
     // ── Excel/CSV: read as text via FileReader (browser cannot run xlsx parser)
     else if(name.match(/\.csv$/)){
@@ -489,11 +495,25 @@ function onFiles(e){
       };
       rd.readAsText(f);
     }
-    // ── Images + PDF: base64 for Claude vision
+    // ── Images + PDF: keep raw File → multipart /analyze-drawing (any size)
     else {
-      const rd=new FileReader();
-      rd.onload=ev=>{files.push({name:f.name,type:f.type,b64:ev.target.result.split(',')[1]});renderChips();};
-      rd.readAsDataURL(f);
+      const isPdf = !!name.match(/\.pdf$/i) || f.type==='application/pdf';
+      const isImg = !!f.type?.startsWith('image/') || !!name.match(/\.(png|jpe?g|webp|gif|bmp|tiff?)$/i);
+      const entry = {
+        name: f.name,
+        type: f.type || (isPdf ? 'application/pdf' : 'application/octet-stream'),
+        rawFile: f,
+        size: f.size,
+        isDrawing: isPdf || isImg,
+      };
+      files.push(entry);
+      renderChips();
+      // Only preload b64 for smaller files (Excel export helper); large files stay on disk via FormData
+      if(f.size < 12*1024*1024){
+        const rd=new FileReader();
+        rd.onload=ev=>{ entry.b64 = ev.target.result.split(',')[1]; };
+        rd.readAsDataURL(f);
+      }
     }
   });
   document.getElementById('fi').value='';
@@ -503,9 +523,64 @@ function renderChips(){
   const c=document.getElementById('chips');c.innerHTML='';
   files.forEach((f,i)=>{
     const ch=document.createElement('div');ch.className='chip';
-    ch.innerHTML=`<span>${fileIcon(f.name)}</span><span class="cn">${f.name}</span><span class="rm" onclick="rmF(${i})">✕</span>`;
+    const sz=f.size?` <span style="opacity:.55;font-size:10px">${fmtSize(f.size)}</span>`:'';
+    ch.innerHTML=`<span>${fileIcon(f.name)}</span><span class="cn">${f.name}</span>${sz}<span class="rm" onclick="rmF(${i})">✕</span>`;
     c.appendChild(ch);
   });
+}
+
+/** Upload drawing as multipart — works for any file size (no JSON/base64 ceiling). */
+async function postAnalyzeDrawing(fileEntry, question){
+  const fd=new FormData();
+  if(fileEntry.rawFile){
+    fd.append('file', fileEntry.rawFile, fileEntry.name);
+  }else if(fileEntry.b64){
+    const bin=atob(fileEntry.b64);
+    const arr=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+    fd.append('file', new Blob([arr],{type:fileEntry.type||'application/pdf'}), fileEntry.name);
+  }else{
+    throw new Error('File data missing — dobara upload karo.');
+  }
+  fd.append('question', question||'Read this construction drawing fully like Civils.ai: sheet type, title block, schedules/tables, levels, dimensions, notes; calculate quantities with formulas; then prepare BOQ. Never invent values.');
+  fd.append('filename', fileEntry.name||'drawing.pdf');
+  const res=await fetch('/analyze-drawing',{method:'POST',body:fd});
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(data.error||('HTTP '+res.status));
+  return data;
+}
+
+function rememberClarify(data, filename, question){
+  if(data?.schedule_first?.needs_user_input && data.extracted && data.clarifications){
+    pendingClarify={
+      extracted:data.extracted,
+      clarifications:data.clarifications,
+      combined_text:data.combined_text||'',
+      filename:filename||data.filename||'drawing.pdf',
+      question:question||'',
+    };
+  }else if(data && !data.schedule_first?.needs_user_input){
+    pendingClarify=null;
+  }
+}
+
+async function postResolveClarifications(userText){
+  if(!pendingClarify) throw new Error('No pending clarification session');
+  const res=await fetch('/resolve-clarifications',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      userText,
+      extracted:pendingClarify.extracted,
+      clarifications:pendingClarify.clarifications,
+      combined_text:pendingClarify.combined_text,
+      filename:pendingClarify.filename,
+      question:pendingClarify.question,
+    }),
+  });
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(data.error||('HTTP '+res.status));
+  return data;
 }
 function rmF(i){files.splice(i,1);renderChips();}
 
@@ -742,6 +817,30 @@ async function send(){
   // Init new chat if needed
   if(!currentChatId){currentChatId='chat_'+Date.now();}
 
+  // Numbered answers (1) … 2) …) → merge into schedules / rebuild BOQ
+  const looksLikeAnswers=pendingClarify && txt && !files.length && /^\s*\d+\s*[\)\.\-:]/.test(txt);
+  if(looksLikeAnswers){
+    const disp=txt;
+    addMsgEl('user',disp,[]);
+    hist.push({role:'user',content:disp});
+    tin.value='';tin.style.height='auto';
+    addLoad();
+    try{
+      const data=await postResolveClarifications(txt);
+      const aiText=data.analysis||data.content?.filter(b=>b.type==='text').map(b=>b.text).join('')||'Updated.';
+      rememberClarify(data, pendingClarify.filename, pendingClarify.question);
+      rmLoad();
+      hist.push({role:'assistant',content:aiText,userText:txt});
+      addMsgEl('ai',aiText,[],true,null,txt,aiText);
+      saveChatToHistory('Answers applied');
+    }catch(err){
+      rmLoad();
+      addMsgEl('ai','**Clarify Error:** '+err.message);
+    }
+    busy=false;document.getElementById('sbtn').disabled=false;
+    return;
+  }
+
   const sentFiles=[...files];
   const sentText=txt;
   const fnames=files.map(f=>f.name);
@@ -786,33 +885,40 @@ async function send(){
     return;
   }
 
-  // DWG files → send to /analyze-dwg for server-side Gemini analysis
-  const hasDWG=sentFiles.some(f=>f.isDWG) && !sentFiles.some(f=>f.isDXF);
-  if(hasDWG){
+  // Drawings (PDF / image / DWG/DWF) → multipart /analyze-drawing (any size, local-first)
+  // Pure DXF already returned above via /classify-dxf
+  const drawingFile=sentFiles.find(f=>
+    (!f.isDXF) && (
+      f.isDrawing || f.isDWG || f.type==='application/pdf' || f.type?.startsWith('image/') ||
+      /\.(pdf|png|jpe?g|webp|gif|bmp|tiff?|dwg|dwf)$/i.test(f.name||'')
+    )
+  );
+  if(drawingFile){
     files=[];renderChips();
     addLoad();
     try{
-      const dwgFile=sentFiles.find(f=>f.isDWG);
-      const res=await fetch('/analyze-dwg',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({b64:dwgFile.b64,filename:dwgFile.name})});
-      const data=await res.json();
-      if(!res.ok || data.needsDxfExport || data.needsPdfOrDxf){
-        // Conversion failed — show clear actionable message
+      const data=await postAnalyzeDrawing(drawingFile, sentText||disp);
+      if(data.needsDxfExport || data.needsPdfOrDxf){
         rmLoad();
-        const errMsg = data.error || 'File could not be converted.';
-        addMsgEl('ai', `⚠️ **File Conversion Error**\n\n${errMsg}`);
+        addMsgEl('ai', `⚠️ **File Conversion Error**\n\n${data.error||'Export PDF/DXF and re-upload (any size OK).'}`);
         busy=false;document.getElementById('sbtn').disabled=false;
         return;
       }
-      const aiText=data.analysis||'DWG analysis failed.';
+      rememberClarify(data, drawingFile.name, sentText||disp);
+      const aiText=data.analysis||data.content?.filter(b=>b.type==='text').map(b=>b.text).join('')||'Analysis failed.';
+      const meta=data.schedule_first;
+      let footer='';
+      if(meta){
+        footer=`\n\n---\n_Local pipeline · type: **${meta.drawing_type||'—'}** · mode: **${meta.mode||'—'}** · tables: **${meta.spatial_tables??'—'}** · file: **${meta.file_mb!=null?meta.file_mb+' MB':'—'}** · tokens: **${meta.tokens??0}**_`;
+        if(meta.needs_user_input) footer+='\n\n_Reply with numbered answers (1) … 2) …) — BOQ rebuild hoga without inventing._';
+      }
       rmLoad();
-      hist=hist.filter(m=>m.role!=='user_parts');
       hist.push({role:'assistant',content:aiText,userText:sentText});
-      addMsgEl('ai',aiText,[],true,null,sentText,aiText);
-      saveChatToHistory(dwgFile.name.slice(0,40));
+      addMsgEl('ai',aiText+footer,[],true,sentFiles,sentText,aiText);
+      saveChatToHistory(drawingFile.name.slice(0,40));
     }catch(err){
       rmLoad();
-      addMsgEl('ai',`**DWG Error:** ${err.message}`);
+      addMsgEl('ai',`**Drawing Error:** ${err.message}\n\n_PDF/DXF dobara try karo — size limit nahi hai (500MB tak)._`);
     }
     busy=false;document.getElementById('sbtn').disabled=false;
     return;
@@ -822,12 +928,12 @@ async function send(){
   const textExtras=[];
 
   files.forEach(f=>{
-    // Images — Gemini vision directly
-    if(f.type?.startsWith('image/')){
+    // Images — only if b64 available (small non-drawing fallback)
+    if(f.type?.startsWith('image/') && f.b64){
       parts.push({inline_data:{mime_type:f.type,data:f.b64}});
     }
-    // PDF — Claude reads natively
-    else if(f.type==='application/pdf'||f.name?.match(/\.pdf$/i)){
+    // PDF — Claude path only when b64 present (legacy small files)
+    else if((f.type==='application/pdf'||f.name?.match(/\.pdf$/i)) && f.b64){
       parts.push({inline_data:{mime_type:'application/pdf',data:f.b64}});
     }
     // FIX BUG-3: DWG files MUST be routed via /analyze-dwg (server converts to PNG tiles
@@ -892,11 +998,11 @@ async function send(){
     }
     // Case 2: No content at all
     if(!data?.content?.length)
-      throw new Error('Claude ne koi response nahi diya. File format check karo — PDF 20MB se chhoti honi chahiye.');
+      throw new Error('Claude ne koi response nahi diya. Drawing ke liye PDF/image dobara /analyze-drawing se try karo.');
     // Case 3: Extract text from Claude response format
     const aiText=data?.content?.filter(b=>b.type==='text').map(b=>b.text).join('')||'';
     if(!aiText.trim())
-      throw new Error('Claude response empty aaya. PDF/image dobara upload karo ya file size check karo.');
+      throw new Error('Claude response empty aaya. Drawing dobara upload karo (size limit nahi — local read).');
     // ── Success ───────────────────────────────────────────────
     hist=hist.filter(m=>m.role!=='user_parts');
     // Keep only text in hist — b64 files are too large for localStorage
@@ -912,7 +1018,7 @@ async function send(){
     let msg=err.message;
     if(msg.includes('429'))msg='⚠️ Rate limit — thodi der baad try karo.';
     if(msg.includes('fetch'))msg='❌ Server se connection nahi hua. Render service check karo.';
-    addMsgEl('ai',`**Error:** ${msg}\n\n_Agar PDF hai toh file size 20MB se kam rakho. Agar baar baar aata hai toh CLAUDE_API_KEY aur server logs check karo._`);
+    addMsgEl('ai',`**Error:** ${msg}\n\n_Drawing ke liye size limit nahi (500MB tak, local CAD-zoom). Agar baar baar aata hai toh server logs / CLAUDE_API_KEY check karo._`);
   }
   busy=false;document.getElementById('sbtn').disabled=false;
 }
@@ -920,9 +1026,9 @@ async function send(){
 function qs(type){document.getElementById('tin').value=QT[type];aRz(document.getElementById('tin'));document.getElementById('tin').focus();}
 
 function newChat(){
-  hist=[];files=[];renderChips();currentChatId=null;
+  hist=[];files=[];pendingClarify=null;renderChips();currentChatId=null;
   const chat=document.getElementById('chat');
-  chat.innerHTML=`<div class="welcome" id="welcome"><div class="wico">🏗️</div><div class="wtit">PMC Civil AI Agent</div><div class="wsub">Upload koi bhi file — PDF, image. AI auto-detect karega aur <strong>PMC format Excel + PDF</strong> download dega!</div><div class="qgrid"><button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Drawing → Auto Excel</span><span class="qd">Upload drawing → AI calculates → Excel auto banta hai</span></button><button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Scope batao → Excel cost sheet</span></button><button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Prepare BOQ</span><span class="qd">Drawing upload → Excel BOQ</span></button><button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare quotes</span><span class="qd">2-3 PDFs → Excel comparison</span></button><button class="qcard" onclick="qs('report')"><span class="qi">📊</span><span class="ql">Site report</span><span class="qd">Details do → Excel site report</span></button><button class="qcard" onclick="qs('study')"><span class="qi">🏗️</span><span class="ql">Drawing study</span><span class="qd">Upload → educational analysis</span></button></div></div>`;
+  chat.innerHTML=`<div class="welcome" id="welcome"><div class="wico">🏗️</div><div class="wtit">PMC Civil AI Agent</div><div class="wsub">Civils.ai-style: <strong>drawing reading</strong> → formula calc → BOQ (DRAFT→FINAL). <strong>PMC Excel</strong> download.</div><div class="qgrid"><button class="qcard" onclick="qs('drawing')"><span class="qi">📐</span><span class="ql">Drawing → Auto Excel</span><span class="qd">Upload drawing → AI calculates → Excel auto banta hai</span></button><button class="qcard" onclick="qs('estimate')"><span class="qi">🧮</span><span class="ql">Cost estimation</span><span class="qd">Scope batao → Excel cost sheet</span></button><button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Prepare BOQ</span><span class="qd">Drawing upload → Excel BOQ</span></button><button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare quotes</span><span class="qd">2-3 PDFs → Excel comparison</span></button><button class="qcard" onclick="qs('report')"><span class="qi">📊</span><span class="ql">Site report</span><span class="qd">Details do → Excel site report</span></button><button class="qcard" onclick="qs('study')"><span class="qi">🏗️</span><span class="ql">Drawing study</span><span class="qd">Upload → educational analysis</span></button></div></div>`;
   renderHistList();
 }
 

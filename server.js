@@ -18,33 +18,46 @@ const {
   runScheduleFirstLocal,
   polishWithClaude,
   combineExtractedText,
+  applyUserClarifications,
+  extractSchedules,
 } = require('./lib/schedule_pipeline');
-const { runCadZoomOcrFromBase64 } = require('./lib/cad_local_reader');
+const { runCadZoomOcrFromBase64, runCadZoomOcrOnFile } = require('./lib/cad_local_reader');
+const { buildSpatialScheduleText } = require('./lib/spatial_tables');
+const multer = require('multer');
+const fs = require('fs');
+const os = require('os');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+// Large drawings: JSON fallback up to 200MB; prefer multipart /analyze-drawing (any size up to 500MB)
+app.use(express.json({ limit: '200mb' }));
 app.use(express.static(publicDir()));
 
+const uploadDrawing = multer({
+  dest: path.join(os.tmpdir(), 'pmc_uploads'),
+  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB — Civils.ai-style: size not a hard product limit
+});
+try { fs.mkdirSync(path.join(os.tmpdir(), 'pmc_uploads'), { recursive: true }); } catch (_) {}
 
-async function extractPdfText(pdfBase64) {
-  const { execSync } = require('child_process');
-  const fs = require('fs');
-  const os = require('os');
-  const tmpDir = fs.mkdtempSync(os.tmpdir() + '/pmc_pdf_');
-  const pdfPath = tmpDir + '/input.pdf';
+function pyExec() {
+  return process.env.PMC_PYTHON || (process.platform === 'win32' ? 'py -3' : 'python3');
+}
+
+async function extractPdfTextFromPath(pdfPath) {
+  const { execFileSync } = require('child_process');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmc_pdf_'));
   try {
-    fs.writeFileSync(pdfPath, Buffer.from(pdfBase64, 'base64'));
-    const script = `
+    const scriptPath = path.join(tmpDir, 'extract.py');
+    fs.writeFileSync(scriptPath, `
 import fitz, json, sys
-doc = fitz.open('${pdfPath}')
+doc = fitz.open(sys.argv[1])
 pages = []
 for page_num in range(len(doc)):
     page = doc[page_num]
     blocks = page.get_text("dict")["blocks"]
     texts = []
     for b in blocks:
-        if b.get("type") == 0:  # text block
+        if b.get("type") == 0:
             for line in b.get("lines", []):
                 for span in line.get("spans", []):
                     t = span.get("text","").strip()
@@ -55,16 +68,33 @@ for page_num in range(len(doc)):
 doc.close()
 total = sum(len(p["texts"]) for p in pages)
 print(json.dumps({"pages": pages, "is_vector": any(len(p["texts"])>10 for p in pages), "total_texts": total}))
-`.trim();
-    const scriptPath = tmpDir + '/extract.py';
-    fs.writeFileSync(scriptPath, script);
-    const out = execSync(`python3 "${scriptPath}"`, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 });
+`.trim());
+    const { execSync } = require('child_process');
+    const out = execSync(`${pyExec()} "${scriptPath}" "${pdfPath}"`, {
+      timeout: 120000,
+      maxBuffer: 40 * 1024 * 1024,
+      windowsHide: true,
+    });
     return JSON.parse(out.toString());
-  } catch(e) {
+  } catch (e) {
     console.error('PDF text extract error:', e.message);
     return null;
   } finally {
-    try { require('fs').rmSync(tmpDir, { recursive: true }); } catch(e) {}
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+  }
+}
+
+async function extractPdfText(pdfBase64) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmc_pdf_'));
+  const pdfPath = path.join(tmpDir, 'input.pdf');
+  try {
+    fs.writeFileSync(pdfPath, Buffer.from(pdfBase64, 'base64'));
+    return await extractPdfTextFromPath(pdfPath);
+  } catch (e) {
+    console.error('PDF text extract error:', e.message);
+    return null;
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
   }
 }
 
@@ -91,7 +121,7 @@ print(json.dumps(tiles))
 `.trim();
     const sp = tmpDir + '/r.py';
     fs.writeFileSync(sp, script);
-    const out = execSync(`python3 "${sp}"`, { timeout: 60000, maxBuffer: 100 * 1024 * 1024 });
+    const out = execSync(`${pyExec()} "${sp}"`, { timeout: 60000, maxBuffer: 100 * 1024 * 1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
     const tiles = JSON.parse(out.toString());
     console.log(`[GCV-Large] Rendered ${tiles.length} page tiles from large PDF`);
 
@@ -156,11 +186,12 @@ async function extractScannedPdfWithGCV(pdfBase64) {
     fs.writeFileSync(pdfPath, Buffer.from(pdfBase64, 'base64'));
 
     const scriptPath = scriptsPath('ocr_pipeline.py');
-    const py = process.env.PMC_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+    const py = pyExec();
 
     execSync(`${py} "${scriptPath}" "${pdfPath}" "${outPath}"`, {
       timeout: 180000,
-      maxBuffer: 50 * 1024 * 1024
+      maxBuffer: 50 * 1024 * 1024,
+      env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' }
     });
 
     if (!fs.existsSync(outPath)) return null;
@@ -206,8 +237,8 @@ print(json.dumps({'pages':pages}))
 `.trim();
       const fbScript = path.join(tmpDir, 'fallback.py');
       fs.writeFileSync(fbScript, fallbackScript);
-      const py2 = process.env.PMC_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
-      const fbOut = execSync(`${py2} "${fbScript}"`, { timeout: 60000, maxBuffer: 10*1024*1024 });
+      const py2 = pyExec();
+      const fbOut = execSync(`${py2} "${fbScript}"`, { timeout: 60000, maxBuffer: 10*1024*1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
       const fbData = JSON.parse(fbOut.toString());
       if (fbData.pages?.length) {
         console.log('[OCR Fallback] Used simple Tesseract PSM6 fallback');
@@ -293,7 +324,7 @@ print(json.dumps(tiles))
 `.trim();
     const scriptPath = tmpDir + '/convert.py';
     fs.writeFileSync(scriptPath, script);
-    const out = execSync(`python3 "${scriptPath}"`, { timeout: 120000, maxBuffer: 300 * 1024 * 1024 });
+    const out = execSync(`${pyExec()} "${scriptPath}"`, { timeout: 120000, maxBuffer: 300 * 1024 * 1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
     const result = JSON.parse(out.toString());
     return result.map(t => typeof t === 'object' ? t.data : t);
   } catch(e) {
@@ -309,16 +340,10 @@ print(json.dumps(tiles))
  * Default: NO image tiles (saves tokens).
  * Vision fallback: 1 overview + up to 2 crops only when schedule text is weak.
  */
-async function buildDrawingContext(pdfB64, opts = {}) {
-  const forceVision = opts.forceVision === true;
-  const parts = [];
-  let extractedTextBlock = '';
+function linesFromExtractedPdf(extracted) {
   const plainLines = [];
-
-  const extracted = await extractPdfText(pdfB64);
-  const isVector = extracted?.is_vector;
-
-  if (isVector && extracted.pages?.length) {
+  let extractedTextBlock = '';
+  if (extracted?.pages?.length) {
     for (const page of extracted.pages) {
       const byY = {};
       for (const t of (page.texts || [])) {
@@ -335,21 +360,56 @@ async function buildDrawingContext(pdfB64, opts = {}) {
     extractedTextBlock = `=== MACHINE-EXTRACTED TEXT FROM DRAWING (${totalTexts} items) ===\n${plainLines.join('\n')}\n=== END EXTRACTED TEXT ===`;
     console.log(`[drawing-context] Vector PDF: ${totalTexts} texts extracted`);
   }
+  return { plainLines, extractedTextBlock };
+}
+
+/**
+ * Civils.ai-style: work from a file on disk (any size).
+ * Spatial tables + schedule-quality OCR gate (not char-count).
+ */
+async function buildDrawingContextFromFile(filePath, opts = {}) {
+  const forceVision = opts.forceVision === true;
+  const parts = [];
+  const ext = path.extname(filePath || '').toLowerCase();
+  const isPdf = ext === '.pdf' || opts.mime === 'application/pdf';
+  const isImage = ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff', '.gif'].includes(ext)
+    || (opts.mime || '').startsWith('image/');
+
+  let extracted = null;
+  if (isPdf) {
+    extracted = await extractPdfTextFromPath(filePath);
+  }
+  const { plainLines, extractedTextBlock } = linesFromExtractedPdf(extracted);
+
+  // Spatial rebuild from PDF coords (column-aligned schedules)
+  let spatial = buildSpatialScheduleText({
+    pdfPages: extracted?.pages || [],
+    plainLines,
+  });
+  let probe = extractSchedules(spatial.text || plainLines.join('\n'), {
+    spatialTables: spatial.tables || [],
+  });
+  console.log(`[drawing-context] Vector spatial: quality=${probe.quality} rows=${probe.total_schedule_rows} tables=${spatial.tables?.length || 0}`);
 
   let gcvBlock = '';
   let cadZoomText = '';
   let cadHints = [];
-  // Scanned CAD PDFs: local CAD-zoom OCR first (zero Claude tokens). GCV only as optional add-on.
-  const vectorThin = plainLines.join('\n').length < 400;
-  if (vectorThin || forceVision) {
+  let ocrBoxes = [];
+  const scheduleWeak = probe.quality === 'poor' || (probe.total_schedule_rows || 0) < 1;
+  const vectorThin = plainLines.join('\n').length < 200;
+
+  if (forceVision || isImage || scheduleWeak || vectorThin) {
     try {
-      console.log('[drawing-context] Running local CAD-zoom OCR (RapidOCR)...');
-      const zoom = runCadZoomOcrFromBase64(pdfB64, 'application/pdf');
+      console.log('[drawing-context] Running CAD-zoom OCR (multi-page + adaptive schedule crops)...');
+      const outDir = path.join(path.dirname(filePath), 'crops_' + Date.now());
+      fs.mkdirSync(outDir, { recursive: true });
+      const zoom = runCadZoomOcrOnFile(filePath, outDir);
       if (zoom?.success && zoom.full_text) {
         cadZoomText = zoom.full_text;
         cadHints = zoom.drawing_hints || [];
+        ocrBoxes = zoom.boxes || [];
         plainLines.push(...String(zoom.full_text).split('\n'));
-        console.log(`[drawing-context] CAD-zoom OCR: ${zoom.char_count || cadZoomText.length} chars | hints=${cadHints.join(',')}`);
+        console.log(`[drawing-context] CAD-zoom OCR: ${zoom.char_count || cadZoomText.length} chars | boxes=${ocrBoxes.length} | pages=${zoom.pages_processed || '?'} | hints=${cadHints.join(',')}`);
       } else {
         console.warn('[drawing-context] CAD-zoom OCR failed:', zoom?.error || 'empty');
       }
@@ -357,68 +417,102 @@ async function buildDrawingContext(pdfB64, opts = {}) {
       console.warn('[drawing-context] CAD-zoom OCR error:', e.message);
     }
 
-    // Optional cloud GCV only if local OCR still weak AND key present
-    if ((cadZoomText.length < 200) && process.env.GOOGLE_CLOUD_VISION_API_KEY) {
-      const gcvResult = await extractScannedPdfWithGCV(pdfB64);
-      if (gcvResult?.pages?.length) {
-        const gcvLines = [];
-        gcvBlock = gcvResult.pages.map((p, i) => {
-          const rotNote = p.is_rotated ? ' [rotated]' : '';
-          const pageText = p.raw_text || p.text || '';
-          gcvLines.push(...String(pageText).split('\n'));
-          return `=== PAGE ${i + 1}${rotNote} ===\n${pageText}`;
-        }).join('\n\n');
-        gcvBlock = `=== SCANNED PDF OCR (GCV) ===\n${gcvBlock}\n=== END OCR ===`;
-        plainLines.push(...gcvLines);
-        console.log(`[drawing-context] GCV fallback: ${gcvResult.pages.length} pages`);
+    if ((cadZoomText.length < 200) && process.env.GOOGLE_CLOUD_VISION_API_KEY && isPdf) {
+      try {
+        const stat = fs.statSync(filePath);
+        if (stat.size <= 40 * 1024 * 1024) {
+          const pdfB64 = fs.readFileSync(filePath).toString('base64');
+          const gcvResult = await extractScannedPdfWithGCV(pdfB64);
+          if (gcvResult?.pages?.length) {
+            const gcvLines = [];
+            gcvBlock = gcvResult.pages.map((p, i) => {
+              const rotNote = p.is_rotated ? ' [rotated]' : '';
+              const pageText = p.raw_text || p.text || '';
+              gcvLines.push(...String(pageText).split('\n'));
+              return `=== PAGE ${i + 1}${rotNote} ===\n${pageText}`;
+            }).join('\n\n');
+            gcvBlock = `=== SCANNED PDF OCR (GCV) ===\n${gcvBlock}\n=== END OCR ===`;
+            plainLines.push(...gcvLines);
+            console.log(`[drawing-context] GCV fallback: ${gcvResult.pages.length} pages`);
+          }
+        } else {
+          console.log('[drawing-context] Skipping GCV — file >40MB; local OCR only');
+        }
+      } catch (e) {
+        console.warn('[drawing-context] GCV skip:', e.message);
       }
     }
+
+    // Rebuild spatial with OCR boxes
+    spatial = buildSpatialScheduleText({
+      pdfPages: extracted?.pages || [],
+      ocrBoxes,
+      plainLines,
+    });
   } else {
-    console.log('[drawing-context] Skipping OCR — vector text sufficient');
+    console.log('[drawing-context] Skipping OCR — schedule quality already good from vector text');
   }
 
-  const combinedText = combineExtractedText([plainLines.join('\n'), extractedTextBlock, gcvBlock, cadZoomText]);
+  const combinedText = combineExtractedText([
+    spatial.text,
+    plainLines.join('\n'),
+    extractedTextBlock,
+    gcvBlock,
+    cadZoomText,
+  ]);
   const userQuestion = opts.question || '';
   const local = runScheduleFirstLocal(combinedText, {
-    filename: opts.filename || 'drawing.pdf',
+    filename: opts.filename || path.basename(filePath) || 'drawing.pdf',
     question: userQuestion,
     hints: cadHints,
+    spatialTables: spatial.tables || [],
   });
   console.log(`[drawing-context] type=${local.typeInfo?.drawing_type} schedule=${local.extracted.quality} rows=${local.extracted.total_schedule_rows} localQA=${!!local.answeredLocally}`);
 
-  // Vision to Claude only if local Q&A failed AND OCR still weak
   const needVision = forceVision || (local.needsClaude && local.needsVision);
+  let fileBytes = 0;
+  try { fileBytes = fs.statSync(filePath).size; } catch (_) {}
 
-  if (needVision) {
+  if (needVision && isPdf && fileBytes > 0 && fileBytes <= 25 * 1024 * 1024) {
+    const pdfB64 = fs.readFileSync(filePath).toString('base64');
     const pngTiles = await pdfToImageTiles(pdfB64);
-    // Cap: overview (first) + up to 2 densest crops — not full 3x2 grid
     const limited = (pngTiles || []).slice(0, 3);
     if (limited.length) {
       for (const tile of limited) {
         parts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: tile } });
       }
       console.log(`[drawing-context] Vision fallback: ${limited.length} image(s) (capped)`);
-      if (limited.length > 1) {
-        parts.push({
-          type: 'text',
-          text: `IMAGE NOTE: ${limited.length} images of the SAME sheet — image 1 overview, rest table crops. Use schedule QTY column only. Never double-count overlap.`,
-        });
-      }
-    } else {
-      console.warn('[drawing-context] Tile render failed — attaching raw PDF as last resort');
-      parts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } });
     }
+  } else if (needVision && fileBytes > 25 * 1024 * 1024) {
+    console.log('[drawing-context] Large file — vision skipped; ask-user / local text only');
   } else {
     console.log('[drawing-context] Text-only mode — zero image tokens');
   }
 
-  // Structured schedules + BOQ (deterministic) — primary payload
   parts.push({
     type: 'text',
     text: `${local.markdown}\n\n=== RAW EXTRACTED TEXT (reference) ===\n${combinedText.slice(0, 50000)}\n=== END RAW TEXT ===\n\nRULES: Use ONLY schedule values above for quantities. Never invent sizes/qty. Prefer drawing-schedule source.`,
   });
 
-  return { parts, scheduleFirst: local, combinedText, needsVision: needVision };
+  return {
+    parts,
+    scheduleFirst: local,
+    combinedText,
+    needsVision: needVision,
+    fileBytes,
+    spatialTables: spatial.tables || [],
+  };
+}
+
+async function buildDrawingContext(pdfB64, opts = {}) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmc_ctx_'));
+  const pdfPath = path.join(tmpDir, 'input.pdf');
+  try {
+    fs.writeFileSync(pdfPath, Buffer.from(pdfB64, 'base64'));
+    return await buildDrawingContextFromFile(pdfPath, { ...opts, mime: 'application/pdf' });
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+  }
 }
 
 // ─── DIRECT CLAUDE CHAT ROUTE (no Gemini wrapper) ────────────────
@@ -1427,7 +1521,7 @@ app.post('/analyze-dwg', async (req, res) => {
       }
     } else {
       try {
-        const py = process.env.PMC_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+        const py = pyExec();
         // FIXED: tiling used to only run when the user explicitly enabled
         // "detail mode" — so by default every DWG/DXF was flattened into one
         // low-res image and small schedule-table numbers were unreadable.
@@ -1438,7 +1532,7 @@ app.post('/analyze-dwg', async (req, res) => {
         const tiledArg = 'true';
         const out = execSync(
           `${py} "${scriptPath}" "${tmpIn}" "${tmpPng}" ${dpi} ${tiledArg}`,
-          { timeout: 120000, maxBuffer: 20 * 1024 * 1024 }
+          { timeout: 180000, maxBuffer: 40 * 1024 * 1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } }
         );
         converterResult = JSON.parse(out.toString());
       } catch (e) {
@@ -1473,10 +1567,10 @@ app.post('/analyze-dwg', async (req, res) => {
         const outDir = path.dirname(converterResult.png_path);
         const baseName = path.basename(converterResult.png_path, path.extname(converterResult.png_path));
         const tileScript = scriptsPath('tile_only.py');
-        const py = process.env.PMC_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+        const py = pyExec();
         const tout = execSync(
           `${py} "${tileScript}" "${converterResult.png_path}" "${outDir}" "${baseName}"`,
-          { timeout: 60000, maxBuffer: 10 * 1024 * 1024 }
+          { timeout: 60000, maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } }
         );
         const ta = JSON.parse(tout.toString().trim() || '[]');
         if (Array.isArray(ta) && ta.length) converterResult.tiles = ta;
@@ -1990,6 +2084,238 @@ app.get('/rates-stats', (req, res) => {
   }
 });
 
+// ─── ANALYZE DRAWING (multipart) — any size, Civils.ai-style local-first ───
+// Prefer this over stuffing PDF base64 into /claude JSON (breaks on large sheets).
+app.post('/analyze-drawing', (req, res) => {
+  uploadDrawing.single('file')(req, res, async (err) => {
+    if (err) {
+      console.error('[/analyze-drawing] upload error:', err.message);
+      return res.status(400).json({
+        error: err.code === 'LIMIT_FILE_SIZE'
+          ? 'File too large for this server (max 500MB). Compress PDF or split sheets.'
+          : err.message,
+      });
+    }
+    let tmpPath = req.file?.path;
+    try {
+      const question = (req.body?.question || req.body?.userText || '').trim();
+      let filename = req.file?.originalname || req.body?.filename || 'drawing.pdf';
+      let mime = req.file?.mimetype || req.body?.mime || '';
+
+      // JSON fallback: { b64, filename, question } for older clients
+      if (!tmpPath && req.body?.b64) {
+        const ext = path.extname(filename).toLowerCase() || '.pdf';
+        tmpPath = path.join(os.tmpdir(), `pmc_b64_${Date.now()}${ext}`);
+        fs.writeFileSync(tmpPath, Buffer.from(req.body.b64, 'base64'));
+        mime = mime || (ext === '.pdf' ? 'application/pdf' : 'application/octet-stream');
+      }
+      if (!tmpPath || !fs.existsSync(tmpPath)) {
+        return res.status(400).json({ error: 'No file uploaded. Use FormData field "file".' });
+      }
+
+      const ext = path.extname(filename).toLowerCase();
+      const sizeMb = (fs.statSync(tmpPath).size / (1024 * 1024)).toFixed(1);
+      console.log(`[/analyze-drawing] ${filename} (${sizeMb} MB) q="${question.slice(0, 80)}"`);
+
+      // DWG/DXF/DWF → reuse converter path then local OCR on PNG if produced
+      if (['.dwg', '.dxf', '.dwf'].includes(ext)) {
+        const { execSync } = require('child_process');
+        const scriptPath = scriptsPath('dwg_converter.py');
+        const tmpPng = path.join(os.tmpdir(), `pmc_dwg_${Date.now()}.png`);
+        let converterResult = {};
+        try {
+          const py = pyExec();
+          const out = execSync(
+            `${py} "${scriptPath}" "${tmpPath}" "${tmpPng}" 300 true`,
+            { timeout: 180000, maxBuffer: 40 * 1024 * 1024 }
+          );
+          converterResult = JSON.parse(out.toString());
+        } catch (e) {
+          converterResult = { success: false, error: e.message };
+        }
+        if (!converterResult.success && !converterResult.png_path) {
+          return res.status(422).json({
+            success: false,
+            needsDxfExport: ext === '.dwg',
+            needsPdfOrDxf: true,
+            error: converterResult.error ||
+              'CAD file could not be rendered. Export PDF/DXF from ZWCAD/AutoCAD and re-upload (any size OK).',
+          });
+        }
+        const pngPath = converterResult.png_path || tmpPng;
+        const texts = (converterResult.texts || []).map(t => (typeof t === 'string' ? t : t.text || '')).filter(Boolean);
+        let combined = texts.join('\n');
+        let ocrBoxes = [];
+        let hints = [];
+        if (fs.existsSync(pngPath)) {
+          const zoom = runCadZoomOcrOnFile(pngPath);
+          if (zoom?.success && zoom.full_text) {
+            combined = [combined, zoom.full_text].filter(Boolean).join('\n');
+            ocrBoxes = zoom.boxes || [];
+            hints = zoom.drawing_hints || [];
+          }
+        }
+        const spatial = buildSpatialScheduleText({ ocrBoxes, plainLines: combined.split('\n') });
+        const scheduleBundle = runScheduleFirstLocal(spatial.text || combined, {
+          filename,
+          question,
+          hints,
+          spatialTables: spatial.tables || [],
+        });
+        const md = scheduleBundle.markdown || 'No schedule data found. Upload PDF export of the same sheet.';
+        return res.json({
+          success: true,
+          content: [{ type: 'text', text: md }],
+          analysis: md,
+          extracted: scheduleBundle.extracted,
+          clarifications: scheduleBundle.clarifications,
+          combined_text: (spatial.text || combined).slice(0, 80000),
+          schedule_first: {
+            quality: scheduleBundle.extracted?.quality,
+            rows: scheduleBundle.extracted?.total_schedule_rows,
+            drawing_type: scheduleBundle.typeInfo?.drawing_type,
+            mode: scheduleBundle.needsUserInput ? 'ask-user' : 'local-only',
+            tokens: 0,
+            file_mb: Number(sizeMb),
+            needs_user_input: !!scheduleBundle.needsUserInput,
+            questions: scheduleBundle.clarifications?.questions || [],
+          },
+        });
+      }
+
+      // PDF / image — disk-based local pipeline
+      const ctx = await buildDrawingContextFromFile(tmpPath, {
+        question,
+        filename,
+        mime: mime || (ext === '.pdf' ? 'application/pdf' : undefined),
+      });
+      const scheduleBundle = ctx.scheduleFirst;
+
+      if (scheduleBundle?.answeredLocally && scheduleBundle.markdown) {
+        const payload = {
+          success: true,
+          content: [{ type: 'text', text: scheduleBundle.markdown }],
+          analysis: scheduleBundle.markdown,
+          extracted: scheduleBundle.extracted,
+          clarifications: scheduleBundle.clarifications,
+          combined_text: (ctx.combinedText || '').slice(0, 80000),
+          filename,
+          schedule_first: {
+            quality: scheduleBundle.extracted?.quality,
+            rows: scheduleBundle.extracted?.total_schedule_rows,
+            drawing_type: scheduleBundle.typeInfo?.drawing_type,
+            boq_items: scheduleBundle.boqResult?.boq?.length || 0,
+            status: scheduleBundle.qa?.meta?.status || scheduleBundle.qa?.status || (scheduleBundle.needsUserInput ? 'DRAFT' : 'FINAL'),
+            mode: scheduleBundle.needsUserInput ? 'ask-user' : 'read-calc-boq',
+            tokens: 0,
+            file_mb: Number(sizeMb),
+            needs_user_input: !!scheduleBundle.needsUserInput,
+            questions: scheduleBundle.clarifications?.questions || [],
+            spatial_tables: (ctx.spatialTables || []).length,
+          },
+        };
+        if (!scheduleBundle.needsUserInput) {
+          try {
+            learnRatesFromMarkdown(scheduleBundle.markdown, {
+              filename,
+              drawing_type: scheduleBundle.typeInfo?.drawing_type,
+            });
+          } catch (_) {}
+        }
+        return res.json(payload);
+      }
+
+      // Weak extract: optional Claude polish on TEXT only (never re-upload huge PDF)
+      if (process.env.CLAUDE_API_KEY && scheduleBundle?.markdown) {
+        try {
+          const polished = await polishWithClaude(callClaudeAPI, {
+            markdown: scheduleBundle.markdown,
+            extracted: scheduleBundle.extracted,
+            system: CIVIL_SYSTEM,
+          });
+          return res.json({
+            success: true,
+            content: [{ type: 'text', text: polished || scheduleBundle.markdown }],
+            analysis: polished || scheduleBundle.markdown,
+            schedule_first: {
+              quality: scheduleBundle.extracted?.quality,
+              drawing_type: scheduleBundle.typeInfo?.drawing_type,
+              mode: 'claude-assisted-text',
+              file_mb: Number(sizeMb),
+            },
+          });
+        } catch (e) {
+          console.warn('[/analyze-drawing] Claude polish failed:', e.message);
+        }
+      }
+
+      const fallback = scheduleBundle?.markdown
+        || `Drawing received (${sizeMb} MB) but local extract was weak.\n\nPlease:\n1. Export a clearer PDF from CAD\n2. Or ask a specific question (e.g. footing sizes, levels)\n3. Answer clarification questions if shown`;
+      return res.json({
+        success: true,
+        content: [{ type: 'text', text: fallback }],
+        analysis: fallback,
+        schedule_first: { mode: 'weak-extract', file_mb: Number(sizeMb), tokens: 0 },
+      });
+    } catch (e) {
+      console.error('[/analyze-drawing]', e.message);
+      return res.status(500).json({ error: e.message });
+    } finally {
+      if (tmpPath) {
+        try { fs.unlinkSync(tmpPath); } catch (_) {}
+      }
+    }
+  });
+});
+
+// ─── RESOLVE CLARIFICATIONS — merge user answers → rebuild BOQ ───
+app.post('/resolve-clarifications', (req, res) => {
+  try {
+    const {
+      userText,
+      extracted,
+      clarifications,
+      combined_text,
+      filename,
+      question,
+      hints,
+      boqOpts,
+    } = req.body || {};
+    if (!userText || !extracted || !clarifications) {
+      return res.status(400).json({ error: 'Need userText + extracted + clarifications' });
+    }
+    const result = applyUserClarifications({
+      text: combined_text || '',
+      extracted,
+      clarifications,
+      userText,
+      filename: filename || 'drawing.pdf',
+      question: question || 'finalize with my answers',
+      hints: hints || [],
+      boqOpts: boqOpts || {},
+    });
+    return res.json({
+      success: true,
+      analysis: result.markdown,
+      content: [{ type: 'text', text: result.markdown }],
+      extracted: result.extracted,
+      clarifications: result.clarifications,
+      answers: result.answers,
+      schedule_first: {
+        mode: result.needsUserInput ? 'ask-user' : 'user-confirmed',
+        needs_user_input: !!result.needsUserInput,
+        questions: result.clarifications?.questions || [],
+        drawing_type: result.typeInfo?.drawing_type,
+        boq_items: result.boqResult?.boq?.length || 0,
+        tokens: 0,
+      },
+    });
+  } catch (e) {
+    console.error('[/resolve-clarifications]', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── 12. HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   const claudeKey = process.env.CLAUDE_API_KEY;
@@ -1997,9 +2323,10 @@ app.get('/health', (req, res) => {
     status: 'ok',
     claude_key_set: !!claudeKey,
     claude_preview: claudeKey ? claudeKey.slice(0, 12) + '...' : 'NOT SET ❌',
-    pipeline: 'local-first multi-type (CAD-zoom OCR → type detect → Q&A/BOQ; Claude only if needed)',
-    routes: ['/claude','/gemini','/export-excel','/export-pdf','/export-drawing','/analyze-dxf','/export-dxf-excel','/drawing-to-excel','/update-area-from-dxf','/fill-template-from-drawing','/analyze-dwg','/classify-dxf','/analyze-with-answers','/rates-stats'],
-    dwg_support: 'ZWCAD + AutoCAD — schedule-first + capped vision'
+    pipeline: 'Civils.ai-style: READ drawing → formula takeoff → DRAFT/FINAL BOQ (spatial+OCR+ask-user)',
+    max_upload_mb: 500,
+    routes: ['/analyze-drawing','/resolve-clarifications','/claude','/gemini','/export-excel','/export-pdf','/export-drawing','/analyze-dxf','/export-dxf-excel','/drawing-to-excel','/update-area-from-dxf','/fill-template-from-drawing','/analyze-dwg','/classify-dxf','/analyze-with-answers','/rates-stats'],
+    dwg_support: 'ZWCAD + AutoCAD — prefer PDF/DXF; size up to 500MB via /analyze-drawing'
   });
 });
 
