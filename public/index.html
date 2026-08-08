@@ -602,28 +602,58 @@ async function postAnalyzeDrawing(fileEntry, question){
 }
 
 function rememberClarify(data, filename, question){
-  if(data?.schedule_first?.needs_user_input && data.extracted && data.clarifications){
+  if(data?.schedule_first?.needs_user_input && data.extracted && data.clarifications?.questions?.length){
     pendingClarify={
       extracted:data.extracted,
       clarifications:data.clarifications,
-      combined_text:data.combined_text||'',
-      filename:filename||data.filename||'drawing.pdf',
-      question:question||'',
+      combined_text:data.combined_text||pendingClarify?.combined_text||'',
+      filename:filename||data.filename||pendingClarify?.filename||'drawing.pdf',
+      question:question||pendingClarify?.question||'',
+      qIndex:0,
     };
   }else if(data && !data.schedule_first?.needs_user_input){
     pendingClarify=null;
   }
 }
 
+/** Strip multi-question blocks — we ask one-by-one in chat instead */
+function stripClarifyBlock(md){
+  return String(md||'')
+    .replace(/\n## ❓ Question[\s\S]*$/i,'')
+    .replace(/\n## ❓ Please confirm[\s\S]*$/i,'')
+    .trim();
+}
+
+function formatCurrentClarifyQuestion(){
+  if(!pendingClarify) return '';
+  const qs=pendingClarify.clarifications?.questions||[];
+  const i=pendingClarify.qIndex||0;
+  if(!qs.length||i>=qs.length) return '';
+  const q=qs[i];
+  const total=qs.length;
+  return `## ❓ Question ${i+1} of ${total}\n\n**${q.question}**\n${q.why?'_Why:_ '+q.why+'\n':''}\n> Sirf iska jawab type karo. Phir agla question aayega.`;
+}
+
+function askNextClarify(){
+  const msg=formatCurrentClarifyQuestion();
+  if(!msg) return;
+  hist.push({role:'assistant',content:msg});
+  addMsgEl('ai',msg);
+}
+
 async function postResolveClarifications(userText){
   if(!pendingClarify) throw new Error('No pending clarification session');
+  // One-by-one: send only the CURRENT question to merge (free text OK)
+  const qs=pendingClarify.clarifications?.questions||[];
+  const i=pendingClarify.qIndex||0;
+  const currentQs=qs[i]?[qs[i]]:qs.slice(0,1);
   const res=await fetch('/resolve-clarifications',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({
       userText,
       extracted:pendingClarify.extracted,
-      clarifications:pendingClarify.clarifications,
+      clarifications:{questions:currentQs, summary:pendingClarify.clarifications?.summary},
       combined_text:pendingClarify.combined_text,
       filename:pendingClarify.filename,
       question:pendingClarify.question,
@@ -868,22 +898,39 @@ async function send(){
   // Init new chat if needed
   if(!currentChatId){currentChatId='chat_'+Date.now();}
 
-  // Numbered answers (1) … 2) …) → merge into schedules / rebuild BOQ
-  const looksLikeAnswers=pendingClarify && txt && !files.length && /^\s*\d+\s*[\)\.\-:]/.test(txt);
-  if(looksLikeAnswers){
+  // One-by-one Q&A (Claude-style): any reply answers the CURRENT question
+  if(pendingClarify && txt && !files.length){
     const disp=txt;
     addMsgEl('user',disp,[]);
     hist.push({role:'user',content:disp});
     tin.value='';tin.style.height='auto';
     addLoad();
     try{
+      const fname=pendingClarify.filename;
+      const qprev=pendingClarify.question;
+      const prevCombined=pendingClarify.combined_text;
       const data=await postResolveClarifications(txt);
-      const aiText=data.analysis||data.content?.filter(b=>b.type==='text').map(b=>b.text).join('')||'Updated.';
-      rememberClarify(data, pendingClarify.filename, pendingClarify.question);
+      const still=data.clarifications?.questions||data.schedule_first?.questions||[];
+      const aiText=data.analysis||data.content?.filter(b=>b.type==='text').map(b=>b.text).join('')||'✅ Noted.';
       rmLoad();
-      hist.push({role:'assistant',content:aiText,userText:txt});
-      addMsgEl('ai',aiText,[],true,null,txt,aiText);
-      saveChatToHistory('Answers applied');
+      if(still.length){
+        pendingClarify={
+          extracted:data.extracted||pendingClarify.extracted,
+          clarifications:{questions:still, summary:data.clarifications?.summary},
+          combined_text:data.combined_text||prevCombined||'',
+          filename:fname,
+          question:qprev,
+          qIndex:0,
+        };
+        hist.push({role:'assistant',content:aiText,userText:txt});
+        addMsgEl('ai',aiText);
+      }else{
+        pendingClarify=null;
+        const finalTxt=stripClarifyBlock(aiText);
+        hist.push({role:'assistant',content:finalTxt,userText:txt});
+        addMsgEl('ai',finalTxt,[],true,null,txt,finalTxt);
+        saveChatToHistory((fname||'Answers').slice(0,40));
+      }
     }catch(err){
       rmLoad();
       addMsgEl('ai','**Clarify Error:** '+err.message);
@@ -956,16 +1003,19 @@ async function send(){
         return;
       }
       rememberClarify(data, drawingFile.name, sentText||disp);
-      const aiText=data.analysis||data.content?.filter(b=>b.type==='text').map(b=>b.text).join('')||'Analysis failed.';
+      const rawAi=data.analysis||data.content?.filter(b=>b.type==='text').map(b=>b.text).join('')||'Analysis failed.';
+      // Report pehle (bina saare questions), phir Claude-style ek question
+      const aiText=stripClarifyBlock(rawAi);
       const meta=data.schedule_first;
       let footer='';
       if(meta){
-        footer=`\n\n---\n_Local pipeline · type: **${meta.drawing_type||'—'}** · mode: **${meta.mode||'—'}** · tables: **${meta.spatial_tables??'—'}** · file: **${meta.file_mb!=null?meta.file_mb+' MB':'—'}** · tokens: **${meta.tokens??0}**_`;
-        if(meta.needs_user_input) footer+='\n\n_Reply with numbered answers (1) … 2) …) — BOQ rebuild hoga without inventing._';
+        footer=`\n\n---\n_Local pipeline · type: **${meta.drawing_type||'—'}** · mode: **${meta.mode||'—'}** · file: **${meta.file_mb!=null?meta.file_mb+' MB':'—'}**_`;
+        if(pendingClarify) footer+='\n\n_Neeche ek-ek question aayega — Claude jaisa._';
       }
       rmLoad();
       hist.push({role:'assistant',content:aiText,userText:sentText});
       addMsgEl('ai',aiText+footer,[],true,sentFiles,sentText,aiText);
+      if(pendingClarify) setTimeout(()=>askNextClarify(),350);
       saveChatToHistory(drawingFile.name.slice(0,40));
     }catch(err){
       rmLoad();
