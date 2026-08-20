@@ -325,7 +325,7 @@ textarea.tin::placeholder{color:var(--tx3)}
         <textarea class="tin" id="tin" placeholder="Extra question optional — scope form above sets the trade…" rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
         <button class="sbtn" id="sbtn" onclick="send()">➤</button>
       </div>
-      <div class="hint">Default = <strong>local OCR (0 Claude)</strong> · Auto vision / weak BH digitise only use Claude when you pick those scopes</div>
+      <div class="hint">PDF + <kbd>Ctrl+V</kbd> schedule photo together → both OCR. Default = local (0 Claude).</div>
     </div>
   </div>
 </div>
@@ -889,18 +889,26 @@ function clearProject(){
   renderProjectSheets();
 }
 
-/** Upload drawing as multipart — works for any file size (no JSON/base64 ceiling). */
-async function postAnalyzeDrawing(fileEntry, question){
+/** Upload drawing as multipart — works for any file size (no JSON/base64 ceiling).
+ *  companions = pasted schedule screenshots OCR'd with the main PDF.
+ */
+async function postAnalyzeDrawing(fileEntry, question, companions=[]){
   const fd=new FormData();
-  if(fileEntry.rawFile){
-    fd.append('file', fileEntry.rawFile, fileEntry.name);
-  }else if(fileEntry.b64){
-    const bin=atob(fileEntry.b64);
-    const arr=new Uint8Array(bin.length);
-    for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
-    fd.append('file', new Blob([arr],{type:fileEntry.type||'application/pdf'}), fileEntry.name);
-  }else{
-    throw new Error('File data missing — dobara upload karo.');
+  const appendBlob=(form, field, entry)=>{
+    if(entry.rawFile){
+      form.append(field, entry.rawFile, entry.name);
+    }else if(entry.b64){
+      const bin=atob(entry.b64);
+      const arr=new Uint8Array(bin.length);
+      for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+      form.append(field, new Blob([arr],{type:entry.type||'application/pdf'}), entry.name);
+    }else{
+      throw new Error('File data missing — dobara upload karo.');
+    }
+  };
+  appendBlob(fd,'file', fileEntry);
+  for(const c of (companions||[]).slice(0,8)){
+    try{ appendBlob(fd,'extra', c); }catch(_){}
   }
   const scope=drawingAction==='calculate'?getTakeoffScope():null;
   const defaultQ=drawingAction==='read'?QT.drawing
@@ -921,12 +929,8 @@ async function postAnalyzeDrawing(fileEntry, question){
   if(!res.ok){
     // fallback to single-sheet analyze
     const fd2=new FormData();
-    if(fileEntry.rawFile) fd2.append('file', fileEntry.rawFile, fileEntry.name);
-    else if(fileEntry.b64){
-      const bin=atob(fileEntry.b64); const arr=new Uint8Array(bin.length);
-      for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
-      fd2.append('file', new Blob([arr],{type:fileEntry.type||'application/pdf'}), fileEntry.name);
-    }
+    appendBlob(fd2,'file', fileEntry);
+    for(const c of (companions||[]).slice(0,8)) try{ appendBlob(fd2,'extra', c); }catch(_){}
     fd2.append('question', question||defaultQ);
     fd2.append('filename', fileEntry.name||'drawing.pdf');
     fd2.append('action', drawingAction==='calculate'?'calculate':drawingAction);
@@ -1788,24 +1792,35 @@ async function send(){
 
   // Drawings (PDF / image / DWG/DWF) → multipart /analyze-drawing (any size, local-first)
   // Pure DXF already returned above via /classify-dxf
-  const drawingFile=sentFiles.find(f=>
+  // PDF + pasted schedule photos: OCR companions with the primary sheet
+  const drawingFiles=sentFiles.filter(f=>
     (!f.isDXF) && (
       f.isDrawing || f.isDWG || f.type==='application/pdf' || f.type?.startsWith('image/') ||
       /\.(pdf|png|jpe?g|webp|gif|bmp|tiff?|dwg|dwf)$/i.test(f.name||'')
     )
   );
-  if(drawingFile){
+  if(drawingFiles.length){
+    const primary=drawingFiles.find(f=>/\.pdf$/i.test(f.name||''))
+      || drawingFiles.find(f=>f.isDWG)
+      || drawingFiles[0];
+    const companions=drawingFiles.filter(f=>f!==primary && (
+      f.type?.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i.test(f.name||'')
+    ));
+    let q=sentText||disp||'';
+    if(/pcc|rcc|footing/i.test(q) && companions.length && !/calculate|takeoff|boq/i.test(q)){
+      q=q+' Calculate PCC and RCC of footing from schedule (photo may show format/table).';
+    }
     files=[];renderChips();
     addLoad('drawing');
     try{
-      const data=await postAnalyzeDrawing(drawingFile, sentText||disp||'');
+      const data=await postAnalyzeDrawing(primary, q, companions);
       if(data.needsDxfExport || data.needsPdfOrDxf){
         rmLoad();
         addMsgEl('ai', `⚠️ **File Conversion Error**\n\n${data.error||'Export PDF/DXF and re-upload (any size OK).'}`);
         busy=false;document.getElementById('sbtn').disabled=false;
         return;
       }
-      rememberClarify(data, drawingFile.name, sentText||disp);
+      rememberClarify(data, primary.name, q);
       const rawAi=data.analysis||data.content?.filter(b=>b.type==='text').map(b=>b.text).join('')||'Analysis failed.';
       lastTakeoff={
         markdown: rawAi,
@@ -1819,22 +1834,21 @@ async function send(){
         qaChecklist: data.qaChecklist||null,
         qaApproval:null,
         qaSigned:false,
-        filename: drawingFile.name||'drawing.pdf',
-        b64: data.b64 || drawingFile.b64 || null,
+        filename: primary.name||'drawing.pdf',
+        b64: data.b64 || primary.b64 || null,
       };
-      // Report pehle (bina saare questions), phir Claude-style ek question
       const aiText=stripClarifyBlock(rawAi);
       const meta=data.schedule_first;
       let footer='';
       if(meta){
-        footer=`\n\n---\n_Local pipeline · type: **${meta.drawing_type||'—'}** · mode: **${meta.mode||'—'}** · file: **${meta.file_mb!=null?meta.file_mb+' MB':'—'}**_`;
+        footer=`\n\n---\n_Local pipeline · type: **${meta.drawing_type||'—'}** · mode: **${meta.mode||'—'}** · file: **${meta.file_mb!=null?meta.file_mb+' MB':'—'}**${companions.length?` · schedule photos: **${companions.length}**`:''}_`;
         if(pendingClarify) footer+='\n\n_Confirm missing values one-by-one below, then export Excel._';
       }
       rmLoad();
       hist.push({role:'assistant',content:aiText,userText:sentText});
       addMsgEl('ai',aiText+footer,[],true,sentFiles,sentText,aiText);
       if(pendingClarify) setTimeout(()=>askNextClarify(),350);
-      saveChatToHistory(drawingFile.name.slice(0,40));
+      saveChatToHistory(primary.name.slice(0,40));
     }catch(err){
       rmLoad();
       addMsgEl('ai',`**Drawing Error:** ${err.message}\n\n_PDF/DXF dobara try karo — size limit nahi hai (500MB tak)._`);

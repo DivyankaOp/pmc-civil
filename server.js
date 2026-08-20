@@ -265,6 +265,35 @@ const uploadDrawing = multer({
 });
 try { fs.mkdirSync(path.join(os.tmpdir(), 'pmc_uploads'), { recursive: true }); } catch (_) {}
 
+/** OCR companion paste/schedule images and return merged text block */
+function ocrCompanionImages(extraFiles = []) {
+  const blocks = [];
+  for (const f of (extraFiles || []).slice(0, 8)) {
+    if (!f?.path || !fs.existsSync(f.path)) continue;
+    const name = f.originalname || f.filename || 'paste.png';
+    try {
+      const outDir = path.join(path.dirname(f.path), 'extra_crops_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6));
+      fs.mkdirSync(outDir, { recursive: true });
+      const zoom = runCadZoomOcrOnFile(f.path, outDir);
+      if (zoom?.success && zoom.full_text && String(zoom.full_text).trim().length > 20) {
+        blocks.push(`=== COMPANION IMAGE OCR (${name}) ===\n${zoom.full_text}\n=== END COMPANION ===`);
+        console.log(`[companion-ocr] ${name}: ${zoom.char_count || zoom.full_text.length} chars`);
+      } else {
+        console.warn(`[companion-ocr] weak/empty: ${name}`, zoom?.error || '');
+      }
+    } catch (e) {
+      console.warn(`[companion-ocr] ${name}:`, e.message);
+    }
+  }
+  return blocks.join('\n\n');
+}
+
+function cleanupUploadFiles(files) {
+  for (const f of files || []) {
+    if (f?.path) try { fs.unlinkSync(f.path); } catch (_) {}
+  }
+}
+
 function pyExec() {
   return process.env.PMC_PYTHON || (process.platform === 'win32' ? 'py -3' : 'python3');
 }
@@ -679,14 +708,14 @@ async function buildDrawingContextFromFile(filePath, opts = {}) {
     console.log('[drawing-context] Skipping OCR — schedule quality already good from vector text');
   }
 
-  const combinedText = combineExtractedText([
-    spatial.text,
-    plainLines.join('\n'),
-    extractedTextBlock,
-    gcvBlock,
-    cadZoomText,
-  ]);
   const userQuestion = opts.question || '';
+  const companionFirst = /photo|paste|format\s+is\s+shown|in\s+photo|schedule\s+photo/i.test(userQuestion)
+    && (opts.companionOcrText || '').length > 40;
+  const combinedText = combineExtractedText(
+    companionFirst
+      ? [opts.companionOcrText, spatial.text, plainLines.join('\n'), extractedTextBlock, gcvBlock, cadZoomText]
+      : [spatial.text, plainLines.join('\n'), extractedTextBlock, gcvBlock, cadZoomText, opts.companionOcrText || ''],
+  );
   const local = runScheduleFirstLocal(combinedText, {
     filename: opts.filename || path.basename(filePath) || 'drawing.pdf',
     question: userQuestion,
@@ -696,7 +725,7 @@ async function buildDrawingContextFromFile(filePath, opts = {}) {
     polylines: opts.polylines || [],
     action: opts.action || null,
   });
-  console.log(`[drawing-context] type=${local.typeInfo?.drawing_type} schedule=${local.extracted.quality} rows=${local.extracted.total_schedule_rows} localQA=${!!local.answeredLocally}`);
+  console.log(`[drawing-context] type=${local.typeInfo?.drawing_type} schedule=${local.extracted.quality} rows=${local.extracted.total_schedule_rows} localQA=${!!local.answeredLocally} companion=${(opts.companionOcrText || '').length}`);
 
   const needVision = forceVision || (local.needsClaude && local.needsVision);
   let fileBytes = 0;
@@ -2316,7 +2345,10 @@ app.get('/rates-stats', (req, res) => {
 // ─── ANALYZE DRAWING (multipart) — any size, Civils.ai-style local-first ───
 // Prefer this over stuffing PDF base64 into /claude JSON (breaks on large sheets).
 app.post('/analyze-drawing', (req, res) => {
-  uploadDrawing.single('file')(req, res, async (err) => {
+  uploadDrawing.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'extra', maxCount: 8 },
+  ])(req, res, async (err) => {
     if (err) {
       console.error('[/analyze-drawing] upload error:', err.message);
       return res.status(400).json({
@@ -2325,7 +2357,9 @@ app.post('/analyze-drawing', (req, res) => {
           : err.message,
       });
     }
-    let tmpPath = req.file?.path;
+    const primary = req.files?.file?.[0] || req.file;
+    const extras = req.files?.extra || [];
+    let tmpPath = primary?.path;
     try {
       const action = parseDrawingAction(req.body || {});
       let scope = parseTakeoffScope(req.body || {});
@@ -2338,8 +2372,8 @@ app.post('/analyze-drawing', (req, res) => {
       } else if (scope && !question) {
         question = buildQuestionFromScope(scope);
       }
-      let filename = req.file?.originalname || req.body?.filename || 'drawing.pdf';
-      let mime = req.file?.mimetype || req.body?.mime || '';
+      let filename = primary?.originalname || req.body?.filename || 'drawing.pdf';
+      let mime = primary?.mimetype || req.body?.mime || '';
 
       // JSON fallback: { b64, filename, question } for older clients
       if (!tmpPath && req.body?.b64) {
@@ -2352,9 +2386,14 @@ app.post('/analyze-drawing', (req, res) => {
         return res.status(400).json({ error: 'No file uploaded. Use FormData field "file".' });
       }
 
+      const companionOcrText = ocrCompanionImages(extras);
+      if (companionOcrText) {
+        console.log(`[/analyze-drawing] companion OCR chars=${companionOcrText.length} files=${extras.length}`);
+      }
+
       const ext = path.extname(filename).toLowerCase();
       const sizeMb = (fs.statSync(tmpPath).size / (1024 * 1024)).toFixed(1);
-      console.log(`[/analyze-drawing] ${filename} (${sizeMb} MB) action=${action || '-'} q="${question.slice(0, 80)}" agent=${scope?.agent || '-'}`);
+      console.log(`[/analyze-drawing] ${filename} (${sizeMb} MB) action=${action || '-'} q="${question.slice(0, 80)}" agent=${scope?.agent || '-'} extras=${extras.length}`);
 
       // DWG/DXF/DWF → reuse converter path then local OCR on PNG if produced
       if (['.dwg', '.dxf', '.dwf'].includes(ext)) {
@@ -2395,14 +2434,17 @@ app.post('/analyze-drawing', (req, res) => {
           }
         }
         const spatial = buildSpatialScheduleText({ ocrBoxes, plainLines: combined.split('\n') });
-        const scheduleBundle = runScheduleFirstLocal(spatial.text || combined, {
-          filename,
-          question,
-          hints,
-          spatialTables: spatial.tables || [],
-          scope,
-          action,
-        });
+        const scheduleBundle = runScheduleFirstLocal(
+          [spatial.text || combined, companionOcrText].filter(Boolean).join('\n\n'),
+          {
+            filename,
+            question,
+            hints,
+            spatialTables: spatial.tables || [],
+            scope,
+            action,
+          },
+        );
         const md = scheduleBundle.markdown || 'No schedule data found. Upload PDF export of the same sheet.';
         return res.json({
           success: true,
@@ -2439,6 +2481,7 @@ app.post('/analyze-drawing', (req, res) => {
         mime: mime || (ext === '.pdf' ? 'application/pdf' : undefined),
         scope,
         action,
+        companionOcrText,
       });
       let scheduleBundle = ctx.scheduleFirst;
       scheduleBundle = await enrichWithVisionAgents({
@@ -2527,7 +2570,9 @@ app.post('/analyze-drawing', (req, res) => {
       console.error('[/analyze-drawing]', e.message);
       return res.status(500).json({ error: e.message });
     } finally {
-      if (tmpPath) {
+      cleanupUploadFiles([primary, ...(extras || [])].filter(Boolean));
+      // b64 temp path not in multer list
+      if (tmpPath && primary?.path !== tmpPath) {
         try { fs.unlinkSync(tmpPath); } catch (_) {}
       }
     }
@@ -2700,9 +2745,14 @@ app.get('/project/:id/merge', (req, res) => {
 
 // Analyze drawing AND add to project in one call
 app.post('/project/analyze-sheet', (req, res) => {
-  uploadDrawing.single('file')(req, res, async (err) => {
+  uploadDrawing.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'extra', maxCount: 8 },
+  ])(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message });
-    let tmpPath = req.file?.path;
+    const primary = req.files?.file?.[0] || req.file;
+    const extras = req.files?.extra || [];
+    let tmpPath = primary?.path;
     try {
       const action = parseDrawingAction(req.body || {});
       let scope = parseTakeoffScope(req.body || {});
@@ -2715,16 +2765,22 @@ app.post('/project/analyze-sheet', (req, res) => {
       } else if (scope && !question) {
         question = buildQuestionFromScope(scope);
       }
-      const filename = req.file?.originalname || 'drawing.pdf';
+      const filename = primary?.originalname || 'drawing.pdf';
       let projectId = req.body?.projectId || '';
       if (!tmpPath) return res.status(400).json({ error: 'No file' });
+
+      const companionOcrText = ocrCompanionImages(extras);
+      if (companionOcrText) {
+        console.log(`[/project/analyze-sheet] companion OCR chars=${companionOcrText.length} files=${extras.length}`);
+      }
 
       const ctx = await buildDrawingContextFromFile(tmpPath, {
         question: question || 'Prepare quantity takeoff from this drawing',
         filename,
-        mime: req.file?.mimetype,
+        mime: primary?.mimetype,
         scope,
         action,
+        companionOcrText,
       });
       let scheduleBundle = ctx.scheduleFirst;
       scheduleBundle = await enrichWithVisionAgents({
@@ -2800,7 +2856,7 @@ app.post('/project/analyze-sheet', (req, res) => {
       console.error('[/project/analyze-sheet]', e.message);
       return res.status(500).json({ error: e.message });
     } finally {
-      if (tmpPath) try { fs.unlinkSync(tmpPath); } catch (_) {}
+      cleanupUploadFiles([primary, ...(extras || [])].filter(Boolean));
     }
   });
 });
