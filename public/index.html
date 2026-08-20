@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PMC Civil AI Agent</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700&family=Inter:wght@400;500&family=DM+Mono:wght@400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <style>
 :root{--navy:#0B1F3A;--gem:#1A73E8;--sur:#F7F8FC;--bor:rgba(11,31,58,0.1);--bor2:rgba(11,31,58,0.16);--tx:#0B1F3A;--tx2:#4B5E7A;--tx3:#8A9BB0;--r:10px;--r2:16px}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -56,6 +57,53 @@ html,body{height:100%;font-family:'Inter',sans-serif;background:var(--sur);color
 .proj-btn{font-size:10px;padding:4px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.15);background:rgba(26,115,232,.25);color:#fff;cursor:pointer}
 .proj-btn:hover{background:rgba(26,115,232,.45)}
 .dl-btn.ann{background:#0B1F3A;color:#fff}.dl-btn.ann:hover{background:#16345a}
+.scope-panel{background:linear-gradient(180deg,#fff 0%,#f3f6fb 100%);border:1px solid var(--bor);border-radius:12px;padding:10px 12px;margin-bottom:8px}
+.scope-h{font-size:11px;font-weight:600;color:var(--navy);margin-bottom:7px;letter-spacing:.03em;text-transform:uppercase}
+.scope-agents{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.scope-chip{font-size:11px;padding:5px 10px;border-radius:8px;border:1px solid var(--bor2);background:#fff;color:var(--tx2);cursor:pointer;font-family:'Inter',sans-serif}
+.scope-chip:hover{border-color:var(--gem);color:var(--navy)}
+.scope-chip.on{background:#E8F0FE;border-color:#1A73E8;color:#1A73E8;font-weight:500}
+.scope-items{display:flex;flex-wrap:wrap;gap:8px 12px;margin-bottom:6px}
+.scope-items label{font-size:11px;color:var(--tx2);display:flex;align-items:center;gap:4px;cursor:pointer}
+.scope-items input{accent-color:var(--gem)}
+.scope-note{width:100%;border:1px solid var(--bor);border-radius:8px;padding:6px 9px;font-size:12px;font-family:'Inter',sans-serif;resize:none;min-height:32px;background:#fff;color:var(--tx);outline:none}
+.scope-note:focus{border-color:var(--gem)}
+.scope-save{display:flex;gap:6px;margin-top:7px;flex-wrap:wrap;align-items:center}
+.scope-save input{flex:1;min-width:120px;border:1px solid var(--bor);border-radius:7px;padding:5px 8px;font-size:11px}
+.scope-save button{font-size:11px;padding:5px 10px;border-radius:7px;border:1px solid var(--bor2);background:#fff;cursor:pointer;color:var(--navy)}
+.saved-agents{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.saved-agents button{font-size:10px;padding:3px 8px;border-radius:6px;border:1px solid #C5D8FC;background:#E8F0FE;color:#1A73E8;cursor:pointer}
+.qty-edit{margin-top:10px;border:1px solid var(--bor);border-radius:10px;padding:8px;background:var(--sur)}
+.qty-edit table{width:100%;border-collapse:collapse;font-size:11px}
+.qty-edit th,.qty-edit td{border:1px solid var(--bor);padding:4px 6px;text-align:left}
+.qty-edit input{width:70px;border:1px solid var(--bor2);border-radius:4px;padding:2px 4px;font-size:11px}
+.map-panel{margin-top:10px;border:1px solid var(--bor);border-radius:10px;overflow:hidden;background:#fff}
+.map-panel .map-h{font-size:11px;font-weight:600;padding:8px 10px;border-bottom:1px solid var(--bor);color:var(--navy);display:flex;justify-content:space-between;align-items:center}
+#takeoffMap{height:260px;width:100%}
+.dl-btn.ags{background:#0F766E;color:#fff}.dl-btn.ags:hover{background:#0D6460}
+.dl-btn.geo{background:#1D4ED8;color:#fff}.dl-btn.geo:hover{background:#1E40AF}
+.dl-btn.map{background:#334155;color:#fff}.dl-btn.map:hover{background:#1e293b}
+.dl-btn.shp{background:#7C2D12;color:#fff}.dl-btn.shp:hover{background:#9A3412}
+.dl-btn.meas{background:#0369A1;color:#fff}.dl-btn.meas:hover{background:#075985}
+.qa-box{margin-top:10px;border:1px solid var(--bor);border-radius:10px;padding:8px 10px;background:#fff}
+.qa-box .qa-h{font-size:11px;font-weight:600;color:var(--navy);margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.qa-item{font-size:11px;padding:3px 0;display:flex;gap:6px;align-items:flex-start;color:var(--tx2)}
+.qa-item .ok{color:#059669}.qa-item .bad{color:#B91C1C}
+.qa-box .qa-sign{margin-top:8px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.qa-box .qa-sign input[type=text]{font-size:11px;padding:4px 8px;border:1px solid var(--bor);border-radius:6px;min-width:140px}
+.qa-box .qa-sign button{font-size:11px;padding:5px 10px;border-radius:6px;border:1px solid var(--navy);background:var(--navy);color:#fff;cursor:pointer}
+.qa-box .qa-sign button:disabled{opacity:.5;cursor:not-allowed}
+.qa-approved{font-size:11px;color:#059669;font-weight:600}
+.meas-modal{position:fixed;inset:0;background:rgba(11,31,58,.55);z-index:9999;display:none;align-items:center;justify-content:center;padding:16px}
+.meas-modal.on{display:flex}
+.meas-card{background:#fff;border-radius:14px;width:min(960px,96vw);max-height:92vh;display:flex;flex-direction:column;overflow:hidden}
+.meas-bar{padding:10px 12px;border-bottom:1px solid var(--bor);display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.meas-bar label{font-size:11px;color:var(--tx2)}
+.meas-bar select,.meas-bar input{font-size:11px;padding:4px 6px;border:1px solid var(--bor2);border-radius:6px}
+.meas-bar button{font-size:11px;padding:5px 10px;border-radius:7px;border:1px solid var(--bor2);background:var(--navy);color:#fff;cursor:pointer}
+.meas-wrap{position:relative;overflow:auto;background:#1e293b;flex:1;min-height:360px}
+#measCanvas{cursor:crosshair;display:block;margin:0 auto}
+.meas-hint{font-size:10px;color:var(--tx3);padding:6px 12px;border-top:1px solid var(--bor)}
 
 /* ── MAIN ── */
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
@@ -88,6 +136,13 @@ html,body{height:100%;font-family:'Inter',sans-serif;background:var(--sur);color
 .qi{font-size:16px;margin-bottom:5px;display:block}
 .ql{font-size:12px;font-weight:500;color:var(--navy);display:block}
 .qd{font-size:10px;color:var(--tx3);margin-top:2px;line-height:1.4;display:block}
+.action-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;width:100%;max-width:620px;margin-top:4px}
+.action-card{background:#fff;border:1.5px solid var(--bor2);border-radius:12px;padding:14px 10px;cursor:pointer;text-align:center;font-family:'Inter',sans-serif;transition:all .15s}
+.action-card:hover,.action-card.on{border-color:var(--gem);background:#F0F6FF;box-shadow:0 0 0 3px rgba(26,115,232,.07)}
+.action-card .al{font-size:13px;font-weight:700;color:var(--navy);display:block}
+.action-card .ad{font-size:10px;color:var(--tx3);margin-top:4px;display:block;line-height:1.35}
+.scope-panel.hidden{display:none!important}
+.trade-label{font-size:11px;font-weight:600;color:var(--tx3);text-transform:uppercase;letter-spacing:.06em;margin:12px 0 4px;width:100%;max-width:620px;text-align:left}
 
 /* ── MESSAGES ── */
 .msg{display:flex;gap:9px;align-items:flex-start;animation:fu .15s ease}
@@ -181,15 +236,15 @@ textarea.tin::placeholder{color:var(--tx3)}
     </div>
 
     <div class="sb-nav">
-      <div class="nlabel">Mode</div>
-      <button class="nb active" onclick="setMode('auto',this)"><span class="ni">🤖</span>Auto-detect</button>
-      <div class="nlabel">Tasks</div>
-      <button class="nb" onclick="setMode('drawing',this)"><span class="ni">📐</span>Drawing Analysis</button>
+      <div class="nlabel">Drawing (Civils-style)</div>
+      <button class="nb" onclick="setMode('drawing',this)"><span class="ni">📖</span>Read drawing</button>
+      <button class="nb" onclick="setMode('study',this)"><span class="ni">🎓</span>Study drawing</button>
+      <button class="nb active" onclick="setMode('auto',this)"><span class="ni">🧮</span>Calculate / takeoff</button>
+      <div class="nlabel">Other tasks</div>
       <button class="nb" onclick="setMode('estimate',this)"><span class="ni">🧮</span>Cost Estimation</button>
-      <button class="nb" onclick="setMode('boq',this)"><span class="ni">📋</span>BOQ / Takeoff</button>
+      <button class="nb" onclick="setMode('boq',this)"><span class="ni">📋</span>Full BOQ</button>
       <button class="nb" onclick="setMode('compare',this)"><span class="ni">⚖️</span>Comparison Report</button>
       <button class="nb" onclick="setMode('report',this)"><span class="ni">📊</span>Site Report</button>
-      <button class="nb" onclick="setMode('study',this)"><span class="ni">🏗️</span>Drawing Study</button>
     </div>
 
     <div class="hist-section" id="histSection">
@@ -227,46 +282,89 @@ textarea.tin::placeholder{color:var(--tx3)}
       <div class="welcome" id="welcome">
         <div class="wico">🏗️</div>
         <div class="wtit">PMC Civil AI</div>
-        <div class="wsub">Upload a drawing, type the scope, get a <strong>draft quantity takeoff</strong> — confirm gaps, then download Excel.</div>
+        <div class="wsub">Civils.ai-style: <strong>Read</strong> the sheet → <strong>Study</strong> it → <strong>Calculate</strong> quantities. Missing cells pe invent nahi — poochhega.</div>
         <div class="steps">
-          <div class="step"><div class="step-n">01</div><div class="step-t">Upload PDF</div><div class="step-d">Drawing / schedule sheet (drag-drop or Ctrl+V)</div></div>
-          <div class="step"><div class="step-n">02</div><div class="step-t">Type scope</div><div class="step-d">e.g. footing PCC/RCC, or leave blank for full takeoff</div></div>
-          <div class="step"><div class="step-n">03</div><div class="step-t">Review & export</div><div class="step-d">Confirm missing qty → download PMC Excel</div></div>
+          <div class="step"><div class="step-n">01</div><div class="step-t">Pick action</div><div class="step-d">Read · Study · Calculate</div></div>
+          <div class="step"><div class="step-n">02</div><div class="step-t">Upload PDF</div><div class="step-d">Drawing / schedule / BH log</div></div>
+          <div class="step"><div class="step-n">03</div><div class="step-t">Confirm & export</div><div class="step-d">Human QA → Excel / AGS</div></div>
         </div>
-        <div class="qgrid">
-          <button class="qcard" onclick="qs('takeoff')"><span class="qi">📐</span><span class="ql">Quantity takeoff</span><span class="qd">Upload → schedules → draft qty → Excel</span></button>
-          <button class="qcard" onclick="qs('footing')"><span class="qi">🧱</span><span class="ql">Footing PCC / RCC</span><span class="qd">Only footing volumes from schedule</span></button>
-          <button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Full BOQ</span><span class="qd">Complete BOQ with rates</span></button>
-          <button class="qcard" onclick="qs('measure')"><span class="qi">📏</span><span class="ql">Plan measure</span><span class="qd">Areas / lengths / counts from drawing</span></button>
-          <button class="qcard" onclick="qs('drawing')"><span class="qi">🔎</span><span class="ql">Read only</span><span class="qd">Sheet identity — no qty</span></button>
-          <button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare quotes</span><span class="qd">2–3 PDFs → comparison</span></button>
+        <div class="action-row" id="actionRow">
+          <button type="button" class="action-card" id="actRead" onclick="setDrawingAction('read')"><span class="al">Read</span><span class="ad">Type · title · schedules · levels — no BOQ</span></button>
+          <button type="button" class="action-card" id="actStudy" onclick="setDrawingAction('study')"><span class="al">Study</span><span class="ad">How to read · mistakes · quiz</span></button>
+          <button type="button" class="action-card on" id="actCalc" onclick="setDrawingAction('calculate')"><span class="al">Calculate</span><span class="ad">Draft takeoff · ask gaps · Excel</span></button>
+        </div>
+        <div class="trade-label" id="tradeLabel">Calculate trades (optional)</div>
+        <div class="qgrid" id="tradeGrid">
+          <button class="qcard" onclick="pickAgent('full')"><span class="qi">📐</span><span class="ql">Full takeoff</span><span class="qd">All trades from sheet</span></button>
+          <button class="qcard" onclick="pickAgent('concrete')"><span class="qi">🧱</span><span class="ql">Concrete</span><span class="qd">Footings · columns · PCC</span></button>
+          <button class="qcard" onclick="pickAgent('openings')"><span class="qi">🚪</span><span class="ql">Doors & windows</span><span class="qd">Opening schedules</span></button>
+          <button class="qcard" onclick="pickAgent('vision_takeoff')"><span class="qi">👁️</span><span class="ql">Auto vision</span><span class="qd">Uses Claude — no click measure</span></button>
+          <button class="qcard" onclick="pickAgent('borehole_digitise')"><span class="qi">📝</span><span class="ql">Handwritten BH</span><span class="qd">Factory score → AGS</span></button>
+          <button class="qcard" onclick="pickAgent('earthworks')"><span class="qi">⛏️</span><span class="ql">Earthworks</span><span class="qd">Cut / fill + bulking</span></button>
+          <button class="qcard" onclick="pickAgent('paving')"><span class="qi">🛣️</span><span class="ql">Paving</span><span class="qd">Asphalt · DBM · WMM · GSB</span></button>
+          <button class="qcard" onclick="pickAgent('groundworks')"><span class="qi">🚧</span><span class="ql">Groundworks</span><span class="qd">Cut/fill + paving layers</span></button>
         </div>
       </div>
     </div>
 
     <div class="iarea" id="dropzone">
+      <div class="scope-panel" id="scopePanel">
+        <div class="scope-h">Takeoff scope</div>
+        <div class="scope-agents" id="scopeAgents"></div>
+        <div class="scope-items" id="scopeItems"></div>
+        <textarea class="scope-note" id="scopeNote" placeholder="Optional instructions (e.g. only F1–F5, ignore steel)…" rows="1"></textarea>
+        <div class="scope-save">
+          <input id="agentName" placeholder="Save agent as…"/>
+          <button type="button" onclick="saveCurrentAgent()">Save agent</button>
+        </div>
+        <div class="saved-agents" id="savedAgents"></div>
+      </div>
       <div class="chips" id="chips"></div>
       <div class="ibox">
         <button class="attbtn" title="Attach PDF / screenshot / DWG" onclick="document.getElementById('fi').click()">📎</button>
-        <textarea class="tin" id="tin" placeholder="Upload drawing, then type scope — or leave blank for full takeoff…" rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
+        <textarea class="tin" id="tin" placeholder="Extra question optional — scope form above sets the trade…" rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
         <button class="sbtn" id="sbtn" onclick="send()">➤</button>
       </div>
-      <div class="hint">PDF · PNG · DWG/DXF · drag-drop · <kbd>Ctrl+V</kbd> · default = <strong>quantity takeoff</strong></div>
+      <div class="hint">Default = <strong>local OCR (0 Claude)</strong> · Auto vision / weak BH digitise only use Claude when you pick those scopes</div>
     </div>
   </div>
 </div>
 <input type="file" id="fi" accept="image/*,.pdf,.png,.jpg,.jpeg,.webp,.gif,.bmp,.tif,.tiff,.dxf,.DXF,.dwg,.DWG,.dwf,.DWF,.xlsx,.xls,.csv,.doc,.docx,.txt" multiple onchange="onFiles(event)">
 
+<div class="meas-modal" id="measModal">
+  <div class="meas-card">
+    <div class="meas-bar">
+      <strong style="font-size:12px;color:var(--navy)">Click measure</strong>
+      <label>Scale 1:<input id="measScale" type="number" value="100" min="1" max="5000" style="width:64px"/></label>
+      <label>Mode
+        <select id="measMode"><option value="polygon">Area polygon</option><option value="line">Length</option><option value="calibrate">Calibrate 2-pt</option></select>
+      </label>
+      <label>Calib length (m)<input id="measCalibM" type="number" step="any" value="10" style="width:64px"/></label>
+      <button type="button" onclick="measUndo()">Undo</button>
+      <button type="button" onclick="measClosePoly()">Close / finish</button>
+      <button type="button" onclick="measClear()">Clear</button>
+      <button type="button" style="background:#64748b" onclick="closeClickMeasure()">Close</button>
+    </div>
+    <div class="meas-wrap"><canvas id="measCanvas"></canvas></div>
+    <div class="meas-hint" id="measHint">Click corners for polygon. Double-click or Finish to close. Calibrate 2 points + known length for accuracy.</div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+if(window.pdfjsLib){ pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; }
+</script>
 <script>
 // ── MODES ──────────────────────────────────────────────
 const MODES={
-  auto:{t:'PMC Civil AI',s:'Upload drawing → quantity takeoff → confirm → Excel',b:'Takeoff'},
-  drawing:{t:'Drawing Analysis',s:'Upload civil drawings — full analysis with IS codes + Excel download',b:'Drawing'},
+  auto:{t:'Calculate / takeoff',s:'Upload drawing → draft quantities → confirm → Excel',b:'Calculate'},
+  drawing:{t:'Read drawing',s:'Sheet type, title, schedules, levels — no BOQ',b:'Read'},
   estimate:{t:'Cost Estimation',s:'Item-wise cost in INR + Excel download',b:'Estimate'},
-  boq:{t:'BOQ / Material Takeoff',s:'Full BOQ with units, rates + Excel download',b:'BOQ'},
+  boq:{t:'Full BOQ',s:'Full BOQ with units, rates + Excel download',b:'BOQ'},
   compare:{t:'Comparison Report',s:'2-3 quotes → Excel comparison with PMC recommendation',b:'Compare'},
   report:{t:'Site Progress Report',s:'Formal PMC site report + Excel download',b:'Report'},
-  study:{t:'Drawing Study',s:'Educational walkthrough with IS codes',b:'Study'}
+  study:{t:'Study drawing',s:'How to read · common mistakes · quiz',b:'Study'}
 };
 const SYS={
   auto:`You are PMC Civil AI — quantity takeoff assistant for India. Today: ${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'})}.
@@ -311,18 +409,119 @@ const QT={
   boq:`Prepare full BOQ from this drawing — schedules, formulas, ask missing values.`,
   compare:`I want to compare quotes/drawings. Uploading files now — give full comparison + Excel report.`,
   report:`I need a PMC site progress report. Please ask me for the details needed.`,
-  study:`I want to study this civil drawing. Uploading now — give educational walkthrough.`
+  study:`Study this civil drawing — educational walkthrough: how to read tables/sections/levels, common mistakes, 3 quiz questions. Do not prepare BOQ.`,
+  geotech:`Extract geotech borehole data (BH marks, GL, water table, SPT, strata).`
 };
+
+const TAKEOFF_AGENTS=[
+  {id:'full',label:'Full sheet',items:['footings','columns','doors','windows','areas','pcc']},
+  {id:'concrete',label:'Concrete',items:['footings','columns','pcc','excavation']},
+  {id:'openings',label:'Doors & windows',items:['doors','windows']},
+  {id:'plan_areas',label:'Plan areas',items:['areas','lengths','counts']},
+  {id:'vision_takeoff',label:'Auto vision (Claude)',items:['areas','lengths','counts','vision']},
+  {id:'earthworks',label:'Earthworks',items:['cut','fill','excavation','areas','paving']},
+  {id:'paving',label:'Paving layers',items:['paving','areas','lengths']},
+  {id:'groundworks',label:'Groundworks',items:['cut','fill','paving','areas','excavation']},
+  {id:'geotech',label:'Geotech (local)',items:['boreholes','spt','water']},
+  {id:'borehole_digitise',label:'BH→AGS (Claude if OCR weak)',items:['boreholes','spt','water','handwritten']},
+];
+const ALL_SCOPE_ITEMS=['footings','columns','pcc','excavation','doors','windows','areas','lengths','counts','cut','fill','paving','boreholes','spt','water','vision','handwritten'];
+const SAVED_AGENTS_KEY='pmc_saved_agents';
 
 // ── STATE ──────────────────────────────────────────────
 let mode='auto', hist=[], files=[], busy=false;
+/** Civils product action: read | study | calculate */
+let drawingAction='calculate';
+let takeoffScope={ agent:'full', items:[...TAKEOFF_AGENTS[0].items], instructions:'' };
+let takeoffMap=null;
 /** Last drawing extract waiting for numbered user answers */
 let pendingClarify=null;
 let currentChatId=null, sentFilesCache=[], sentTextCache='';
 /** Multi-sheet project + last takeoff for annotated PDF */
 let projectId=localStorage.getItem('pmc_project_id')||'';
 let projectMeta=null;
-let lastTakeoff={ markdown:'', extracted:null, measure:null, filename:'', b64:null };
+let lastTakeoff={ markdown:'', extracted:null, measure:null, geotech:null, earthworks:null, paving:null, groundworks:null, groundModel:null, qaChecklist:null, qaApproval:null, filename:'', b64:null, qaSigned:false };
+let measState={ points:[], closed:[], calibPxPerM:null, page:null, viewport:null, img:null, dragging:false };
+
+function getTakeoffScope(){
+  const items=[...document.querySelectorAll('#scopeItems input:checked')].map(el=>el.value);
+  const note=(document.getElementById('scopeNote')?.value||'').trim();
+  return {
+    agent: takeoffScope.agent||'full',
+    items: items.length?items:(takeoffScope.items||[]),
+    instructions: note,
+  };
+}
+function loadSavedAgents(){
+  try{ return JSON.parse(localStorage.getItem(SAVED_AGENTS_KEY)||'[]'); }catch(_){ return []; }
+}
+function renderSavedAgents(){
+  const el=document.getElementById('savedAgents');
+  if(!el) return;
+  const list=loadSavedAgents();
+  if(!list.length){ el.innerHTML=''; return; }
+  el.innerHTML=list.map((a,i)=>
+    `<button type="button" title="Load saved agent" onclick="loadSavedAgent(${i})">${a.name}</button>`
+  ).join('')+`<button type="button" style="background:#fee2e2;border-color:#fecaca;color:#b91c1c" onclick="clearSavedAgents()">Clear saved</button>`;
+}
+function saveCurrentAgent(){
+  const name=(document.getElementById('agentName')?.value||'').trim()||(takeoffScope.agent+'_'+Date.now().toString(36));
+  const scope=getTakeoffScope();
+  const list=loadSavedAgents().filter(a=>a.name!==name);
+  list.unshift({ name, ...scope, savedAt: Date.now() });
+  localStorage.setItem(SAVED_AGENTS_KEY, JSON.stringify(list.slice(0,20)));
+  const inp=document.getElementById('agentName'); if(inp) inp.value='';
+  renderSavedAgents();
+}
+function loadSavedAgent(i){
+  const a=loadSavedAgents()[i];
+  if(!a) return;
+  takeoffScope={ agent:a.agent||'full', items:[...(a.items||[])], instructions:a.instructions||'' };
+  const note=document.getElementById('scopeNote'); if(note) note.value=a.instructions||'';
+  renderScopePanel();
+}
+function clearSavedAgents(){
+  localStorage.removeItem(SAVED_AGENTS_KEY);
+  renderSavedAgents();
+}
+function renderScopePanel(){
+  const agentsEl=document.getElementById('scopeAgents');
+  const itemsEl=document.getElementById('scopeItems');
+  if(!agentsEl||!itemsEl) return;
+  agentsEl.innerHTML=TAKEOFF_AGENTS.map(a=>
+    `<button type="button" class="scope-chip${takeoffScope.agent===a.id?' on':''}" onclick="pickAgent('${a.id}')">${a.label}</button>`
+  ).join('');
+  const selected=new Set(takeoffScope.items||[]);
+  itemsEl.innerHTML=ALL_SCOPE_ITEMS.map(it=>
+    `<label><input type="checkbox" value="${it}" ${selected.has(it)?'checked':''} onchange="onScopeItemChange()"> ${it}</label>`
+  ).join('');
+  const note=document.getElementById('scopeNote');
+  if(note && takeoffScope.instructions!=null && !note.value) note.value=takeoffScope.instructions||'';
+  renderSavedAgents();
+}
+function pickAgent(id){
+  setDrawingAction('calculate');
+  const a=TAKEOFF_AGENTS.find(x=>x.id===id)||TAKEOFF_AGENTS[0];
+  takeoffScope={ agent:a.id, items:[...a.items], instructions:takeoffScope.instructions||'' };
+  renderScopePanel();
+  const tin=document.getElementById('tin');
+  if(tin && !tin.value.trim()){
+    if(id==='geotech') tin.value=QT.geotech;
+    else if(id==='borehole_digitise') tin.value='Digitise handwritten or scanned borehole logs into AGS (BH, GL, WT, SPT, strata).';
+    else if(id==='vision_takeoff') tin.value='Auto vision takeoff — measure areas, lengths and counts from the drawing without clicking.';
+    else if(id==='earthworks') tin.value='Calculate earthworks cut and fill from levels and plan areas (include paving layers if present).';
+    else if(id==='paving') tin.value='Paving / road layer takeoff — areas × asphalt/DBM/WMM/GSB thicknesses to volumes.';
+    else if(id==='groundworks') tin.value='Groundworks takeoff — cut/fill with bulking/borrow plus paving layer volumes (asphalt/DBM/WMM/GSB).';
+    else if(id==='plan_areas') tin.value=QT.measure;
+    else if(id==='concrete') tin.value=QT.footing;
+    else tin.value=QT.takeoff;
+    aRz(tin);
+  }
+  tin?.focus();
+}
+function onScopeItemChange(){
+  takeoffScope.items=[...document.querySelectorAll('#scopeItems input:checked')].map(el=>el.value);
+}
 
 // ── HISTORY STORAGE ────────────────────────────────────
 const HS_KEY='pmc_chat_history';
@@ -434,10 +633,51 @@ function clearAllHistory(){
 // ── MODE ───────────────────────────────────────────────
 function setMode(m,el){
   mode=m;document.querySelectorAll('.nb').forEach(b=>b.classList.remove('active'));
-  el.classList.add('active');const i=MODES[m];
+  if(el) el.classList.add('active');
+  const i=MODES[m];
   document.getElementById('tbt').textContent=i.t;
   document.getElementById('tbs').textContent=i.s;
   document.getElementById('mbadge').textContent=i.b;
+  if(m==='drawing') setDrawingAction('read');
+  else if(m==='study') setDrawingAction('study');
+  else if(m==='auto'||m==='boq') setDrawingAction('calculate');
+}
+
+function setDrawingAction(act){
+  drawingAction=act==='read'||act==='study'?act:'calculate';
+  const map={read:'actRead',study:'actStudy',calculate:'actCalc'};
+  Object.entries(map).forEach(([k,id])=>{
+    const el=document.getElementById(id);
+    if(el) el.classList.toggle('on', k===drawingAction);
+  });
+  const tin=document.getElementById('tin');
+  if(tin){
+    if(drawingAction==='read') tin.value=QT.drawing;
+    else if(drawingAction==='study') tin.value=QT.study;
+    else if(!tin.value.trim()||/read this drawing only|study this civil/i.test(tin.value)) tin.value=QT.takeoff;
+    aRz(tin);
+  }
+  syncScopeVisibility();
+  // Sync sidebar active button
+  if(drawingAction==='read') mode='drawing';
+  else if(drawingAction==='study') mode='study';
+  else if(mode!=='boq') mode='auto';
+  const badge=MODES[mode];
+  if(badge){
+    document.getElementById('tbt').textContent=badge.t;
+    document.getElementById('tbs').textContent=badge.s;
+    document.getElementById('mbadge').textContent=badge.b;
+  }
+}
+
+function syncScopeVisibility(){
+  const panel=document.getElementById('scopePanel');
+  const trade=document.getElementById('tradeGrid');
+  const label=document.getElementById('tradeLabel');
+  const showCalc=drawingAction==='calculate';
+  if(panel) panel.classList.toggle('hidden', !showCalc);
+  if(trade) trade.style.display=showCalc?'grid':'none';
+  if(label) label.style.display=showCalc?'block':'none';
 }
 
 // ── FILES ───────────────────────────────────────────────
@@ -599,8 +839,8 @@ function setupDragPaste(){
     }
   });
 }
-document.addEventListener('DOMContentLoaded', ()=>{ setupDragPaste(); if(projectId) ensureProject().catch(()=>{}); });
-if(document.readyState!=='loading'){ setupDragPaste(); if(projectId) ensureProject().catch(()=>{}); }
+document.addEventListener('DOMContentLoaded', ()=>{ setupDragPaste(); renderScopePanel(); syncScopeVisibility(); renderSavedAgents(); if(projectId) ensureProject().catch(()=>{}); });
+if(document.readyState!=='loading'){ setupDragPaste(); renderScopePanel(); syncScopeVisibility(); renderSavedAgents(); if(projectId) ensureProject().catch(()=>{}); }
 
 function renderChips(){
   const c=document.getElementById('chips');c.innerHTML='';
@@ -641,7 +881,7 @@ async function mergeProject(){
   const r=await fetch('/project/'+projectId+'/merge');
   const d=await r.json();
   if(!r.ok) throw new Error(d.error||'Merge failed');
-  lastTakeoff={ markdown:d.markdown, extracted:null, measure:null, filename:'project-merge', b64:null };
+  lastTakeoff={ markdown:d.markdown, extracted:null, measure:null, geotech:null, earthworks:null, paving:null, groundworks:null, qaChecklist:null, qaApproval:null, qaSigned:false, filename:'project-merge', b64:null };
   addMsgEl('ai', d.markdown, [], true, null, 'project merge', d.markdown);
 }
 function clearProject(){
@@ -662,8 +902,17 @@ async function postAnalyzeDrawing(fileEntry, question){
   }else{
     throw new Error('File data missing — dobara upload karo.');
   }
-  fd.append('question', question||'Prepare quantity takeoff from this drawing — read schedules, calculate quantities, ask missing values one-by-one.');
+  const scope=drawingAction==='calculate'?getTakeoffScope():null;
+  const defaultQ=drawingAction==='read'?QT.drawing
+    :drawingAction==='study'?QT.study
+      :'Prepare quantity takeoff from this drawing — read schedules, calculate quantities, ask missing values one-by-one.';
+  fd.append('question', question||defaultQ);
   fd.append('filename', fileEntry.name||'drawing.pdf');
+  fd.append('action', drawingAction==='calculate'?'calculate':drawingAction);
+  if(scope){
+    fd.append('scope', JSON.stringify(scope));
+    fd.append('agent', scope.agent||'full');
+  }
   // Multi-sheet: also register into project workspace
   await ensureProject();
   fd.append('projectId', projectId);
@@ -678,8 +927,13 @@ async function postAnalyzeDrawing(fileEntry, question){
       for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
       fd2.append('file', new Blob([arr],{type:fileEntry.type||'application/pdf'}), fileEntry.name);
     }
-    fd2.append('question', question||'Prepare quantity takeoff from this drawing');
+    fd2.append('question', question||defaultQ);
     fd2.append('filename', fileEntry.name||'drawing.pdf');
+    fd2.append('action', drawingAction==='calculate'?'calculate':drawingAction);
+    if(scope){
+      fd2.append('scope', JSON.stringify(scope));
+      fd2.append('agent', scope.agent||'full');
+    }
     const res2=await fetch('/analyze-drawing',{method:'POST',body:fd2});
     const data2=await res2.json().catch(()=>({}));
     if(!res2.ok) throw new Error(data2.error||data.error||('HTTP '+res.status));
@@ -804,25 +1058,170 @@ function addMsgEl(role,text,fnames,badge,msgFiles,msgText,aiResponseText,dxfFile
     const xlB=mkBtn('xl','📊','Comparison Excel',()=>dlFile(xlB,'/export-excel',msgFiles,msgText||'',aiResponseText||text));
     const pdB=mkBtn('pdf','📄','Download PDF',()=>dlFile(pdB,'/export-pdf',msgFiles,msgText||'',aiResponseText||text));
     const annB=mkBtn('ann','📝','Annotated takeoff PDF',()=>dlAnnotatedPdf(annB));
-    br.appendChild(xlB);br.appendChild(pdB);br.appendChild(annB);bub.appendChild(br);
+    br.appendChild(xlB);br.appendChild(pdB);br.appendChild(annB);
+    appendTakeoffExtraButtons(br);
+    bub.appendChild(br);
+    appendQtyEditAndMap(bub);
   } else if(role==='ai' && lastTakeoff.markdown){
     const br=document.createElement('div');br.className='btn-row';
     const annB=mkBtn('ann','📝','Annotated takeoff PDF',()=>dlAnnotatedPdf(annB));
-    br.appendChild(annB);bub.appendChild(br);
+    br.appendChild(annB);
+    appendTakeoffExtraButtons(br);
+    bub.appendChild(br);
+    appendQtyEditAndMap(bub);
   }
   row.appendChild(av);row.appendChild(bub);chat.appendChild(row);chat.scrollTop=chat.scrollHeight;
 }
 
+function appendTakeoffExtraButtons(br){
+  br.appendChild(mkBtn('meas','🖊️','Click measure',()=>openClickMeasure()));
+  if(lastTakeoff.geotech?.boreholes?.length){
+    br.appendChild(mkBtn('ags','🕳️','AGS 4.1',btn=>dlAgs(btn)));
+  }
+  if(lastTakeoff.geotech?.boreholes?.length || lastTakeoff.measure?.items?.length){
+    br.appendChild(mkBtn('geo','🗺️','GeoJSON',btn=>dlGeoJson(btn)));
+    br.appendChild(mkBtn('shp','📦','Shapefile ZIP',btn=>dlShapefile(btn)));
+    br.appendChild(mkBtn('map','📍','Map + ground model',()=>showTakeoffMap()));
+  }
+}
+
+function appendQtyEditAndMap(bub){
+  const items=collectEditableQtys();
+  if(items.length){
+    const wrap=document.createElement('div');
+    wrap.className='qty-edit';
+    wrap.innerHTML=`<div style="font-size:11px;font-weight:600;margin-bottom:6px;color:var(--navy)">Edit quantities (then re-export)</div>
+      <table><thead><tr><th>Item</th><th>Qty</th><th>Unit</th></tr></thead>
+      <tbody>${items.map((it,i)=>`<tr><td>${it.label}</td><td><input data-qi="${i}" type="number" step="any" value="${it.qty??''}" onchange="applyQtyEdit(${i},this.value)"/></td><td>${it.unit||''}</td></tr>`).join('')}</tbody></table>`;
+    bub.appendChild(wrap);
+  }
+  // Human QA gate — mandatory ticks + reviewer before export
+  const qa=lastTakeoff.qaChecklist;
+  if(qa?.items?.length){
+    const box=document.createElement('div');
+    box.className='qa-box';
+    const approved=!!lastTakeoff.qaApproval?.approved;
+    box.innerHTML=`<div class="qa-h"><span>Human QA on every takeoff (${qa.score})</span>
+      ${approved?`<span class="qa-approved">✓ Signed by ${lastTakeoff.qaApproval.reviewer}</span>`:'<span style="font-size:10px;color:#B91C1C">Exports locked</span>'}</div>
+      ${qa.items.map(it=>{
+        if(it.requiresConfirm){
+          return `<div class="qa-item"><label><input type="checkbox" class="qa-confirm" data-qid="${it.id}" ${approved?'checked disabled':''}/> <b>${it.label}</b> — ${it.detail||''}</label></div>`;
+        }
+        return `<div class="qa-item"><span class="${it.ok?'ok':'bad'}">${it.ok?'✓':'!'}</span><span><b>${it.label}</b> — ${it.detail||''}</span></div>`;
+      }).join('')}
+      ${approved?'':`<div class="qa-sign">
+        <input type="text" id="qaReviewer" placeholder="Reviewer name (required)" value="${localStorage.getItem('pmc_qa_reviewer')||''}"/>
+        <button type="button" id="qaApproveBtn" onclick="submitHumanQa()">Approve for export</button>
+      </div>`}
+      <div style="font-size:10px;color:var(--tx3);margin-top:4px">${qa.note||''}</div>`;
+    bub.appendChild(box);
+  }
+  if(lastTakeoff.geotech?.boreholes?.length || lastTakeoff.measure?.geometry?.length || lastTakeoff.measure?.items?.length){
+    const mp=document.createElement('div');
+    mp.className='map-panel';
+    mp.id='mapPanel';
+    mp.style.display='none';
+    mp.innerHTML=`<div class="map-h"><span>Map / ground model</span><button type="button" class="proj-btn" onclick="document.getElementById('mapPanel').style.display='none'">Hide</button></div><div id="takeoffMap"></div>`;
+    bub.appendChild(mp);
+  }
+}
+
+function collectEditableQtys(){
+  const out=[];
+  const ft=lastTakeoff.extracted?.schedules?.footings||[];
+  ft.forEach((f,i)=>out.push({ kind:'footing', index:i, label:`Footing ${f.mark}`, qty:f.qty, unit:'nos' }));
+  (lastTakeoff.measure?.items||[]).forEach((m,i)=>out.push({ kind:'measure', index:i, label:m.description||m.type, qty:m.qty, unit:m.unit }));
+  (lastTakeoff.earthworks?.items||[]).filter(e=>e.qty!=null).forEach((e,i)=>out.push({ kind:'earthworks', index:i, label:e.description||e.type, qty:e.qty, unit:e.unit }));
+  (lastTakeoff.paving?.items||[]).filter(e=>e.qty!=null).forEach((e,i)=>out.push({ kind:'paving', index:i, label:e.description||e.type, qty:e.qty, unit:e.unit }));
+  return out;
+}
+
+function ensureHumanQaOrAlert(){
+  if(lastTakeoff.qaApproval?.approved) return true;
+  alert('Human QA required: tick second-pass + engineer sign-off, enter reviewer name, then Approve for export.');
+  return false;
+}
+
+async function submitHumanQa(){
+  const reviewer=(document.getElementById('qaReviewer')?.value||'').trim();
+  if(!reviewer||reviewer.length<2){ alert('Reviewer name required'); return; }
+  localStorage.setItem('pmc_qa_reviewer', reviewer);
+  const confirmedIds=[...document.querySelectorAll('.qa-confirm:checked')].map(el=>el.dataset.qid);
+  const btn=document.getElementById('qaApproveBtn');
+  if(btn){ btn.disabled=true; btn.textContent='Approving…'; }
+  try{
+    const res=await fetch('/qa-approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      checklist: lastTakeoff.qaChecklist,
+      reviewer,
+      confirmedIds,
+      extracted: lastTakeoff.extracted,
+      measure: lastTakeoff.measure,
+      geotech: lastTakeoff.geotech,
+      earthworks: lastTakeoff.earthworks,
+      paving: lastTakeoff.paving,
+      markdown: lastTakeoff.markdown,
+    })});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok) throw new Error(data.error||'QA approve failed');
+    lastTakeoff.qaApproval=data.qaApproval;
+    lastTakeoff.qaSigned=true;
+    alert('Human QA approved — exports unlocked.');
+    // Refresh QA box state in last AI bubble
+    const boxes=document.querySelectorAll('.qa-box');
+    const last=boxes[boxes.length-1];
+    if(last){
+      last.querySelector('.qa-h')?.insertAdjacentHTML('beforeend', `<span class="qa-approved">✓ Signed by ${reviewer}</span>`);
+      last.querySelectorAll('.qa-confirm').forEach(c=>{ c.checked=true; c.disabled=true; });
+      last.querySelector('.qa-sign')?.remove();
+      const lock=last.querySelector('.qa-h span[style]');
+      if(lock && /locked/i.test(lock.textContent||'')) lock.remove();
+    }
+  }catch(err){
+    alert(err.message||'QA failed');
+    if(btn){ btn.disabled=false; btn.textContent='Approve for export'; }
+  }
+}
+
+function applyQtyEdit(i, val){
+  const items=collectEditableQtys();
+  const it=items[i];
+  if(!it) return;
+  const n=val===''?null:Number(val);
+  if(it.kind==='footing' && lastTakeoff.extracted?.schedules?.footings?.[it.index]){
+    lastTakeoff.extracted.schedules.footings[it.index].qty=n;
+  }else if(it.kind==='measure' && lastTakeoff.measure?.items?.[it.index]){
+    lastTakeoff.measure.items[it.index].qty=n;
+  }else if(it.kind==='earthworks' && lastTakeoff.earthworks?.items){
+    let k=-1;
+    for(let j=0;j<lastTakeoff.earthworks.items.length;j++){
+      if(lastTakeoff.earthworks.items[j].qty==null) continue;
+      k++;
+      if(k===it.index){ lastTakeoff.earthworks.items[j].qty=n; break; }
+    }
+  }else if(it.kind==='paving' && lastTakeoff.paving?.items){
+    let k=-1;
+    for(let j=0;j<lastTakeoff.paving.items.length;j++){
+      if(lastTakeoff.paving.items[j].qty==null) continue;
+      k++;
+      if(k===it.index){ lastTakeoff.paving.items[j].qty=n; break; }
+    }
+  }
+}
+
 async function dlAnnotatedPdf(btn){
+  if(!ensureHumanQaOrAlert()) return;
   btn.disabled=true;btn.classList.add('loading');
   try{
     const body={
       markdown: lastTakeoff.markdown||'',
       extracted: lastTakeoff.extracted,
       measure: lastTakeoff.measure,
+      geotech: lastTakeoff.geotech,
+      earthworks: lastTakeoff.earthworks,
       title: lastTakeoff.filename||'PMC Takeoff',
       filename: lastTakeoff.filename||'drawing.pdf',
       b64: lastTakeoff.b64||null,
+      qaApproval: lastTakeoff.qaApproval,
     };
     const res=await fetch('/export-annotated-pdf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||'Annotated PDF failed');}
@@ -836,6 +1235,280 @@ async function dlAnnotatedPdf(btn){
     btn.disabled=false;
   }
   btn.classList.remove('loading');
+}
+
+async function dlAgs(btn){
+  if(!ensureHumanQaOrAlert()) return;
+  btn.disabled=true;btn.classList.add('loading');
+  try{
+    const res=await fetch('/export-ags',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      geotech: lastTakeoff.geotech,
+      title: lastTakeoff.filename||'PMC Geotech',
+      qaApproval: lastTakeoff.qaApproval,
+    })});
+    if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||'AGS failed');}
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download=`PMC_Geotech_${Date.now()}.ags`;a.click();
+    URL.revokeObjectURL(url);
+    btn.innerHTML=`<span class="ic">✅</span> AGS`;
+  }catch(err){
+    btn.innerHTML=`<span class="ic">❌</span> ${err.message}`;
+    btn.disabled=false;
+  }
+  btn.classList.remove('loading');
+}
+
+async function dlGeoJson(btn){
+  if(!ensureHumanQaOrAlert()) return;
+  btn.disabled=true;btn.classList.add('loading');
+  try{
+    const res=await fetch('/export-geojson',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      geotech: lastTakeoff.geotech,
+      measure: lastTakeoff.measure,
+      title: lastTakeoff.filename||'PMC export',
+      qaApproval: lastTakeoff.qaApproval,
+    })});
+    if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||'GeoJSON failed');}
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download=`PMC_Export_${Date.now()}.geojson`;a.click();
+    URL.revokeObjectURL(url);
+    btn.innerHTML=`<span class="ic">✅</span> GeoJSON`;
+  }catch(err){
+    btn.innerHTML=`<span class="ic">❌</span> ${err.message}`;
+    btn.disabled=false;
+  }
+  btn.classList.remove('loading');
+}
+
+async function dlShapefile(btn){
+  if(!ensureHumanQaOrAlert()) return;
+  btn.disabled=true;btn.classList.add('loading');
+  try{
+    const res=await fetch('/export-shapefile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      geotech: lastTakeoff.geotech,
+      measure: lastTakeoff.measure,
+      title: lastTakeoff.filename||'PMC export',
+      qaApproval: lastTakeoff.qaApproval,
+    })});
+    if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||'Shapefile failed');}
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download=`PMC_Shapefile_${Date.now()}.zip`;a.click();
+    URL.revokeObjectURL(url);
+    btn.innerHTML=`<span class="ic">✅</span> SHP`;
+  }catch(err){
+    btn.innerHTML=`<span class="ic">❌</span> ${err.message}`;
+    btn.disabled=false;
+  }
+  btn.classList.remove('loading');
+}
+
+/* ── Click-to-measure (PDF.js canvas) ── */
+function shoelacePx(pts){
+  let a=0;
+  for(let i=0;i<pts.length;i++){
+    const j=(i+1)%pts.length;
+    a+=pts[i].x*pts[j].y - pts[j].x*pts[i].y;
+  }
+  return Math.abs(a)/2;
+}
+function pathLenPx(pts){
+  let L=0;
+  for(let i=1;i<pts.length;i++) L+=Math.hypot(pts[i].x-pts[i-1].x, pts[i].y-pts[i-1].y);
+  return L;
+}
+function pxToMeters(px, scaleDen){
+  if(measState.calibPxPerM) return px/measState.calibPxPerM;
+  if(!measState.page||!measState.viewport) return null;
+  const pageWidthPts=(measState.page.view[2]-measState.page.view[0])||measState.page.getViewport({scale:1}).width;
+  const pageWidthMm=pageWidthPts*25.4/72;
+  const mmPerPx=pageWidthMm/measState.viewport.width;
+  const drawingMm=px*mmPerPx;
+  return (drawingMm*scaleDen)/1000;
+}
+function redrawMeas(){
+  const c=document.getElementById('measCanvas');
+  if(!c||!measState.img) return;
+  const ctx=c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  ctx.drawImage(measState.img,0,0);
+  ctx.lineWidth=2; ctx.strokeStyle='#38bdf8'; ctx.fillStyle='rgba(56,189,248,.25)';
+  for(const poly of measState.closed){
+    ctx.beginPath();
+    poly.forEach((p,i)=> i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+  }
+  if(measState.points.length){
+    ctx.beginPath();
+    measState.points.forEach((p,i)=> i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));
+    ctx.stroke();
+    ctx.fillStyle='#fbbf24';
+    measState.points.forEach(p=>{ ctx.beginPath(); ctx.arc(p.x,p.y,4,0,Math.PI*2); ctx.fill(); });
+  }
+}
+async function openClickMeasure(){
+  const b64=lastTakeoff.b64 || (files.find(f=>f.b64||f.rawFile)?.b64);
+  const file=files.find(f=>f.rawFile||f.b64);
+  if(!b64 && !file?.rawFile){
+    alert('Pehle PDF upload / takeoff karo (click measure ke liye drawing chahiye).');
+    return;
+  }
+  if(typeof pdfjsLib==='undefined'){ alert('PDF.js load nahi hua'); return; }
+  document.getElementById('measModal').classList.add('on');
+  measState.points=[]; measState.closed=[];
+  let data;
+  if(b64) data=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));
+  else data=new Uint8Array(await file.rawFile.arrayBuffer());
+  const pdf=await pdfjsLib.getDocument({data}).promise;
+  const page=await pdf.getPage(1);
+  const viewport=page.getViewport({scale:1.4});
+  const canvas=document.getElementById('measCanvas');
+  canvas.width=viewport.width; canvas.height=viewport.height;
+  const ctx=canvas.getContext('2d');
+  await page.render({canvasContext:ctx, viewport}).promise;
+  const img=new Image();
+  img.src=canvas.toDataURL('image/png');
+  await new Promise(r=>{ img.onload=r; });
+  measState.img=img; measState.page=page; measState.viewport=viewport;
+  redrawMeas();
+  canvas.onmousedown=e=>{
+    const rect=canvas.getBoundingClientRect();
+    const x=(e.clientX-rect.left)*(canvas.width/rect.width);
+    const y=(e.clientY-rect.top)*(canvas.height/rect.height);
+    measState.points.push({x,y});
+    redrawMeas();
+    document.getElementById('measHint').textContent=`Points: ${measState.points.length} · mode ${document.getElementById('measMode').value}`;
+  };
+  canvas.ondblclick=e=>{ e.preventDefault(); measClosePoly(); };
+}
+function closeClickMeasure(){ document.getElementById('measModal').classList.remove('on'); }
+function measUndo(){ measState.points.pop(); redrawMeas(); }
+function measClear(){ measState.points=[]; measState.closed=[]; redrawMeas(); }
+function measClosePoly(){
+  const mode=document.getElementById('measMode').value;
+  const scaleDen=Number(document.getElementById('measScale').value)||100;
+  const pts=measState.points;
+  if(mode==='calibrate'){
+    if(pts.length<2){ alert('Calibrate: 2 points click karo'); return; }
+    const px=Math.hypot(pts[1].x-pts[0].x, pts[1].y-pts[0].y);
+    const m=Number(document.getElementById('measCalibM').value)||10;
+    measState.calibPxPerM=px/m;
+    document.getElementById('measHint').textContent=`Calibrated: ${measState.calibPxPerM.toFixed(1)} px/m`;
+    measState.points=[]; redrawMeas(); return;
+  }
+  if(mode==='line'){
+    if(pts.length<2){ alert('Length: kam se kam 2 points'); return; }
+    const px=pathLenPx(pts);
+    const metres=pxToMeters(px, scaleDen);
+    if(metres==null){ alert('Scale/calib set karo'); return; }
+    pushClickMeasureItem({ type:'length', qty:Math.round(metres*1000)/1000, unit:'m', description:`Click length (${pts.length} pts)`, source:'click-measure', confidence:'high', editable:true });
+    measState.points=[]; redrawMeas();
+    document.getElementById('measHint').textContent=`Length added: ${metres.toFixed(3)} m`;
+    return;
+  }
+  // polygon area
+  if(pts.length<3){ alert('Area: kam se kam 3 points'); return; }
+  const ring=[...pts, pts[0]];
+  const areaPx=shoelacePx(pts);
+  // m2 = areaPx / (pxPerM)^2
+  let pxPerM=measState.calibPxPerM;
+  if(!pxPerM){
+    const oneM=pxToMeters(1, scaleDen); // meters per 1 px? wait pxToMeters(1)= meters for 1 px length
+    pxPerM= oneM? 1/oneM : null;
+  }
+  if(!pxPerM){ alert('Scale/calib set karo'); return; }
+  const areaSqm=Math.round((areaPx/(pxPerM*pxPerM))*100)/100;
+  measState.closed.push(pts.slice());
+  const coords=pts.map(p=>{
+    // schematic local m from top-left
+    return [p.x/pxPerM, (measState.viewport.height-p.y)/pxPerM];
+  });
+  coords.push(coords[0]);
+  pushClickMeasureItem({
+    type:'area', qty:areaSqm, unit:'sqm',
+    description:`Click area polygon (${pts.length} pts)`,
+    source:'click-measure', confidence:'high', editable:true,
+  }, { type:'Polygon', coordinates:[coords], properties:{ area_sqm:areaSqm, source:'click-measure' } });
+  measState.points=[]; redrawMeas();
+  document.getElementById('measHint').textContent=`Area added: ${areaSqm} sqm · export GeoJSON/SHP/annotated updated`;
+}
+function pushClickMeasureItem(item, geom){
+  if(!lastTakeoff.measure) lastTakeoff.measure={ items:[], geometry:[], quality:'medium', note:'Includes click-measure' };
+  if(!lastTakeoff.measure.items) lastTakeoff.measure.items=[];
+  if(!lastTakeoff.measure.geometry) lastTakeoff.measure.geometry=[];
+  lastTakeoff.measure.items.push(item);
+  if(geom) lastTakeoff.measure.geometry.push(geom);
+  lastTakeoff.measure.quality='medium';
+}
+
+function showTakeoffMap(){
+  const panel=document.getElementById('mapPanel');
+  if(!panel){ alert('Map panel not available — run takeoff with geotech/measure first.'); return; }
+  panel.style.display='block';
+  const el=document.getElementById('takeoffMap');
+  if(!el || typeof L==='undefined'){ alert('Leaflet not loaded'); return; }
+  if(takeoffMap){ takeoffMap.remove(); takeoffMap=null; }
+  const holes=lastTakeoff.geotech?.boreholes||[];
+  const gm=lastTakeoff.groundModel;
+  const withXY=holes.filter(b=>b.easting!=null&&b.northing!=null);
+  const looksLikeLatLon=withXY.length && withXY.every(b=>Math.abs(Number(b.northing))<=90 && Math.abs(Number(b.easting))<=180);
+
+  function addGroundCells(scaleFn){
+    if(!gm?.cells?.length) return;
+    gm.cells.forEach(c=>{
+      const ll=scaleFn(c.x,c.y);
+      L.circleMarker(ll,{
+        radius:c.r||6, color:'#f59e0b', fillColor:'#f59e0b', fillOpacity:.35, weight:0,
+      }).bindPopup(`SPT/GL model ≈ <b>${c.value}</b>`).addTo(takeoffMap);
+    });
+  }
+
+  if(withXY.length && looksLikeLatLon){
+    takeoffMap=L.map(el);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OSM'}).addTo(takeoffMap);
+    const layers=[];
+    addGroundCells((x,y)=>[y,x]);
+    withXY.forEach(b=>{
+      const m=L.circleMarker([Number(b.northing), Number(b.easting)],{radius:7,color:'#1A73E8',fillColor:'#1A73E8',fillOpacity:.7})
+        .bindPopup(`<b>${b.mark}</b><br>GL ${b.ground_level_m??'—'} · SPT ${b.avg_spt??'—'}`);
+      m.addTo(takeoffMap); layers.push(m);
+    });
+    if(layers.length) takeoffMap.fitBounds(L.featureGroup(layers).getBounds().pad(0.3));
+  } else if(withXY.length){
+    takeoffMap=L.map(el,{crs:L.CRS.Simple});
+    addGroundCells((x,y)=>[y/1000,x/1000]);
+    const pts=withXY.map(b=>{
+      const pt=[Number(b.northing)/1000, Number(b.easting)/1000];
+      L.circleMarker(pt,{radius:7,color:'#1A73E8',fillColor:'#1A73E8',fillOpacity:.8})
+        .bindPopup(`<b>${b.mark}</b> (projected)<br>E ${b.easting} N ${b.northing}<br>SPT ${b.avg_spt??'—'}`)
+        .addTo(takeoffMap);
+      return pt;
+    });
+    takeoffMap.fitBounds(L.latLngBounds(pts.map(p=>L.latLng(p[0],p[1]))).pad(0.3));
+  } else {
+    takeoffMap=L.map(el,{crs:L.CRS.Simple});
+    addGroundCells((x,y)=>[y,x]);
+    const pts=[];
+    holes.forEach((b,i)=>{
+      const pt=gm?.holes?.[i] ? [gm.holes[i].y, gm.holes[i].x] : [Math.floor(i/5)*20, (i%5)*20];
+      L.circleMarker(pt,{radius:7,color:'#0F766E',fillColor:'#0F766E',fillOpacity:.8})
+        .bindPopup(`<b>${b.mark}</b> schematic<br>GL ${b.ground_level_m??'—'} · SPT ${b.avg_spt??'—'}`)
+        .addTo(takeoffMap);
+      pts.push(pt);
+    });
+    (lastTakeoff.measure?.geometry||[]).slice(0,12).forEach(g=>{
+      if(g.type==='Polygon' && g.coordinates?.[0]){
+        const latlngs=g.coordinates[0].map(c=>[c[1],c[0]]);
+        L.polygon(latlngs,{color:'#B45309',weight:1,fillOpacity:.2}).addTo(takeoffMap);
+        pts.push(...latlngs);
+      }
+    });
+    if(pts.length) takeoffMap.fitBounds(L.latLngBounds(pts.map(p=>L.latLng(p[0],p[1]))).pad(0.4));
+    else takeoffMap.setView([0,0],1);
+  }
+  setTimeout(()=>takeoffMap && takeoffMap.invalidateSize(),100);
 }
 
 function mkBtn(type,icon,label,fn){
@@ -1138,6 +1811,14 @@ async function send(){
         markdown: rawAi,
         extracted: data.extracted||null,
         measure: data.measure||null,
+        geotech: data.geotech||null,
+        earthworks: data.earthworks||null,
+        paving: data.paving||null,
+        groundworks: data.groundworks||null,
+        groundModel: data.groundModel||null,
+        qaChecklist: data.qaChecklist||null,
+        qaApproval:null,
+        qaSigned:false,
         filename: drawingFile.name||'drawing.pdf',
         b64: data.b64 || drawingFile.b64 || null,
       };
@@ -1265,10 +1946,15 @@ function qs(type){document.getElementById('tin').value=QT[type];aRz(document.get
 
 function newChat(){
   hist=[];files=[];pendingClarify=null;renderChips();currentChatId=null;
+  takeoffScope={ agent:'full', items:[...TAKEOFF_AGENTS[0].items], instructions:'' };
+  drawingAction='calculate';
+  renderScopePanel();
   const chat=document.getElementById('chat');
-  chat.innerHTML=`<div class="welcome" id="welcome"><div class="wico">🏗️</div><div class="wtit">PMC Civil AI</div><div class="wsub">Upload drawings → <strong>takeoff + plan measure</strong> → confirm → Excel / annotated PDF. Multi-sheet project tray on the left.</div><div class="steps"><div class="step"><div class="step-n">01</div><div class="step-t">Upload PDF(s)</div><div class="step-d">One or many sheets</div></div><div class="step"><div class="step-n">02</div><div class="step-t">Type scope</div><div class="step-d">Takeoff / measure / footing</div></div><div class="step"><div class="step-n">03</div><div class="step-t">Review & export</div><div class="step-d">Excel + annotated PDF</div></div></div><div class="qgrid"><button class="qcard" onclick="qs('takeoff')"><span class="qi">📐</span><span class="ql">Quantity takeoff</span><span class="qd">Schedules → draft qty</span></button><button class="qcard" onclick="qs('footing')"><span class="qi">🧱</span><span class="ql">Footing PCC / RCC</span><span class="qd">Volumes only</span></button><button class="qcard" onclick="qs('measure')"><span class="qi">📏</span><span class="ql">Plan measure</span><span class="qd">Areas / lengths</span></button><button class="qcard" onclick="qs('boq')"><span class="qi">📋</span><span class="ql">Full BOQ</span><span class="qd">With rates</span></button><button class="qcard" onclick="qs('drawing')"><span class="qi">🔎</span><span class="ql">Read only</span><span class="qd">No quantities</span></button><button class="qcard" onclick="qs('compare')"><span class="qi">⚖️</span><span class="ql">Compare</span><span class="qd">2–3 PDFs</span></button></div></div>`;
+  chat.innerHTML=`<div class="welcome" id="welcome"><div class="wico">🏗️</div><div class="wtit">PMC Civil AI</div><div class="wsub">Civils.ai-style: <strong>Read</strong> → <strong>Study</strong> → <strong>Calculate</strong>.</div><div class="steps"><div class="step"><div class="step-n">01</div><div class="step-t">Pick action</div><div class="step-d">Read · Study · Calculate</div></div><div class="step"><div class="step-n">02</div><div class="step-t">Upload PDF</div><div class="step-d">Drawing sheet</div></div><div class="step"><div class="step-n">03</div><div class="step-t">Confirm & export</div><div class="step-d">Human QA → Excel</div></div></div><div class="action-row"><button type="button" class="action-card" id="actRead" onclick="setDrawingAction('read')"><span class="al">Read</span><span class="ad">Type · schedules · levels</span></button><button type="button" class="action-card" id="actStudy" onclick="setDrawingAction('study')"><span class="al">Study</span><span class="ad">How to read · quiz</span></button><button type="button" class="action-card on" id="actCalc" onclick="setDrawingAction('calculate')"><span class="al">Calculate</span><span class="ad">Draft takeoff</span></button></div><div class="trade-label" id="tradeLabel">Calculate trades</div><div class="qgrid" id="tradeGrid"><button class="qcard" onclick="pickAgent('full')"><span class="qi">📐</span><span class="ql">Full takeoff</span><span class="qd">All trades</span></button><button class="qcard" onclick="pickAgent('concrete')"><span class="qi">🧱</span><span class="ql">Concrete</span><span class="qd">Footings · PCC</span></button><button class="qcard" onclick="pickAgent('earthworks')"><span class="qi">⛏️</span><span class="ql">Earthworks</span><span class="qd">Cut / fill</span></button><button class="qcard" onclick="pickAgent('paving')"><span class="qi">🛣️</span><span class="ql">Paving</span><span class="qd">Asphalt · WMM · GSB</span></button><button class="qcard" onclick="pickAgent('groundworks')"><span class="qi">🚧</span><span class="ql">Groundworks</span><span class="qd">Cut/fill + paving</span></button><button class="qcard" onclick="pickAgent('borehole_digitise')"><span class="qi">📝</span><span class="ql">Handwritten BH</span><span class="qd">Factory → AGS</span></button></div></div>`;
+  syncScopeVisibility();
   renderHistList();
   renderProjectSheets();
+  renderSavedAgents();
 }
 
 function hkey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}}

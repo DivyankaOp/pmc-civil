@@ -24,6 +24,14 @@ const {
 const { runCadZoomOcrFromBase64, runCadZoomOcrOnFile } = require('./lib/cad_local_reader');
 const { buildSpatialScheduleText } = require('./lib/spatial_tables');
 const { buildAnnotatedTakeoffPdf } = require('./lib/annotated_takeoff_pdf');
+const { AGENTS, buildQuestionFromScope } = require('./lib/takeoff_agents');
+const { buildAgs41 } = require('./lib/ags_export');
+const { buildGeoJson } = require('./lib/geojson_export');
+const { buildShapefileZip } = require('./lib/shapefile_export');
+const { buildQaChecklist, approveQaSession, assertExportAllowed } = require('./lib/qa_review');
+const { buildGroundModel } = require('./lib/ground_model');
+const { runAutoVisionTakeoff } = require('./lib/vision_takeoff');
+const { digitiseBoreholes } = require('./lib/borehole_digitiser');
 const {
   createProject,
   getProject,
@@ -32,6 +40,215 @@ const {
   mergeProjectMarkdown,
   removeSheet,
 } = require('./lib/project_store');
+
+async function tilesFromPdfPath(filePath, maxTiles = 4) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return [];
+    const st = fs.statSync(filePath);
+    if (st.size > 25 * 1024 * 1024) {
+      console.log('[vision] skip tiles — file >25MB');
+      return [];
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.webp') {
+      return [fs.readFileSync(filePath).toString('base64')];
+    }
+    const b64 = fs.readFileSync(filePath).toString('base64');
+    const tiles = await pdfToImageTiles(b64);
+    return (tiles || []).slice(0, maxTiles);
+  } catch (e) {
+    console.warn('[vision] tilesFromPdfPath:', e.message);
+    return [];
+  }
+}
+
+/**
+ * Claude ONLY for explicit vision / weak handwritten BH — never on default takeoff.
+ * Policy: local OCR first; Claude last resort.
+ */
+async function enrichWithVisionAgents({
+  tmpPath, scope, scheduleBundle, question, filename, combinedText = '',
+}) {
+  const agent = scope?.agent || '';
+  // Strict: only these agents — do NOT trigger from fuzzy question text on full/concrete
+  const wantsVision = agent === 'vision_takeoff';
+  const wantsBhDigitise = agent === 'borehole_digitise';
+
+  if (!wantsVision && !wantsBhDigitise) return scheduleBundle;
+
+  const combined = combinedText || '';
+  let bundle = { ...scheduleBundle };
+  const allowClaude = process.env.PMC_ALLOW_CLAUDE_VISION !== '0' && !!process.env.CLAUDE_API_KEY;
+
+  if (wantsVision) {
+    // Local measure first — Claude only if local weak
+    const localVt = await runAutoVisionTakeoff({
+      pngTiles: [],
+      callClaudeAPI: null,
+      text: combined,
+      schedules: bundle.extracted,
+      instructions: scope?.instructions || question || '',
+    });
+    const localMeasureOk = (localVt.measure?.items?.length || 0) >= 2
+      && localVt.measure.quality !== 'poor';
+
+    if (localMeasureOk) {
+      console.log('[vision-takeoff] local measure enough — Claude SKIPPED (tokens=0)');
+      bundle.measure = localVt.measure;
+      bundle.markdown = [
+        localVt.markdown + '\n\n_Claude not used — printed dims/areas were enough._',
+        bundle.markdown,
+      ].filter(Boolean).join('\n\n---\n\n');
+      bundle.vision_takeoff = {
+        mode: 'local-text-enough',
+        tokens: 0,
+        items: localVt.measure?.items?.length || 0,
+        claude_used: false,
+      };
+    } else if (allowClaude) {
+      const tiles = await tilesFromPdfPath(tmpPath, 3);
+      console.log(`[vision-takeoff] local weak → Claude vision tiles=${tiles.length}`);
+      const vt = await runAutoVisionTakeoff({
+        pngTiles: tiles,
+        callClaudeAPI: tiles.length ? callClaudeAPI : null,
+        text: combined,
+        schedules: bundle.extracted,
+        instructions: scope?.instructions || question || '',
+      });
+      bundle.measure = vt.measure;
+      bundle.markdown = [vt.markdown, bundle.markdown].filter(Boolean).join('\n\n---\n\n');
+      bundle.vision_takeoff = {
+        mode: vt.mode,
+        tokens: vt.tokens,
+        items: vt.visionItems?.length || 0,
+        claude_used: !!vt.tokens,
+      };
+    } else {
+      bundle.measure = localVt.measure;
+      bundle.markdown = [localVt.markdown, bundle.markdown].filter(Boolean).join('\n\n---\n\n');
+      bundle.vision_takeoff = {
+        mode: 'local-weak-no-claude',
+        tokens: 0,
+        items: localVt.measure?.items?.length || 0,
+        claude_used: false,
+      };
+    }
+  }
+
+  if (wantsBhDigitise) {
+    // 1) Always free OCR/local first
+    const localFirst = await digitiseBoreholes({
+      pngTiles: [],
+      callClaudeAPI: null,
+      text: combined,
+      title: filename || 'PMC Borehole Digitiser',
+    });
+    const localOk = localFirst.geotech?.quality === 'medium'
+      && (localFirst.geotech?.boreholes?.length || 0) >= 1
+      && localFirst.geotech.boreholes.some(b => b.avg_spt != null || b.ground_level_m != null || (b.strata_layers || []).length);
+
+    if (localOk) {
+      console.log('[borehole-digitise] local OCR enough — Claude SKIPPED (tokens=0)');
+      bundle.geotech = localFirst.geotech;
+      bundle.groundModel = localFirst.groundModel;
+      bundle.markdown = [localFirst.markdown + '\n\n_Claude not used — local OCR was enough._', bundle.markdown]
+        .filter(Boolean).join('\n\n---\n\n');
+      bundle.borehole_digitise = {
+        mode: 'ocr-local-only',
+        tokens: 0,
+        holes: localFirst.geotech?.boreholes?.length || 0,
+        claude_used: false,
+      };
+    } else if (allowClaude) {
+      // 2) Claude only when OCR weak
+      const tiles = await tilesFromPdfPath(tmpPath, 4);
+      console.log(`[borehole-digitise] OCR weak → Claude vision tiles=${tiles.length}`);
+      const dig = await digitiseBoreholes({
+        pngTiles: tiles,
+        callClaudeAPI: tiles.length ? callClaudeAPI : null,
+        text: combined,
+        title: filename || 'PMC Borehole Digitiser',
+      });
+      bundle.geotech = dig.geotech;
+      bundle.groundModel = dig.groundModel;
+      bundle.markdown = [dig.markdown, bundle.markdown].filter(Boolean).join('\n\n---\n\n');
+      bundle.borehole_digitise = {
+        mode: dig.mode,
+        tokens: dig.tokens,
+        holes: dig.geotech?.boreholes?.length || 0,
+        claude_used: !!dig.tokens,
+      };
+    } else {
+      console.log('[borehole-digitise] OCR weak but Claude disabled/unavailable');
+      bundle.geotech = localFirst.geotech;
+      bundle.groundModel = localFirst.groundModel;
+      bundle.markdown = [localFirst.markdown, bundle.markdown].filter(Boolean).join('\n\n---\n\n');
+      bundle.borehole_digitise = {
+        mode: 'ocr-weak-no-claude',
+        tokens: 0,
+        holes: localFirst.geotech?.boreholes?.length || 0,
+        claude_used: false,
+      };
+    }
+    if (bundle.qa) {
+      bundle.qa = { ...bundle.qa, geotech: bundle.geotech, groundModel: bundle.groundModel };
+    }
+  }
+
+  try {
+    bundle.qaChecklist = buildQaChecklist({
+      extracted: bundle.extracted,
+      measure: bundle.measure,
+      geotech: bundle.geotech,
+      earthworks: bundle.earthworks,
+      paving: bundle.paving || bundle.groundworks?.paving || null,
+      markdown: bundle.markdown,
+    });
+  } catch (_) {}
+
+  return bundle;
+}
+
+function requireHumanQa(req, res) {
+  const gate = assertExportAllowed(req.body?.qaApproval || req.body?.qa_approval);
+  if (!gate.ok) {
+    res.status(403).json({ error: gate.error, requires_human_qa: true });
+    return false;
+  }
+  return true;
+}
+
+function parseTakeoffScope(body = {}) {
+  let scope = body.scope || null;
+  if (typeof scope === 'string') {
+    try { scope = JSON.parse(scope); } catch (_) { scope = null; }
+  }
+  if (!scope && body.agent) {
+    scope = {
+      agent: body.agent,
+      items: body.items
+        ? (Array.isArray(body.items) ? body.items : String(body.items).split(',').map(s => s.trim()).filter(Boolean))
+        : undefined,
+      instructions: body.instructions || '',
+    };
+  }
+  if (scope && !scope.items) {
+    const a = AGENTS.find(x => x.id === scope.agent);
+    if (a) scope.items = [...a.items];
+  }
+  return scope;
+}
+
+/** Civils-style product action: read | study | calculate */
+function parseDrawingAction(body = {}) {
+  const raw = String(body.action || body.drawingAction || body.mode || '').toLowerCase().trim();
+  if (raw === 'read' || raw === 'drawing') return 'read';
+  if (raw === 'study') return 'study';
+  if (raw === 'calculate' || raw === 'calc' || raw === 'takeoff' || raw === 'boq') {
+    return raw === 'boq' ? 'boq' : 'calculate';
+  }
+  return null;
+}
 const multer = require('multer');
 const fs = require('fs');
 const os = require('os');
@@ -475,6 +692,9 @@ async function buildDrawingContextFromFile(filePath, opts = {}) {
     question: userQuestion,
     hints: cadHints,
     spatialTables: spatial.tables || [],
+    scope: opts.scope || null,
+    polylines: opts.polylines || [],
+    action: opts.action || null,
   });
   console.log(`[drawing-context] type=${local.typeInfo?.drawing_type} schedule=${local.extracted.quality} rows=${local.extracted.total_schedule_rows} localQA=${!!local.answeredLocally}`);
 
@@ -2107,7 +2327,17 @@ app.post('/analyze-drawing', (req, res) => {
     }
     let tmpPath = req.file?.path;
     try {
-      const question = (req.body?.question || req.body?.userText || '').trim();
+      const action = parseDrawingAction(req.body || {});
+      let scope = parseTakeoffScope(req.body || {});
+      if (action === 'read' || action === 'study') scope = null;
+      let question = (req.body?.question || req.body?.userText || '').trim();
+      if (!question && action === 'read') {
+        question = 'Read this drawing only — type, title, schedules, levels, dims, notes. Do not prepare BOQ.';
+      } else if (!question && action === 'study') {
+        question = 'Study this civil drawing — educational walkthrough with how-to-read and quiz. Do not prepare BOQ.';
+      } else if (scope && !question) {
+        question = buildQuestionFromScope(scope);
+      }
       let filename = req.file?.originalname || req.body?.filename || 'drawing.pdf';
       let mime = req.file?.mimetype || req.body?.mime || '';
 
@@ -2124,7 +2354,7 @@ app.post('/analyze-drawing', (req, res) => {
 
       const ext = path.extname(filename).toLowerCase();
       const sizeMb = (fs.statSync(tmpPath).size / (1024 * 1024)).toFixed(1);
-      console.log(`[/analyze-drawing] ${filename} (${sizeMb} MB) q="${question.slice(0, 80)}"`);
+      console.log(`[/analyze-drawing] ${filename} (${sizeMb} MB) action=${action || '-'} q="${question.slice(0, 80)}" agent=${scope?.agent || '-'}`);
 
       // DWG/DXF/DWF → reuse converter path then local OCR on PNG if produced
       if (['.dwg', '.dxf', '.dwf'].includes(ext)) {
@@ -2170,6 +2400,8 @@ app.post('/analyze-drawing', (req, res) => {
           question,
           hints,
           spatialTables: spatial.tables || [],
+          scope,
+          action,
         });
         const md = scheduleBundle.markdown || 'No schedule data found. Upload PDF export of the same sheet.';
         return res.json({
@@ -2178,6 +2410,13 @@ app.post('/analyze-drawing', (req, res) => {
           analysis: md,
           extracted: scheduleBundle.extracted,
           clarifications: scheduleBundle.clarifications,
+          measure: scheduleBundle.measure || null,
+          geotech: scheduleBundle.geotech || null,
+          earthworks: scheduleBundle.earthworks || null,
+          paving: scheduleBundle.paving || null,
+          groundworks: scheduleBundle.groundworks || null,
+          qaChecklist: scheduleBundle.qaChecklist || null,
+          scope: scope || null,
           combined_text: (spatial.text || combined).slice(0, 80000),
           schedule_first: {
             quality: scheduleBundle.extracted?.quality,
@@ -2188,6 +2427,7 @@ app.post('/analyze-drawing', (req, res) => {
             file_mb: Number(sizeMb),
             needs_user_input: !!scheduleBundle.needsUserInput,
             questions: scheduleBundle.clarifications?.questions || [],
+            agent: scope?.agent || null,
           },
         });
       }
@@ -2197,8 +2437,18 @@ app.post('/analyze-drawing', (req, res) => {
         question,
         filename,
         mime: mime || (ext === '.pdf' ? 'application/pdf' : undefined),
+        scope,
+        action,
       });
-      const scheduleBundle = ctx.scheduleFirst;
+      let scheduleBundle = ctx.scheduleFirst;
+      scheduleBundle = await enrichWithVisionAgents({
+        tmpPath,
+        scope,
+        scheduleBundle,
+        question,
+        filename,
+        combinedText: ctx.combinedText || '',
+      });
 
       // ALWAYS return local read/ask-user first — never drop clarifications via Claude polish
       if (scheduleBundle?.markdown) {
@@ -2209,6 +2459,15 @@ app.post('/analyze-drawing', (req, res) => {
           extracted: scheduleBundle.extracted,
           clarifications: scheduleBundle.clarifications,
           measure: scheduleBundle.measure || scheduleBundle.qa?.measure || null,
+          geotech: scheduleBundle.geotech || scheduleBundle.qa?.geotech || null,
+          earthworks: scheduleBundle.earthworks || scheduleBundle.qa?.earthworks || null,
+          paving: scheduleBundle.paving || scheduleBundle.qa?.paving || null,
+          groundworks: scheduleBundle.groundworks || scheduleBundle.qa?.groundworks || null,
+          groundModel: scheduleBundle.groundModel || scheduleBundle.qa?.groundModel || null,
+          qaChecklist: scheduleBundle.qaChecklist || scheduleBundle.qa?.qaChecklist || null,
+          vision_takeoff: scheduleBundle.vision_takeoff || null,
+          borehole_digitise: scheduleBundle.borehole_digitise || null,
+          scope: scope || null,
           combined_text: (ctx.combinedText || '').slice(0, 80000),
           filename,
           schedule_first: {
@@ -2217,14 +2476,19 @@ app.post('/analyze-drawing', (req, res) => {
             drawing_type: scheduleBundle.typeInfo?.drawing_type,
             boq_items: scheduleBundle.boqResult?.boq?.length || 0,
             status: scheduleBundle.qa?.meta?.status || scheduleBundle.qa?.status || (scheduleBundle.needsUserInput ? 'DRAFT' : 'FINAL'),
-            mode: scheduleBundle.needsUserInput ? 'ask-user' : (scheduleBundle.qa?.meta?.intent || 'takeoff'),
-            tokens: 0,
+            mode: scheduleBundle.vision_takeoff?.mode
+              || scheduleBundle.borehole_digitise?.mode
+              || (scheduleBundle.needsUserInput ? 'ask-user' : (scheduleBundle.qa?.meta?.intent || 'takeoff')),
+            tokens: (scheduleBundle.vision_takeoff?.tokens || 0) + (scheduleBundle.borehole_digitise?.tokens || 0),
             file_mb: Number(sizeMb),
             needs_user_input: !!scheduleBundle.needsUserInput,
             questions: scheduleBundle.clarifications?.questions || [],
             spatial_tables: (ctx.spatialTables || []).length,
             text_chars: (ctx.combinedText || '').length,
             measure_items: (scheduleBundle.measure || scheduleBundle.qa?.measure)?.items?.length || 0,
+            agent: scope?.agent || null,
+            geotech_bh: (scheduleBundle.geotech || scheduleBundle.qa?.geotech)?.boreholes?.length || 0,
+            vision_items: scheduleBundle.vision_takeoff?.items || 0,
           },
         };
         if (!scheduleBundle.needsUserInput) {
@@ -2270,10 +2534,111 @@ app.post('/analyze-drawing', (req, res) => {
   });
 });
 
+// ─── TAKEOFF AGENTS (form scopes) ────────────────────────────────
+app.get('/takeoff/agents', (req, res) => {
+  res.json({ success: true, agents: AGENTS });
+});
+
+// ─── AGS 4.1 (geotech) ───────────────────────────────────────────
+app.post('/export-ags', (req, res) => {
+  try {
+    if (!requireHumanQa(req, res)) return;
+    const { geotech, title, project } = req.body || {};
+    if (!geotech?.boreholes?.length) {
+      return res.status(400).json({ error: 'No borehole data — run Geotech takeoff first' });
+    }
+    const out = buildAgs41(geotech, { title, project });
+    const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="PMC_Geotech_${today}.ags"`);
+    return res.send(out.bytes);
+  } catch (e) {
+    console.error('[/export-ags]', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── GeoJSON (boreholes + measure) ───────────────────────────────
+app.post('/export-geojson', (req, res) => {
+  try {
+    if (!requireHumanQa(req, res)) return;
+    const { geotech, measure, title } = req.body || {};
+    if (!geotech?.boreholes?.length && !measure?.items?.length && !measure?.geometry?.length) {
+      return res.status(400).json({ error: 'Need geotech or measure data for GeoJSON' });
+    }
+    const fc = buildGeoJson({ geotech, measure, title: title || 'PMC export' });
+    const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
+    res.setHeader('Content-Type', 'application/geo+json');
+    res.setHeader('Content-Disposition', `attachment; filename="PMC_Export_${today}.geojson"`);
+    return res.send(JSON.stringify(fc, null, 2));
+  } catch (e) {
+    console.error('[/export-geojson]', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Shapefile ZIP ───────────────────────────────────────────────
+app.post('/export-shapefile', (req, res) => {
+  try {
+    if (!requireHumanQa(req, res)) return;
+    const { geotech, measure, title } = req.body || {};
+    const out = buildShapefileZip({ geotech, measure, title: title || 'PMC export' });
+    if (out.error || !out.bytes) {
+      return res.status(400).json({ error: out.error || 'Shapefile export failed' });
+    }
+    const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="PMC_Shapefile_${today}.zip"`);
+    return res.send(out.bytes);
+  } catch (e) {
+    console.error('[/export-shapefile]', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── QA checklist ────────────────────────────────────────────────
+app.post('/qa-checklist', (req, res) => {
+  try {
+    const checklist = buildQaChecklist(req.body || {});
+    res.json({ success: true, checklist });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Human QA approve (mandatory before export) ──────────────────
+app.post('/qa-approve', (req, res) => {
+  try {
+    const body = req.body || {};
+    const checklist = body.checklist || buildQaChecklist(body);
+    const result = approveQaSession(checklist, {
+      reviewer: body.reviewer,
+      confirmedIds: body.confirmedIds || body.confirmed_ids || [],
+      note: body.note,
+      force: !!body.force,
+    });
+    if (!result.ok) return res.status(400).json({ error: result.error, requires_human_qa: true });
+    res.json({ success: true, qaApproval: result.approval });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Ground model ────────────────────────────────────────────────
+app.post('/ground-model', (req, res) => {
+  try {
+    const gm = buildGroundModel(req.body?.geotech || {}, { field: req.body?.field || 'avg_spt' });
+    res.json({ success: true, groundModel: gm });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── ANNOTATED TAKEOFF PDF ───────────────────────────────────────
 app.post('/export-annotated-pdf', async (req, res) => {
   try {
-    const { markdown, extracted, measure, title, b64, filename } = req.body || {};
+    if (!requireHumanQa(req, res)) return;
+    const { markdown, extracted, measure, geotech, earthworks, title, b64, filename } = req.body || {};
     if (!markdown && !extracted) {
       return res.status(400).json({ error: 'Need markdown or extracted takeoff data' });
     }
@@ -2286,6 +2651,8 @@ app.post('/export-annotated-pdf', async (req, res) => {
       markdown: markdown || '',
       extracted: extracted || null,
       measure: measure || null,
+      geotech: geotech || null,
+      earthworks: earthworks || null,
       title: title || filename || 'PMC Quantity Takeoff',
     });
     const today = new Date().toLocaleDateString('en-IN').replace(/\//g, '-');
@@ -2337,7 +2704,17 @@ app.post('/project/analyze-sheet', (req, res) => {
     if (err) return res.status(400).json({ error: err.message });
     let tmpPath = req.file?.path;
     try {
-      const question = (req.body?.question || '').trim();
+      const action = parseDrawingAction(req.body || {});
+      let scope = parseTakeoffScope(req.body || {});
+      if (action === 'read' || action === 'study') scope = null;
+      let question = (req.body?.question || '').trim();
+      if (!question && action === 'read') {
+        question = 'Read this drawing only — type, title, schedules, levels, dims, notes. Do not prepare BOQ.';
+      } else if (!question && action === 'study') {
+        question = 'Study this civil drawing — educational walkthrough with how-to-read and quiz. Do not prepare BOQ.';
+      } else if (scope && !question) {
+        question = buildQuestionFromScope(scope);
+      }
       const filename = req.file?.originalname || 'drawing.pdf';
       let projectId = req.body?.projectId || '';
       if (!tmpPath) return res.status(400).json({ error: 'No file' });
@@ -2346,8 +2723,18 @@ app.post('/project/analyze-sheet', (req, res) => {
         question: question || 'Prepare quantity takeoff from this drawing',
         filename,
         mime: req.file?.mimetype,
+        scope,
+        action,
       });
-      const scheduleBundle = ctx.scheduleFirst;
+      let scheduleBundle = ctx.scheduleFirst;
+      scheduleBundle = await enrichWithVisionAgents({
+        tmpPath,
+        scope,
+        scheduleBundle,
+        question,
+        filename,
+        combinedText: ctx.combinedText || '',
+      });
       if (!projectId || !getProject(projectId)) {
         projectId = createProject(req.body?.projectName || 'Takeoff project').id;
       }
@@ -2359,7 +2746,9 @@ app.post('/project/analyze-sheet', (req, res) => {
         markdown: scheduleBundle?.markdown || '',
         extracted: scheduleBundle?.extracted || null,
         measure: scheduleBundle?.measure || scheduleBundle?.qa?.measure || null,
+        geotech: scheduleBundle?.geotech || null,
         question,
+        scope,
         file_mb: Number(sizeMb),
         combined_text: ctx.combinedText || '',
       });
@@ -2380,17 +2769,31 @@ app.post('/project/analyze-sheet', (req, res) => {
         extracted: scheduleBundle?.extracted,
         clarifications: scheduleBundle?.clarifications,
         measure: scheduleBundle?.measure || scheduleBundle?.qa?.measure || null,
+        geotech: scheduleBundle?.geotech || scheduleBundle?.qa?.geotech || null,
+        earthworks: scheduleBundle?.earthworks || scheduleBundle?.qa?.earthworks || null,
+        paving: scheduleBundle?.paving || scheduleBundle?.qa?.paving || null,
+        groundworks: scheduleBundle?.groundworks || scheduleBundle?.qa?.groundworks || null,
+        groundModel: scheduleBundle?.groundModel || scheduleBundle?.qa?.groundModel || null,
+        qaChecklist: scheduleBundle?.qaChecklist || scheduleBundle?.qa?.qaChecklist || null,
+        vision_takeoff: scheduleBundle?.vision_takeoff || null,
+        borehole_digitise: scheduleBundle?.borehole_digitise || null,
+        scope: scope || null,
         combined_text: (ctx.combinedText || '').slice(0, 80000),
         b64,
         schedule_first: {
           drawing_type: scheduleBundle?.typeInfo?.drawing_type,
-          mode: scheduleBundle?.needsUserInput ? 'ask-user' : 'takeoff',
+          mode: scheduleBundle?.vision_takeoff?.mode
+            || scheduleBundle?.borehole_digitise?.mode
+            || (scheduleBundle?.needsUserInput ? 'ask-user' : 'takeoff'),
           needs_user_input: !!scheduleBundle?.needsUserInput,
           questions: scheduleBundle?.clarifications?.questions || [],
+          agent: scope?.agent || null,
           project_id: project.id,
           sheet_id: sheet.id,
-          tokens: 0,
+          tokens: (scheduleBundle?.vision_takeoff?.tokens || 0) + (scheduleBundle?.borehole_digitise?.tokens || 0),
           file_mb: Number(sizeMb),
+          vision_items: scheduleBundle?.vision_takeoff?.items || 0,
+          geotech_bh: scheduleBundle?.geotech?.boreholes?.length || 0,
         },
       });
     } catch (e) {
@@ -2457,9 +2860,10 @@ app.get('/health', (req, res) => {
     status: 'ok',
     claude_key_set: !!claudeKey,
     claude_preview: claudeKey ? claudeKey.slice(0, 12) + '...' : 'NOT SET ❌',
-    pipeline: 'Takeoff: READ → measure/schedules → DRAFT → confirm → Excel/annotated PDF · multi-sheet project',
+    pipeline: 'Local-first takeoff (Claude=0). Claude ONLY for Auto vision agent, or BH digitise when OCR weak.',
     max_upload_mb: 500,
-    routes: ['/analyze-drawing','/resolve-clarifications','/export-annotated-pdf','/project/create','/project/analyze-sheet','/claude','/gemini','/export-excel','/export-pdf','/export-drawing','/analyze-dxf','/export-dxf-excel','/drawing-to-excel','/update-area-from-dxf','/fill-template-from-drawing','/analyze-dwg','/classify-dxf','/analyze-with-answers','/rates-stats'],
+    routes: ['/analyze-drawing','/takeoff/agents','/export-ags','/export-geojson','/export-shapefile','/qa-checklist','/qa-approve','/ground-model','/resolve-clarifications','/export-annotated-pdf','/project/create','/project/analyze-sheet','/claude','/gemini','/export-excel','/export-pdf','/export-drawing','/analyze-dxf','/export-dxf-excel','/drawing-to-excel','/update-area-from-dxf','/fill-template-from-drawing','/analyze-dwg','/classify-dxf','/analyze-with-answers','/rates-stats'],
+    takeoff_agents: AGENTS.map(a => a.id),
     dwg_support: 'ZWCAD + AutoCAD — prefer PDF/DXF; size up to 500MB via /analyze-drawing'
   });
 });
