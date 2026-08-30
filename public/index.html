@@ -298,8 +298,8 @@ textarea.tin::placeholder{color:var(--tx3)}
           <button class="qcard" onclick="pickAgent('full')"><span class="qi">📐</span><span class="ql">Full takeoff</span><span class="qd">All trades from sheet</span></button>
           <button class="qcard" onclick="pickAgent('concrete')"><span class="qi">🧱</span><span class="ql">Concrete</span><span class="qd">Footings · columns · PCC</span></button>
           <button class="qcard" onclick="pickAgent('openings')"><span class="qi">🚪</span><span class="ql">Doors & windows</span><span class="qd">Opening schedules</span></button>
-          <button class="qcard" onclick="pickAgent('vision_takeoff')"><span class="qi">👁️</span><span class="ql">Auto vision</span><span class="qd">Uses Claude — no click measure</span></button>
-          <button class="qcard" onclick="pickAgent('borehole_digitise')"><span class="qi">📝</span><span class="ql">Handwritten BH</span><span class="qd">Factory score → AGS</span></button>
+          <button class="qcard" onclick="pickAgent('vision_takeoff')"><span class="qi">👁️</span><span class="ql">Auto vision</span><span class="qd">Local first — Claude only if weak</span></button>
+          <button class="qcard" onclick="pickAgent('borehole_digitise')"><span class="qi">📝</span><span class="ql">Handwritten BH</span><span class="qd">OCR first — Claude if weak</span></button>
           <button class="qcard" onclick="pickAgent('earthworks')"><span class="qi">⛏️</span><span class="ql">Earthworks</span><span class="qd">Cut / fill + bulking</span></button>
           <button class="qcard" onclick="pickAgent('paving')"><span class="qi">🛣️</span><span class="ql">Paving</span><span class="qd">Asphalt · DBM · WMM · GSB</span></button>
           <button class="qcard" onclick="pickAgent('groundworks')"><span class="qi">🚧</span><span class="ql">Groundworks</span><span class="qd">Cut/fill + paving layers</span></button>
@@ -418,7 +418,7 @@ const TAKEOFF_AGENTS=[
   {id:'concrete',label:'Concrete',items:['footings','columns','pcc','excavation']},
   {id:'openings',label:'Doors & windows',items:['doors','windows']},
   {id:'plan_areas',label:'Plan areas',items:['areas','lengths','counts']},
-  {id:'vision_takeoff',label:'Auto vision (Claude)',items:['areas','lengths','counts','vision']},
+  {id:'vision_takeoff',label:'Auto vision (Claude if local weak)',items:['areas','lengths','counts','vision']},
   {id:'earthworks',label:'Earthworks',items:['cut','fill','excavation','areas','paving']},
   {id:'paving',label:'Paving layers',items:['paving','areas','lengths']},
   {id:'groundworks',label:'Groundworks',items:['cut','fill','paving','areas','excavation']},
@@ -1849,7 +1849,9 @@ async function send(){
       const meta=data.schedule_first;
       let footer='';
       if(meta){
-        footer=`\n\n---\n_Local pipeline · type: **${meta.drawing_type||'—'}** · mode: **${meta.mode||'—'}** · file: **${meta.file_mb!=null?meta.file_mb+' MB':'—'}**${companions.length?` · schedule photos: **${companions.length}**`:''}_`;
+        const tok=meta.tokens!=null?meta.tokens:0;
+        const used=meta.claude_used?'Claude used':'Claude=0';
+        footer=`\n\n---\n_Local pipeline · type: **${meta.drawing_type||'—'}** · mode: **${meta.mode||'—'}** · **${used}** · tokens≈**${tok}** · file: **${meta.file_mb!=null?meta.file_mb+' MB':'—'}**${companions.length?` · schedule photos: **${companions.length}**`:''}_`;
         if(pendingClarify) footer+='\n\n_Confirm missing values one-by-one below, then export Excel._';
       }
       rmLoad();
@@ -1947,10 +1949,14 @@ async function send(){
     // ── Success ───────────────────────────────────────────────
     hist=hist.filter(m=>m.role!=='user_parts');
     // Keep only text in hist — b64 files are too large for localStorage
+    const meta=data.schedule_first||{};
+    const used=meta.claude_used?'Claude used':'Claude=0';
+    const tok=meta.tokens!=null?meta.tokens:0;
+    const foot=`\n\n---\n_${used} · tokens≈**${tok}** · mode: **${meta.mode||'—'}**_`;
     hist.push({role:'assistant',content:aiText,userText:sentText});
     rmLoad();
     // sentFiles still in memory — pass directly to buttons NOW (before cleared)
-    addMsgEl('ai',aiText,[],true,sentFiles,sentText,aiText);
+    addMsgEl('ai',aiText+foot,[],true,sentFiles,sentText,aiText);
     const title=disp.slice(0,40)||(fnames[0]||'Chat');
     saveChatToHistory(title);
   }catch(err){

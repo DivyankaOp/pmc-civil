@@ -12,7 +12,17 @@ Usage:
 from __future__ import annotations
 import json, os, sys, re, tempfile
 
+# CAD sheets are often huge (A0 @ high DPI). Pillow's default decompression-bomb
+# limit (~178M px) rejects legitimate drawings — raise/disable for this tool only.
+try:
+    from PIL import Image as _PilBoot
+    _PilBoot.MAX_IMAGE_PIXELS = None
+except Exception:
+    pass
+
 MAX_PAGES = 5
+# Cap longest side before cropping (keeps RapidOCR fast + stable)
+IMAGE_MAX_SIDE = int(os.environ.get("PMC_OCR_MAX_SIDE", "9000"))
 SCHEDULE_RE = re.compile(
     r"schedule\s*of|footing\s*schedule|column\s*schedule|beam\s*schedule|"
     r"door\s*schedule|window\s*schedule|base\s*plate|mark\s+size|qty|nos\.?",
@@ -98,24 +108,43 @@ def render_pdf_regions(pdf_path, out_dir):
 
 def render_image_regions(img_path, out_dir):
     from PIL import Image
-    im = Image.open(img_path).convert("RGB")
-    W, H = im.size
-    regions = {
-        "overview": (0, 0, W, H),
-        "zoom_top": (0, 0, W, int(H * 0.40)),
-        "zoom_right": (int(W * 0.50), 0, W, int(H * 0.72)),
-        "zoom_left": (0, int(H * 0.30), int(W * 0.55), int(H * 0.90)),
-        "zoom_center": (int(W * 0.15), int(H * 0.20), int(W * 0.85), int(H * 0.80)),
-        "zoom_title": (int(W * 0.40), int(H * 0.70), W, H),
-    }
-    paths = []
-    for name, box in regions.items():
-        crop = im.crop(box)
-        if max(crop.size) > 2400:
-            crop.thumbnail((2400, 2400), Image.LANCZOS)
+    Image.MAX_IMAGE_PIXELS = None
+    im = Image.open(img_path)
+    try:
+        im.load()
+    except Exception:
+        pass
+    im = im.convert("RGB")
+    W0, H0 = im.size
+
+    # Work canvas: downsample only for overview; schedule crops from full-res first
+    work = im
+    if max(im.size) > IMAGE_MAX_SIDE:
+        work = im.copy()
+        work.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE), Image.LANCZOS)
+    W, H = work.size
+
+    def _save_box(src, name, box, max_side=2400):
+        crop = src.crop(box)
+        if max(crop.size) > max_side:
+            crop = crop.copy()
+            crop.thumbnail((max_side, max_side), Image.LANCZOS)
         path = os.path.join(out_dir, f"{name}.png")
         crop.save(path, optimize=True)
-        paths.append((name, path, 0))
+        return name, path, 0
+
+    paths = []
+    # Overview from downsampled work image
+    paths.append(_save_box(work, "overview", (0, 0, W, H), 2200))
+
+    # Schedule / table bands from FULL-RES original (critical for L×B / depth digits)
+    paths.append(_save_box(im, "zoom_sched_top", (0, 0, W0, int(H0 * 0.32)), 2800))
+    paths.append(_save_box(im, "zoom_sched_right", (int(W0 * 0.45), 0, W0, int(H0 * 0.55)), 2800))
+    paths.append(_save_box(im, "zoom_top", (0, 0, W, int(H * 0.40)), 2400))
+    paths.append(_save_box(work, "zoom_right", (int(W * 0.50), 0, W, int(H * 0.72)), 2400))
+    paths.append(_save_box(work, "zoom_left", (0, int(H * 0.30), int(W * 0.55), int(H * 0.90)), 2400))
+    paths.append(_save_box(work, "zoom_center", (int(W * 0.15), int(H * 0.20), int(W * 0.85), int(H * 0.80)), 2400))
+    paths.append(_save_box(work, "zoom_title", (int(W * 0.40), int(H * 0.70), W, H), 2400))
     return paths
 
 

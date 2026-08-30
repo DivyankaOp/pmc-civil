@@ -40,6 +40,13 @@ const {
   mergeProjectMarkdown,
   removeSheet,
 } = require('./lib/project_store');
+const {
+  allowClaude,
+  gatedClaude,
+  logClaudeCall,
+  getSpendSummary,
+  mode: claudeMode,
+} = require('./lib/claude_policy');
 
 async function tilesFromPdfPath(filePath, maxTiles = 4) {
   try {
@@ -78,10 +85,11 @@ async function enrichWithVisionAgents({
 
   const combined = combinedText || '';
   let bundle = { ...scheduleBundle };
-  const allowClaude = process.env.PMC_ALLOW_CLAUDE_VISION !== '0' && !!process.env.CLAUDE_API_KEY;
+  const visionGate = allowClaude('vision_takeoff_local_weak', { detail: 'explicit Auto vision agent + local weak' });
+  const bhGate = allowClaude('borehole_ocr_weak', { detail: 'explicit BH digitise + OCR weak' });
 
   if (wantsVision) {
-    // Local measure first — Claude only if local weak
+    // Local measure first — Claude only if local weak AND policy allows
     const localVt = await runAutoVisionTakeoff({
       pngTiles: [],
       callClaudeAPI: null,
@@ -94,9 +102,10 @@ async function enrichWithVisionAgents({
 
     if (localMeasureOk) {
       console.log('[vision-takeoff] local measure enough — Claude SKIPPED (tokens=0)');
+      logClaudeCall({ reason: 'vision_takeoff_local_weak', ok: false, detail: 'local measure enough' });
       bundle.measure = localVt.measure;
       bundle.markdown = [
-        localVt.markdown + '\n\n_Claude not used — printed dims/areas were enough._',
+        localVt.markdown + '\n\n_Claude not used — printed dims/areas were enough (tokens=0)._',
         bundle.markdown,
       ].filter(Boolean).join('\n\n---\n\n');
       bundle.vision_takeoff = {
@@ -105,33 +114,43 @@ async function enrichWithVisionAgents({
         items: localVt.measure?.items?.length || 0,
         claude_used: false,
       };
-    } else if (allowClaude) {
-      const tiles = await tilesFromPdfPath(tmpPath, 3);
-      console.log(`[vision-takeoff] local weak → Claude vision tiles=${tiles.length}`);
-      const vt = await runAutoVisionTakeoff({
-        pngTiles: tiles,
-        callClaudeAPI: tiles.length ? callClaudeAPI : null,
-        text: combined,
-        schedules: bundle.extracted,
-        instructions: scope?.instructions || question || '',
-      });
-      bundle.measure = vt.measure;
-      bundle.markdown = [vt.markdown, bundle.markdown].filter(Boolean).join('\n\n---\n\n');
-      bundle.vision_takeoff = {
-        mode: vt.mode,
-        tokens: vt.tokens,
-        items: vt.visionItems?.length || 0,
-        claude_used: !!vt.tokens,
-      };
     } else {
-      bundle.measure = localVt.measure;
-      bundle.markdown = [localVt.markdown, bundle.markdown].filter(Boolean).join('\n\n---\n\n');
-      bundle.vision_takeoff = {
-        mode: 'local-weak-no-claude',
-        tokens: 0,
-        items: localVt.measure?.items?.length || 0,
-        claude_used: false,
-      };
+      const api = visionGate.ok ? gatedClaude(callClaudeAPI, 'vision_takeoff_local_weak') : null;
+      const tiles = api ? await tilesFromPdfPath(tmpPath, 3) : [];
+      if (api && tiles.length) {
+        console.log(`[vision-takeoff] local weak → Claude vision tiles=${tiles.length}`);
+        const vt = await runAutoVisionTakeoff({
+          pngTiles: tiles,
+          callClaudeAPI: api,
+          text: combined,
+          schedules: bundle.extracted,
+          instructions: scope?.instructions || question || '',
+        });
+        bundle.measure = vt.measure;
+        bundle.markdown = [
+          `${vt.markdown}\n\n_Claude used (last resort): local measure was weak._`,
+          bundle.markdown,
+        ].filter(Boolean).join('\n\n---\n\n');
+        bundle.vision_takeoff = {
+          mode: vt.mode,
+          tokens: vt.tokens,
+          items: vt.visionItems?.length || 0,
+          claude_used: !!vt.tokens,
+        };
+      } else {
+        if (!visionGate.ok) logClaudeCall({ reason: 'vision_takeoff_local_weak', ok: false, detail: visionGate.detail });
+        bundle.measure = localVt.measure;
+        bundle.markdown = [
+          `${localVt.markdown}\n\n_Claude skipped (${visionGate.detail || 'no tiles'}) — confirm dims / ask user. Tokens=0._`,
+          bundle.markdown,
+        ].filter(Boolean).join('\n\n---\n\n');
+        bundle.vision_takeoff = {
+          mode: 'local-weak-no-claude',
+          tokens: 0,
+          items: localVt.measure?.items?.length || 0,
+          claude_used: false,
+        };
+      }
     }
   }
 
@@ -149,9 +168,10 @@ async function enrichWithVisionAgents({
 
     if (localOk) {
       console.log('[borehole-digitise] local OCR enough — Claude SKIPPED (tokens=0)');
+      logClaudeCall({ reason: 'borehole_ocr_weak', ok: false, detail: 'local OCR enough' });
       bundle.geotech = localFirst.geotech;
       bundle.groundModel = localFirst.groundModel;
-      bundle.markdown = [localFirst.markdown + '\n\n_Claude not used — local OCR was enough._', bundle.markdown]
+      bundle.markdown = [localFirst.markdown + '\n\n_Claude not used — local OCR was enough (tokens=0)._', bundle.markdown]
         .filter(Boolean).join('\n\n---\n\n');
       bundle.borehole_digitise = {
         mode: 'ocr-local-only',
@@ -159,36 +179,45 @@ async function enrichWithVisionAgents({
         holes: localFirst.geotech?.boreholes?.length || 0,
         claude_used: false,
       };
-    } else if (allowClaude) {
-      // 2) Claude only when OCR weak
-      const tiles = await tilesFromPdfPath(tmpPath, 4);
-      console.log(`[borehole-digitise] OCR weak → Claude vision tiles=${tiles.length}`);
-      const dig = await digitiseBoreholes({
-        pngTiles: tiles,
-        callClaudeAPI: tiles.length ? callClaudeAPI : null,
-        text: combined,
-        title: filename || 'PMC Borehole Digitiser',
-      });
-      bundle.geotech = dig.geotech;
-      bundle.groundModel = dig.groundModel;
-      bundle.markdown = [dig.markdown, bundle.markdown].filter(Boolean).join('\n\n---\n\n');
-      bundle.borehole_digitise = {
-        mode: dig.mode,
-        tokens: dig.tokens,
-        holes: dig.geotech?.boreholes?.length || 0,
-        claude_used: !!dig.tokens,
-      };
     } else {
-      console.log('[borehole-digitise] OCR weak but Claude disabled/unavailable');
-      bundle.geotech = localFirst.geotech;
-      bundle.groundModel = localFirst.groundModel;
-      bundle.markdown = [localFirst.markdown, bundle.markdown].filter(Boolean).join('\n\n---\n\n');
-      bundle.borehole_digitise = {
-        mode: 'ocr-weak-no-claude',
-        tokens: 0,
-        holes: localFirst.geotech?.boreholes?.length || 0,
-        claude_used: false,
-      };
+      const api = bhGate.ok ? gatedClaude(callClaudeAPI, 'borehole_ocr_weak') : null;
+      const tiles = api ? await tilesFromPdfPath(tmpPath, 4) : [];
+      if (api && tiles.length) {
+        console.log(`[borehole-digitise] OCR weak → Claude vision tiles=${tiles.length}`);
+        const dig = await digitiseBoreholes({
+          pngTiles: tiles,
+          callClaudeAPI: api,
+          text: combined,
+          title: filename || 'PMC Borehole Digitiser',
+        });
+        bundle.geotech = dig.geotech;
+        bundle.groundModel = dig.groundModel;
+        bundle.markdown = [
+          `${dig.markdown}\n\n_Claude used (last resort): local OCR was weak._`,
+          bundle.markdown,
+        ].filter(Boolean).join('\n\n---\n\n');
+        bundle.borehole_digitise = {
+          mode: dig.mode,
+          tokens: dig.tokens,
+          holes: dig.geotech?.boreholes?.length || 0,
+          claude_used: !!dig.tokens,
+        };
+      } else {
+        console.log('[borehole-digitise] OCR weak but Claude blocked/unavailable');
+        if (!bhGate.ok) logClaudeCall({ reason: 'borehole_ocr_weak', ok: false, detail: bhGate.detail });
+        bundle.geotech = localFirst.geotech;
+        bundle.groundModel = localFirst.groundModel;
+        bundle.markdown = [
+          `${localFirst.markdown}\n\n_Claude skipped (${bhGate.detail || 'no tiles'}) — confirm BH values. Tokens=0._`,
+          bundle.markdown,
+        ].filter(Boolean).join('\n\n---\n\n');
+        bundle.borehole_digitise = {
+          mode: 'ocr-weak-no-claude',
+          tokens: 0,
+          holes: localFirst.geotech?.boreholes?.length || 0,
+          claude_used: false,
+        };
+      }
     }
     if (bundle.qa) {
       bundle.qa = { ...bundle.qa, geotech: bundle.geotech, groundModel: bundle.groundModel };
@@ -428,8 +457,8 @@ async function extractLargePdfViaImageOCR(pdfBase64, gcvKey) {
 
 
     const script = `
-import fitz, base64, json
-doc = fitz.open('${pdfPath}')
+import fitz, base64, json, sys
+doc = fitz.open(sys.argv[1])
 tiles = []
 for i in range(len(doc)):
     page = doc[i]
@@ -440,7 +469,7 @@ print(json.dumps(tiles))
 `.trim();
     const sp = tmpDir + '/r.py';
     fs.writeFileSync(sp, script);
-    const out = execSync(`${pyExec()} "${sp}"`, { timeout: 60000, maxBuffer: 100 * 1024 * 1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
+    const out = execSync(`${pyExec()} "${sp}" "${pdfPath}"`, { timeout: 60000, maxBuffer: 100 * 1024 * 1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
     const tiles = JSON.parse(out.toString());
     console.log(`[GCV-Large] Rendered ${tiles.length} page tiles from large PDF`);
 
@@ -540,8 +569,8 @@ async function extractScannedPdfWithGCV(pdfBase64) {
         fs.writeFileSync(pdfPath2, Buffer.from(pdfBase64, 'base64'));
       }
       const fallbackScript = `
-import fitz,base64,subprocess,json,tempfile,os
-doc=fitz.open('${tmpDir.replace(/\\/g,'/')}/input.pdf')
+import fitz,subprocess,json,tempfile,os,sys
+doc=fitz.open(sys.argv[1])
 pages=[]
 for i in range(len(doc)):
     pix=doc[i].get_pixmap(matrix=fitz.Matrix(300/72,300/72),alpha=False)
@@ -550,14 +579,15 @@ for i in range(len(doc)):
     r=subprocess.run(['tesseract',tmp.name,'stdout','--oem','1','--psm','6','-l','eng'],capture_output=True,text=True,timeout=30)
     t=r.stdout.strip()
     if t: pages.append({'raw_text':t,'table_rows':[[l] for l in t.split('\\n') if l.strip()],'is_rotated':False})
-    os.unlink(tmp.name)
+    try: os.unlink(tmp.name)
+    except Exception: pass
 doc.close()
 print(json.dumps({'pages':pages}))
 `.trim();
       const fbScript = path.join(tmpDir, 'fallback.py');
       fs.writeFileSync(fbScript, fallbackScript);
       const py2 = pyExec();
-      const fbOut = execSync(`${py2} "${fbScript}"`, { timeout: 60000, maxBuffer: 10*1024*1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
+      const fbOut = execSync(`${py2} "${fbScript}" "${pdfPath2}"`, { timeout: 60000, maxBuffer: 10*1024*1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
       const fbData = JSON.parse(fbOut.toString());
       if (fbData.pages?.length) {
         console.log('[OCR Fallback] Used simple Tesseract PSM6 fallback');
@@ -594,7 +624,7 @@ async function pdfToImageTiles(pdfBase64) {
     // optimal edge) so text stays crisp instead of being crushed by
     // whole-page downscaling.
     const script = `
-import fitz, json, base64, io
+import fitz, json, base64, io, sys
 from PIL import Image
 
 MAX_EDGE = 1568
@@ -609,7 +639,7 @@ def encode_capped(pix):
     img.save(buf, format='PNG', optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
-doc = fitz.open('${pdfPath}')
+doc = fitz.open(sys.argv[1])
 tiles = []
 mat = fitz.Matrix(RENDER_DPI/72, RENDER_DPI/72)
 
@@ -643,7 +673,7 @@ print(json.dumps(tiles))
 `.trim();
     const scriptPath = tmpDir + '/convert.py';
     fs.writeFileSync(scriptPath, script);
-    const out = execSync(`${pyExec()} "${scriptPath}"`, { timeout: 120000, maxBuffer: 300 * 1024 * 1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
+    const out = execSync(`${pyExec()} "${scriptPath}" "${pdfPath}"`, { timeout: 120000, maxBuffer: 300 * 1024 * 1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
     const result = JSON.parse(out.toString());
     return result.map(t => typeof t === 'object' ? t.data : t);
   } catch(e) {
@@ -689,14 +719,38 @@ function linesFromExtractedPdf(extracted) {
 async function buildDrawingContextFromFile(filePath, opts = {}) {
   const forceVision = opts.forceVision === true;
   const parts = [];
-  const ext = path.extname(filePath || '').toLowerCase();
+  let workPath = filePath;
+  let ext = path.extname(filePath || '').toLowerCase();
+  // Multer often saves as extensionless temp names — restore from mime/filename
+  if (!ext) {
+    const fromName = path.extname(opts.filename || '').toLowerCase();
+    const mime = String(opts.mime || '').toLowerCase();
+    if (fromName) ext = fromName;
+    else if (mime.includes('pdf')) ext = '.pdf';
+    else if (mime.includes('png')) ext = '.png';
+    else if (mime.includes('jpeg') || mime.includes('jpg')) ext = '.jpg';
+    else if (mime.includes('webp')) ext = '.webp';
+    else if (mime.includes('tif')) ext = '.tif';
+    else if (mime.includes('dwg')) ext = '.dwg';
+    else if (mime.includes('dxf')) ext = '.dxf';
+    if (ext) {
+      const renamed = `${filePath}${ext}`;
+      try {
+        fs.copyFileSync(filePath, renamed);
+        workPath = renamed;
+        console.log(`[drawing-context] restored ext ${ext} for OCR → ${path.basename(renamed)}`);
+      } catch (e) {
+        console.warn('[drawing-context] rename with ext failed:', e.message);
+      }
+    }
+  }
   const isPdf = ext === '.pdf' || opts.mime === 'application/pdf';
   const isImage = ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff', '.gif'].includes(ext)
     || (opts.mime || '').startsWith('image/');
 
   let extracted = null;
   if (isPdf) {
-    extracted = await extractPdfTextFromPath(filePath);
+    extracted = await extractPdfTextFromPath(workPath);
   }
   const { plainLines, extractedTextBlock } = linesFromExtractedPdf(extracted);
 
@@ -720,9 +774,9 @@ async function buildDrawingContextFromFile(filePath, opts = {}) {
   if (forceVision || isImage || scheduleWeak || vectorThin) {
     try {
       console.log('[drawing-context] Running CAD-zoom OCR (multi-page + adaptive schedule crops)...');
-      const outDir = path.join(path.dirname(filePath), 'crops_' + Date.now());
+      const outDir = path.join(path.dirname(workPath), 'crops_' + Date.now());
       fs.mkdirSync(outDir, { recursive: true });
-      const zoom = runCadZoomOcrOnFile(filePath, outDir);
+      const zoom = runCadZoomOcrOnFile(workPath, outDir);
       if (zoom?.success && zoom.full_text) {
         cadZoomText = zoom.full_text;
         cadHints = zoom.drawing_hints || [];
@@ -738,9 +792,9 @@ async function buildDrawingContextFromFile(filePath, opts = {}) {
 
     if ((cadZoomText.length < 200) && process.env.GOOGLE_CLOUD_VISION_API_KEY && isPdf) {
       try {
-        const stat = fs.statSync(filePath);
+        const stat = fs.statSync(workPath);
         if (stat.size <= 40 * 1024 * 1024) {
-          const pdfB64 = fs.readFileSync(filePath).toString('base64');
+          const pdfB64 = fs.readFileSync(workPath).toString('base64');
           const gcvResult = await extractScannedPdfWithGCV(pdfB64);
           if (gcvResult?.pages?.length) {
             const gcvLines = [];
@@ -792,7 +846,10 @@ async function buildDrawingContextFromFile(filePath, opts = {}) {
   });
   console.log(`[drawing-context] type=${local.typeInfo?.drawing_type} schedule=${local.extracted.quality} rows=${local.extracted.total_schedule_rows} localQA=${!!local.answeredLocally} companion=${(opts.companionOcrText || '').length}`);
 
-  const needVision = forceVision || (local.needsClaude && local.needsVision);
+  const needVisionRaw = forceVision || (local.needsClaude && local.needsVision);
+  // Strict policy: never attach image tiles for "schedule weak" Claude polish — ask user instead
+  const visionOk = allowClaude('schedule_weak_fallback').ok;
+  const needVision = needVisionRaw && visionOk;
   let fileBytes = 0;
   try { fileBytes = fs.statSync(filePath).size; } catch (_) {}
 
@@ -806,6 +863,8 @@ async function buildDrawingContextFromFile(filePath, opts = {}) {
       }
       console.log(`[drawing-context] Vision fallback: ${limited.length} image(s) (capped)`);
     }
+  } else if (needVisionRaw && !visionOk) {
+    console.log(`[drawing-context] Vision tiles skipped — ${claudeMode()} mode (tokens=0; ask-user if weak)`);
   } else if (needVision && fileBytes > 25 * 1024 * 1024) {
     console.log('[drawing-context] Large file — vision skipped; ask-user / local text only');
   } else {
@@ -841,13 +900,13 @@ async function buildDrawingContext(pdfB64, opts = {}) {
 // ─── DIRECT CLAUDE CHAT ROUTE (no Gemini wrapper) ────────────────
 app.post('/claude', async (req, res) => {
   try {
-    if (!process.env.CLAUDE_API_KEY) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
     const { system, messages, max_tokens } = req.body;
     if (!messages?.length) return res.status(400).json({ error: 'No messages.' });
     const systemToUse = (system && system.trim().length > 50) ? system : CIVIL_SYSTEM;
     const maxTokens = Math.min(Number(max_tokens) || 4096, 4096);
 
     let scheduleBundle = null;
+    let hadDrawingPart = false;
     const processedMessages = [];
     // Pull last user text question for local Q&A routing
     let userQuestion = '';
@@ -867,6 +926,7 @@ app.post('/claude', async (req, res) => {
       const newParts = [];
       for (const part of msg.content) {
         if (part.type === 'document' && part.source?.media_type === 'application/pdf') {
+          hadDrawingPart = true;
           const pdfB64 = part.source.data;
           console.log('[/claude] PDF — local CAD-zoom + multi-type study (tokens only if needed)');
           try {
@@ -878,6 +938,7 @@ app.post('/claude', async (req, res) => {
             newParts.push(part);
           }
         } else if (part.type === 'image' && part.source?.type === 'base64') {
+          hadDrawingPart = true;
           const imgB64 = part.source.data;
           console.log('[/claude] Image — local CAD-zoom OCR first');
           try {
@@ -904,14 +965,17 @@ app.post('/claude', async (req, res) => {
             if (ocrText.trim().length > 40) {
               scheduleBundle = runScheduleFirstLocal(ocrText, { filename: 'upload.png', question: userQuestion });
               newParts.push({ type: 'text', text: scheduleBundle.markdown });
-              if (scheduleBundle.needsClaude && scheduleBundle.needsVision) newParts.push(part);
+              // Strict: never attach raw image for Claude polish on drawings
+              if (scheduleBundle.needsClaude && scheduleBundle.needsVision && allowClaude('schedule_weak_fallback').ok) {
+                newParts.push(part);
+              }
             } else {
-              newParts.push(part);
-              newParts.push({ type: 'text', text: 'WARNING: Local OCR got little text. Read only what is clearly visible. Never invent schedule qty.' });
+              newParts.push({ type: 'text', text: 'WARNING: Local OCR got little text. Ask user — never invent schedule qty. Tokens=0.' });
+              if (allowClaude('schedule_weak_fallback').ok) newParts.push(part);
             }
           } catch (e) {
             console.error('[/claude] Image OCR failed:', e.message);
-            newParts.push(part);
+            newParts.push({ type: 'text', text: `Local OCR failed: ${e.message}. Ask user — do not invent.` });
           }
         } else {
           newParts.push(part);
@@ -933,6 +997,7 @@ app.post('/claude', async (req, res) => {
             drawing_type: scheduleBundle.typeInfo?.drawing_type,
             mode: 'ask-user',
             tokens: 0,
+            claude_used: false,
             needs_user_input: true,
             questions: scheduleBundle.clarifications?.questions || [],
           },
@@ -955,22 +1020,46 @@ app.post('/claude', async (req, res) => {
           boq_items: scheduleBundle.boqResult?.boq?.length || 0,
           mode: 'local-only',
           tokens: 0,
+          claude_used: false,
           needs_user_input: false,
         },
       });
     }
 
-    // Weak extract: ONE Claude call with already-capped parts (few/no images)
-    const raw = await callClaudeAPI({ system: systemToUse, messages: processedMessages, maxTokens });
-    try { learnRatesFromMarkdown(raw, { filename: 'chat', drawing_type: scheduleBundle?.typeInfo?.drawing_type || 'GENERAL' }); } catch (e) {}
+    // Drawing was present: NEVER spend Claude on weak schedule — ask user / return local
+    if (hadDrawingPart || scheduleBundle) {
+      const md = scheduleBundle?.markdown
+        || 'Local extract was weak. Confirm missing schedule values — Claude not used (tokens are costly).';
+      logClaudeCall({ reason: 'schedule_weak_fallback', ok: false, detail: 'drawing path local-only' });
+      console.log('[/claude] Drawing weak → ask-user / local — Claude BLOCKED (tokens=0)');
+      return res.json({
+        content: [{ type: 'text', text: `${md}\n\n---\n_Claude not used on this drawing (strict local-first). Confirm unclear items — we never invent qty._` }],
+        schedule_first: {
+          quality: scheduleBundle?.extracted?.quality,
+          rows: scheduleBundle?.extracted?.total_schedule_rows,
+          drawing_type: scheduleBundle?.typeInfo?.drawing_type,
+          mode: 'local-weak-no-claude',
+          tokens: 0,
+          claude_used: false,
+          needs_user_input: true,
+          questions: scheduleBundle?.clarifications?.questions || [],
+        },
+      });
+    }
+
+    // Freeform chat only (no drawing) — still gated
+    const api = gatedClaude(callClaudeAPI, 'freeform_chat', { detail: 'text chat without drawing' });
+    if (!api) {
+      return res.json({
+        content: [{ type: 'text', text: `Claude chat is blocked (${claudeMode()} mode / no key). Upload a drawing for local Read/Study/Calculate, or set PMC_CLAUDE_MODE=on for freeform chat.` }],
+        schedule_first: { mode: 'claude-blocked', tokens: 0, claude_used: false },
+      });
+    }
+    const raw = await api({ system: systemToUse, messages: processedMessages, maxTokens });
+    try { learnRatesFromMarkdown(raw, { filename: 'chat', drawing_type: 'GENERAL' }); } catch (e) {}
     return res.json({
       content: [{ type: 'text', text: raw }],
-      schedule_first: scheduleBundle ? {
-        quality: scheduleBundle.extracted?.quality,
-        rows: scheduleBundle.extracted?.total_schedule_rows,
-        drawing_type: scheduleBundle.typeInfo?.drawing_type,
-        mode: 'claude-assisted',
-      } : { mode: 'claude-only' },
+      schedule_first: { mode: 'claude-freeform', tokens: 1, claude_used: true },
     });
   } catch (e) {
     console.error('[/claude]', e.message);
@@ -980,7 +1069,6 @@ app.post('/claude', async (req, res) => {
 
 app.post('/gemini', async (req, res) => {
   try {
-    if (!process.env.CLAUDE_API_KEY) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
     const { body } = req.body;
 
     //
@@ -989,6 +1077,8 @@ app.post('/gemini', async (req, res) => {
 
     // Extract all message parts (text + images/PDFs) from Gemini-format body
     const claudeMessages = [];
+    let hadDrawing = false;
+    let scheduleMd = '';
     for (const content of (body?.contents || [])) {
       const claudeParts = [];
       for (const part of (content.parts || [])) {
@@ -997,28 +1087,52 @@ app.post('/gemini', async (req, res) => {
         } else if (part.inline_data) {
           const mt = part.inline_data.mime_type;
           if (mt === 'application/pdf') {
+            hadDrawing = true;
             console.log('[/gemini] PDF — schedule-first buildDrawingContext');
             try {
               const ctx = await buildDrawingContext(part.inline_data.data);
               claudeParts.push(...ctx.parts);
+              if (ctx.scheduleFirst?.markdown) scheduleMd = ctx.scheduleFirst.markdown;
+              if (ctx.scheduleFirst?.answeredLocally && ctx.scheduleFirst.markdown) {
+                return res.json({
+                  candidates: [{ content: { parts: [{ text: ctx.scheduleFirst.markdown }] }, finishReason: 'STOP' }],
+                  schedule_first: { mode: 'local-only', tokens: 0, claude_used: false },
+                });
+              }
             } catch (e) {
               console.error('[/gemini] buildDrawingContext failed:', e.message);
-              claudeParts.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: part.inline_data.data } });
             }
           } else if (mt?.startsWith('image/')) {
-            // FIX A: Was duplicated — second handler had empty body, so direct images were DROPPED
-            claudeParts.push({ type: 'image', source: { type: 'base64', media_type: mt, data: part.inline_data.data } });
+            hadDrawing = true;
+            // Strict: don't forward images to Claude for drawing polish
+            if (allowClaude('schedule_weak_fallback').ok) {
+              claudeParts.push({ type: 'image', source: { type: 'base64', media_type: mt, data: part.inline_data.data } });
+            }
           }
         }
       }
       if (claudeParts.length) claudeMessages.push({ role: content.role === 'user' ? 'user' : 'assistant', content: claudeParts });
     }
-    if (!claudeMessages.length) return res.status(400).json({ error: 'No messages.' });
+    if (!claudeMessages.length && !scheduleMd) return res.status(400).json({ error: 'No messages.' });
 
-    const raw = await callClaudeAPI({ system: systemToUse, messages: claudeMessages, maxTokens: 4096 });
-    // Auto-learn rates from chat responses (BOQ markdown tables)
+    if (hadDrawing) {
+      logClaudeCall({ reason: 'schedule_weak_fallback', ok: false, detail: '/gemini drawing local-only' });
+      const text = scheduleMd || 'Local extract only — Claude blocked on drawings (tokens costly). Confirm missing values.';
+      return res.json({
+        candidates: [{ content: { parts: [{ text }] }, finishReason: 'STOP' }],
+        schedule_first: { mode: 'local-weak-no-claude', tokens: 0, claude_used: false },
+      });
+    }
+
+    const api = gatedClaude(callClaudeAPI, 'freeform_chat', { detail: '/gemini freeform' });
+    if (!api) {
+      return res.json({
+        candidates: [{ content: { parts: [{ text: `Claude blocked (${claudeMode()}). Upload drawing for local pipeline.` }] }, finishReason: 'STOP' }],
+        schedule_first: { mode: 'claude-blocked', tokens: 0, claude_used: false },
+      });
+    }
+    const raw = await api({ system: systemToUse, messages: claudeMessages, maxTokens: 4096 });
     try { learnRatesFromMarkdown(raw, { filename: 'chat', drawing_type: 'GENERAL' }); } catch(e) {}
-    // Return in Gemini-compatible format so the frontend doesn't need changes
     return res.json({ candidates: [{ content: { parts: [{ text: raw }] }, finishReason: 'STOP' }] });
   } catch (e) {
     console.error('[/gemini → Claude]', e.message);
@@ -1326,9 +1440,17 @@ async function buildExcel(d) {
 // ─── 4. EXCEL ENDPOINT ─────────────────────────────────────────────
 app.post('/export-excel', async (req, res) => {
   try {
+    const gate = allowClaude('export_excel');
+    if (!gate.ok) {
+      logClaudeCall({ reason: 'export_excel', ok: false, detail: gate.detail });
+      return res.status(403).json({
+        error: 'Claude Excel extract disabled (tokens costly). Export from local takeoff BOQ instead. Set PMC_ALLOW_CLAUDE_EXPORT=1 only if required.',
+        tokens: 0,
+      });
+    }
     const key = process.env.CLAUDE_API_KEY;
-    if (!key) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
     const { files, userText, aiResponse } = req.body;
+    logClaudeCall({ reason: 'export_excel', ok: true, tokensEstimate: 4096 });
     const d = await extractData(key, files, userText, aiResponse);
     const wb = await buildExcel(d);
     const today = new Date().toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric' }).replace(/\//g, '-');
@@ -1344,9 +1466,17 @@ app.post('/export-excel', async (req, res) => {
 // ─── 5. PDF ENDPOINT (print-ready HTML) ────────────────────────────
 app.post('/export-pdf', async (req, res) => {
   try {
+    const gate = allowClaude('export_pdf');
+    if (!gate.ok) {
+      logClaudeCall({ reason: 'export_pdf', ok: false, detail: gate.detail });
+      return res.status(403).json({
+        error: 'Claude PDF extract disabled (tokens costly). Use local takeoff export. Set PMC_ALLOW_CLAUDE_EXPORT=1 only if required.',
+        tokens: 0,
+      });
+    }
     const key = process.env.CLAUDE_API_KEY;
-    if (!key) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
     const { files, userText, aiResponse } = req.body;
+    logClaudeCall({ reason: 'export_pdf', ok: true, tokensEstimate: 4096 });
     const d = await extractData(key, files, userText, aiResponse);
     const today = new Date().toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric' });
     const vendors = d.vendors || [];
@@ -1483,8 +1613,6 @@ app.post('/export-drawing', async (req, res) => {
 // Uses drawing_intelligence.js — reads legend, auto-maps layers, extracts levels
 app.post('/analyze-dxf', async (req, res) => {
   try {
-    const claudeKey = process.env.CLAUDE_API_KEY;
-    if (!claudeKey) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
     const { dxfContent, filename } = req.body;
     if (!dxfContent) return res.status(400).json({ error: 'No DXF content provided.' });
 
@@ -1493,37 +1621,37 @@ app.post('/analyze-dxf', async (req, res) => {
     console.log(`[DXF] ${filename} | ${analyzed.total_layers} layers | ${analyzed.floor_levels.length} floor levels | ${analyzed.element_counts.wall_polylines} wall polylines | ${analyzed.unknown_layers.length} unknown layers`);
 
     // ── Step 2: Smart BOQ Engine — pre-digest drawing into structured engineering data ──
-    // Out-of-the-box approach: Claude gets a PRE-DRAFTED BOQ to verify, not raw data to guess from
-    // This shifts Claude from "guesser" to "checker" — 90-95% accuracy
     const ratesMap = getRatesMap();
     const smartCtx = buildSmartContextFromAnalyzed(analyzed, ratesMap);
     const prompt = smartCtx.summary_text;
     console.log(`[DXF Smart] Pre-drafted ${smartCtx.pre_drafted_boq?.length || 0} BOQ items, ${smartCtx.rooms?.length || 0} rooms, ${smartCtx.wall_quantities?.length || 0} wall entries`);
 
-    // ── Step 3: Claude verifies + fixes + completes the pre-drafted BOQ ──────────────
-    const claudeResp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type':'application/json','x-api-key':claudeKey,'anthropic-version':'2023-06-01','anthropic-beta':'pdfs-2024-09-25' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6', max_tokens: 4096,
-        system: CIVIL_SYSTEM,
-        messages: [{ role:'user', content: prompt }]
-      })
-    });
-    const claudeData = await claudeResp.json();
-    let raw = claudeData?.content?.find(b=>b.type==='text')?.text || '{}';
-    const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
+    // ── Step 3: Claude verify ONLY if PMC_ALLOW_CLAUDE_DXF=1 (costly) ─────────
     let geminiResult = {};
-    if (fb !== -1) try { geminiResult = JSON.parse(raw.slice(fb, lb+1)); } catch(e) { console.error('JSON parse fail:', e.message); }
+    const api = gatedClaude(callClaudeAPI, 'dxf_unknown_symbols', { detail: '/analyze-dxf' });
+    if (api) {
+      try {
+        const raw = await api({ system: CIVIL_SYSTEM, messages: [{ role: 'user', content: prompt }], maxTokens: 4096 });
+        const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
+        if (fb !== -1) try { geminiResult = JSON.parse(raw.slice(fb, lb + 1)); } catch (e) { console.error('JSON parse fail:', e.message); }
+        geminiResult._claude_used = true;
+      } catch (e) {
+        console.warn('[analyze-dxf] Claude fail:', e.message);
+      }
+    } else {
+      console.log('[analyze-dxf] Claude SKIPPED — using pre-drafted local BOQ (tokens=0)');
+    }
     // Attach pre-drafted data for fallback
     if (!geminiResult.boq?.length && smartCtx.pre_drafted_boq?.length) {
       geminiResult.boq = smartCtx.pre_drafted_boq;
-      geminiResult._source = 'pre_draft_fallback';
+      geminiResult._source = geminiResult._claude_used ? 'pre_draft_fallback' : 'pre_draft_local';
     }
 
     // ── Step 4: Return everything — drawing data + AI interpretation ──────────
     res.json({
       success: true,
+      claude_used: !!geminiResult._claude_used,
+      tokens: geminiResult._claude_used ? 1 : 0,
       dxf_data: {
         filename:         analyzed.filename,
         project_name:     analyzed.project_name,
@@ -1559,7 +1687,6 @@ app.post('/analyze-dxf', async (req, res) => {
 app.post('/export-dxf-excel', async (req, res) => {
   try {
     const { dxfContent, filename, aiResponse } = req.body;
-    if (!process.env.CLAUDE_API_KEY) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
     if (!dxfContent) return res.status(400).json({ error: 'No DXF content.' });
 
     // Parse DXF + attach coordinate-clustered schedule tables
@@ -1567,22 +1694,28 @@ app.post('/export-dxf-excel', async (req, res) => {
     let civilData = extractCivilData(parsed, filename);
     civilData = attachScheduleTables(civilData); // adds schedule_tables[] for accurate BOQ
 
-    // ✅ SMART ENGINE: Pre-draft BOQ from drawing data, Claude only verifies
+    // SMART ENGINE: Pre-draft BOQ locally — Claude only if PMC_ALLOW_CLAUDE_DXF=1
     let geminiResult = {};
-    try {
-      const ratesMap = getRatesMap();
-      const smartCtx = buildSmartContext(civilData, ratesMap);
-      console.log(`[DXF-Excel Smart] Pre-drafted ${smartCtx.pre_drafted_boq?.length || 0} BOQ items`);
-      
-      geminiResult = await claudeAnalyzeDXF(civilData, filename, getRatesSummary({ maxItems: 40 }), smartCtx.summary_text);
-      console.log('[DXF-Excel] Claude analysis done:', geminiResult.drawing_type);
-      
-      // Fallback: use pre-draft if Claude fails
-      if (!geminiResult.boq?.length && smartCtx.pre_drafted_boq?.length) {
-        geminiResult.boq = smartCtx.pre_drafted_boq;
-        geminiResult._source = 'smart_pre_draft_fallback';
-      }
-    } catch(e) { console.log('Claude DXF interp fail:', e.message); }
+    const ratesMap = getRatesMap();
+    const smartCtx = buildSmartContext(civilData, ratesMap);
+    console.log(`[DXF-Excel Smart] Pre-drafted ${smartCtx.pre_drafted_boq?.length || 0} BOQ items`);
+
+    const dxfApi = gatedClaude(callClaudeAPI, 'dxf_unknown_symbols', { detail: '/export-dxf-excel' });
+    if (dxfApi) {
+      try {
+        geminiResult = await claudeAnalyzeDXF(civilData, filename, getRatesSummary({ maxItems: 40 }), smartCtx.summary_text);
+        console.log('[DXF-Excel] Claude analysis done:', geminiResult.drawing_type);
+      } catch (e) { console.log('Claude DXF interp fail:', e.message); }
+    } else {
+      console.log('[DXF-Excel] Claude SKIPPED — local pre-draft (tokens=0)');
+    }
+
+    if (!geminiResult.boq?.length && smartCtx.pre_drafted_boq?.length) {
+      geminiResult.boq = smartCtx.pre_drafted_boq;
+      geminiResult._source = 'smart_pre_draft_local';
+      geminiResult.project_name = geminiResult.project_name || filename || 'DXF';
+      geminiResult.drawing_type = geminiResult.drawing_type || civilData.drawing_type || 'DXF';
+    }
 
     // Build Excel
     const wb = await buildDXFExcel(civilData, geminiResult, ExcelJS);
@@ -1601,24 +1734,31 @@ app.post('/export-dxf-excel', async (req, res) => {
 // ─── 8. DRAWING → EXCEL (AI Analysis + Auto Excel) ───────────────
 app.post('/drawing-to-excel', async (req, res) => {
   try {
-    if (!process.env.CLAUDE_API_KEY) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
     const { files, userText, aiResponse } = req.body;
 
-    // FIX BUG-1: claudeAnalyzeDrawingVision() already returns a parsed JS object
-    // (parseJSON is called internally). Never call .replace() on the result.
     let drawingData = {};
-    try {
-      const analysisResult = await claudeAnalyzeDrawingVision(files, userText, aiResponse);
-      if (analysisResult && typeof analysisResult === 'object') {
-        drawingData = analysisResult;
-      } else if (typeof analysisResult === 'string') {
-        // Defensive: if somehow a string comes back, parse it
-        const clean = analysisResult.replace(/```json|```/g, '').trim();
-        const fb2 = clean.indexOf('{'), lb2 = clean.lastIndexOf('}');
-        if (fb2 !== -1) { try { drawingData = JSON.parse(clean.slice(fb2, lb2+1)); } catch(e2) {} }
-      }
-      console.log('[drawing-to-excel] Claude done | type:', drawingData.drawing_type || '?', '| boq items:', drawingData.boq?.length || 0);
-    } catch(e) { console.log('Claude drawing-to-excel fail:', e.message); }
+    const exportGate = allowClaude('drawing_to_excel');
+    if (exportGate.ok) {
+      try {
+        const analysisResult = await claudeAnalyzeDrawingVision(files, userText, aiResponse);
+        logClaudeCall({ reason: 'drawing_to_excel', ok: true, tokensEstimate: 4096 });
+        if (analysisResult && typeof analysisResult === 'object') {
+          drawingData = analysisResult;
+        } else if (typeof analysisResult === 'string') {
+          const clean = analysisResult.replace(/```json|```/g, '').trim();
+          const fb2 = clean.indexOf('{'), lb2 = clean.lastIndexOf('}');
+          if (fb2 !== -1) { try { drawingData = JSON.parse(clean.slice(fb2, lb2+1)); } catch(e2) {} }
+        }
+        console.log('[drawing-to-excel] Claude done | type:', drawingData.drawing_type || '?', '| boq items:', drawingData.boq?.length || 0);
+      } catch(e) { console.log('Claude drawing-to-excel fail:', e.message); }
+    } else {
+      logClaudeCall({ reason: 'drawing_to_excel', ok: false, detail: exportGate.detail });
+      return res.status(403).json({
+        error: 'Claude drawing→Excel disabled (tokens costly). Use /analyze-drawing then local Excel export. Set PMC_ALLOW_CLAUDE_EXPORT=1 only if needed.',
+        claude_used: false,
+        tokens: 0,
+      });
+    }
 
     // Build Excel
     const wb = await buildExcelFromDrawing(drawingData);
@@ -1979,23 +2119,35 @@ app.post('/analyze-dwg', async (req, res) => {
         _markdown: `${scheduleBundle.markdown}\n\n> **Note:** Native DWG did not render to PNG on this server. For AutoCAD-like zoom reading of tables/sections, export from ZWCAD/AutoCAD as **PDF or DXF** and re-upload.`,
       };
     } else {
-      const pngTiles = parts.filter(p => p.inline_data?.mime_type === 'image/png').map(p => p.inline_data.data);
-      try {
-        if (pngTiles.length) {
-          analysisRaw = await claudeAnalyzeDWGVision(pngTiles.slice(0, 3), {
-            ...converterResult,
-            texts: converterResult.texts,
-            _schedule_markdown: scheduleBundle.markdown,
-          }, filename);
-          console.log('[DWG] Claude vision (capped tiles) done');
-        } else {
+      // Strict: never call DWG Claude vision — local markdown / ask-user (tokens costly)
+      const dwgGate = allowClaude('analyze_dwg_vision');
+      if (dwgGate.ok) {
+        const pngTiles = parts.filter(p => p.inline_data?.mime_type === 'image/png').map(p => p.inline_data.data);
+        try {
+          if (pngTiles.length) {
+            analysisRaw = await claudeAnalyzeDWGVision(pngTiles.slice(0, 3), {
+              ...converterResult,
+              texts: converterResult.texts,
+              _schedule_markdown: scheduleBundle.markdown,
+            }, filename);
+            console.log('[DWG] Claude vision (capped tiles) done');
+          } else {
+            analysisRaw = scheduleBundle.boqResult;
+            analysisRaw._markdown = scheduleBundle.markdown;
+          }
+        } catch (e) {
+          console.error('Claude DWG analysis fail:', e.message);
           analysisRaw = scheduleBundle.boqResult;
-          analysisRaw._markdown = scheduleBundle.markdown;
+          if (analysisRaw) analysisRaw._markdown = scheduleBundle.markdown;
         }
-      } catch (e) {
-        console.error('Claude DWG analysis fail:', e.message);
-        analysisRaw = scheduleBundle.boqResult;
-        if (analysisRaw) analysisRaw._markdown = scheduleBundle.markdown;
+      } else {
+        logClaudeCall({ reason: 'analyze_dwg_vision', ok: false, detail: dwgGate.detail });
+        console.log('[DWG] Claude vision BLOCKED — local-only (tokens=0)');
+        analysisRaw = {
+          ...(scheduleBundle.boqResult || {}),
+          drawing_type: scheduleBundle.typeInfo?.drawing_type,
+          _markdown: `${scheduleBundle.markdown || ''}\n\n_Claude vision skipped (strict local-first). Confirm unclear schedule values — we never invent qty._`,
+        };
       }
     }
 
@@ -2152,7 +2304,6 @@ app.post('/analyze-dwg', async (req, res) => {
 // Unknown symbols will be shown to user as questions in the chat UI.
 app.post('/classify-dxf', async (req, res) => {
   try {
-    if (!process.env.CLAUDE_API_KEY) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
     const { dxfContent, filename } = req.body;
     if (!dxfContent) return res.status(400).json({ error: 'No DXF content.' });
 
@@ -2216,17 +2367,18 @@ app.post('/classify-dxf', async (req, res) => {
       if (!matched) unknownLayers.push(l);
     }
 
-    // Call Claude ONLY if > threshold truly unknown blocks — saves 70% classify calls
-    let geminiClassified = { blocks: {}, layers: {} };
+    // Claude ONLY if many unknowns AND PMC_ALLOW_CLAUDE_DXF=1 — else ask user
+    let geminiClassified = { blocks: {}, layers: {}, still_unknown_blocks: unknownBlocks.map(b => b.name), still_unknown_layers: unknownLayers };
     const CLAUDE_CLASSIFY_THRESHOLD = 3;
     const needsClaude = unknownBlocks.length > CLAUDE_CLASSIFY_THRESHOLD;
-    if (needsClaude) {
+    const classifyApi = needsClaude ? gatedClaude(callClaudeAPI, 'dxf_unknown_symbols', { detail: '/classify-dxf' }) : null;
+    if (classifyApi) {
       try {
         geminiClassified = await claudeClassifySymbols(unknownBlocks, unknownLayers, civilData, filename);
         console.log('[classify-dxf] Claude classified', Object.keys(geminiClassified.blocks||{}).length, 'blocks');
       } catch(e) { console.log('Claude classify fail:', e.message); }
     } else {
-      console.log(`[classify-dxf] Skipped Claude — only ${unknownBlocks.length} unknown blocks (threshold:${CLAUDE_CLASSIFY_THRESHOLD})`);
+      console.log(`[classify-dxf] Claude SKIPPED — unknown=${unknownBlocks.length} (ask user / threshold:${CLAUDE_CLASSIFY_THRESHOLD})`);
     }
 
     // Merge all known
@@ -2234,13 +2386,17 @@ app.post('/classify-dxf', async (req, res) => {
     const finalKnownLayers = { ...knownLayers, ...(geminiClassified.layers || {}) };
 
     // These still need user input
-    const askUserBlocks = (geminiClassified.still_unknown_blocks || [])
+    const askUserBlocks = (geminiClassified.still_unknown_blocks || unknownBlocks.map(b => b.name) || [])
+      .filter(name => !finalKnownBlocks[name])
       .map(name => ({ name, count: civilData.block_counts[name] || 1 }));
-    const askUserLayers = geminiClassified.still_unknown_layers || [];
+    const askUserLayers = (geminiClassified.still_unknown_layers || unknownLayers || [])
+      .filter(l => !finalKnownLayers[l]);
 
     res.json({
       success: true,
       filename,
+      claude_used: !!classifyApi,
+      tokens: classifyApi ? 1 : 0,
       dxf_data: civilData,
       known_blocks: finalKnownBlocks,
       known_layers: finalKnownLayers,
@@ -2279,8 +2435,6 @@ function guessBlockType(name) {
 // Returns: full Gemini BOQ analysis → used to generate Excel
 app.post('/analyze-with-answers', async (req, res) => {
   try {
-    if (!process.env.CLAUDE_API_KEY) return res.status(500).json({ error: 'CLAUDE_API_KEY not set.' });
-
     const { dxfContent, filename, knownBlocks, knownLayers, userAnswers, dxfData } = req.body;
     const fs = require('fs');
 
@@ -2377,20 +2531,45 @@ Generate complete BOQ. Return ONLY raw JSON:
   "pmc_recommendation": ""
 }`;
 
-    // ✅ FIX: Claude replaces Gemini for final BOQ analysis
+    // Local smart BOQ first — Claude only if PMC_ALLOW_CLAUDE_DXF=1
     let geminiResult = {};
-    try {
-      geminiResult = await claudeAnalyzeWithAnswers(civilData, filename, symbolSummary, ratesSummary);
-      console.log('[analyze-with-answers] Claude done, BOQ items:', geminiResult.boq?.length || 0);
-      // ── NEW: Auto-learn rates from BOQ result ──
-      if (geminiResult.boq?.length) {
-        try {
-          learnRatesFromBOQ(geminiResult.boq, { filename, drawing_type: geminiResult.drawing_type });
-        } catch(e) { console.warn('[rate_store]', e.message); }
-      }
-    } catch(e) { console.log('Claude analyze-with-answers fail:', e.message); }
+    const ratesMap = getRatesMap();
+    const smartCtx = buildSmartContext(civilData, ratesMap);
+    const ansApi = gatedClaude(callClaudeAPI, 'dxf_unknown_symbols', { detail: '/analyze-with-answers' });
+    if (ansApi) {
+      try {
+        geminiResult = await claudeAnalyzeWithAnswers(civilData, filename, symbolSummary, ratesSummary);
+        console.log('[analyze-with-answers] Claude done, BOQ items:', geminiResult.boq?.length || 0);
+        if (geminiResult.boq?.length) {
+          try {
+            learnRatesFromBOQ(geminiResult.boq, { filename, drawing_type: geminiResult.drawing_type });
+          } catch(e) { console.warn('[rate_store]', e.message); }
+        }
+      } catch(e) { console.log('Claude analyze-with-answers fail:', e.message); }
+    } else {
+      console.log('[analyze-with-answers] Claude SKIPPED — local pre-draft (tokens=0)');
+      geminiResult = {
+        project_name: filename || 'DXF',
+        drawing_type: civilData.drawing_type || 'DXF',
+        boq: smartCtx.pre_drafted_boq || [],
+        _source: 'smart_pre_draft_local',
+        _claude_used: false,
+        observations: ['Claude not used — confirm quantities from drawing. Set PMC_ALLOW_CLAUDE_DXF=1 only if needed.'],
+      };
+    }
+    if (!geminiResult.boq?.length && smartCtx.pre_drafted_boq?.length) {
+      geminiResult.boq = smartCtx.pre_drafted_boq;
+      geminiResult._source = geminiResult._source || 'smart_pre_draft_fallback';
+    }
 
-    res.json({ success: true, interpretation: geminiResult, dxf_data: civilData, learned_count: Object.keys(learned.blocks).length + Object.keys(learned.layers).length });
+    res.json({
+      success: true,
+      interpretation: geminiResult,
+      dxf_data: civilData,
+      claude_used: !!ansApi && !!geminiResult.boq,
+      tokens: ansApi ? 1 : 0,
+      learned_count: Object.keys(learned.blocks).length + Object.keys(learned.layers).length,
+    });
 
   } catch (err) {
     console.error('analyze-with-answers error:', err);
@@ -2555,6 +2734,7 @@ app.post('/analyze-drawing', (req, res) => {
               || scheduleBundle.borehole_digitise?.mode
               || (scheduleBundle.needsUserInput ? 'ask-user' : (scheduleBundle.qa?.meta?.intent || 'takeoff')),
             tokens: (scheduleBundle.vision_takeoff?.tokens || 0) + (scheduleBundle.borehole_digitise?.tokens || 0),
+            claude_used: !!(scheduleBundle.vision_takeoff?.claude_used || scheduleBundle.borehole_digitise?.claude_used),
             file_mb: Number(sizeMb),
             needs_user_input: !!scheduleBundle.needsUserInput,
             questions: scheduleBundle.clarifications?.questions || [],
@@ -2972,17 +3152,29 @@ app.post('/resolve-clarifications', (req, res) => {
 
 // ─── 12. HEALTH ─────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  const claudeKey = process.env.CLAUDE_API_KEY;
+  const spend = getSpendSummary();
   res.json({
     status: 'ok',
-    claude_key_set: !!claudeKey,
-    claude_preview: claudeKey ? claudeKey.slice(0, 12) + '...' : 'NOT SET ❌',
-    pipeline: 'Local-first takeoff (Claude=0). Claude ONLY for Auto vision agent, or BH digitise when OCR weak.',
+    claude_key_set: spend.key_set,
+    claude_preview: spend.key_set ? (process.env.CLAUDE_API_KEY || '').slice(0, 12) + '...' : 'NOT SET ❌',
+    claude_policy: {
+      mode: spend.mode,
+      allow_vision: spend.allow_vision,
+      allow_export: spend.allow_export,
+      allow_dxf: spend.allow_dxf,
+      calls_allowed: spend.calls_allowed,
+      calls_skipped: spend.calls_skipped,
+    },
+    pipeline: 'Local-first. Default PMC_CLAUDE_MODE=strict — Claude ONLY for Auto vision (if local weak), BH digitise (if OCR weak), or freeform chat without drawing.',
     max_upload_mb: 500,
-    routes: ['/analyze-drawing','/takeoff/agents','/export-ags','/export-geojson','/export-shapefile','/qa-checklist','/qa-approve','/ground-model','/resolve-clarifications','/export-annotated-pdf','/project/create','/project/analyze-sheet','/claude','/gemini','/export-excel','/export-pdf','/export-drawing','/analyze-dxf','/export-dxf-excel','/drawing-to-excel','/update-area-from-dxf','/fill-template-from-drawing','/analyze-dwg','/classify-dxf','/analyze-with-answers','/rates-stats'],
+    routes: ['/analyze-drawing','/takeoff/agents','/export-ags','/export-geojson','/export-shapefile','/qa-checklist','/qa-approve','/ground-model','/resolve-clarifications','/export-annotated-pdf','/project/create','/project/analyze-sheet','/claude','/gemini','/claude-spend','/export-excel','/export-pdf','/export-drawing','/analyze-dxf','/export-dxf-excel','/drawing-to-excel','/update-area-from-dxf','/fill-template-from-drawing','/analyze-dwg','/classify-dxf','/analyze-with-answers','/rates-stats'],
     takeoff_agents: AGENTS.map(a => a.id),
     dwg_support: 'ZWCAD + AutoCAD — prefer PDF/DXF; size up to 500MB via /analyze-drawing'
   });
+});
+
+app.get('/claude-spend', (req, res) => {
+  res.json(getSpendSummary());
 });
 
 const APP_URL = process.env.RENDER_EXTERNAL_URL;
@@ -2992,6 +3184,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n✅ PMC Civil AI Agent on port ${PORT}`);
   console.log(`🔑 CLAUDE_API_KEY: ${process.env.CLAUDE_API_KEY ? 'SET ✅' : 'NOT SET ❌'}`);
+  console.log(`🧾 Claude policy: PMC_CLAUDE_MODE=${claudeMode()} (strict = tokens only when local truly fails)`);
   console.log('✅ Local-first: CAD-zoom OCR → drawing type → Q&A/BOQ (Claude only if needed)');
   console.log('🏗️  PDF/DXF/DWG/ZWCAD: multi-type sheets (section, footing, plan, elevation…)');
 });
