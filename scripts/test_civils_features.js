@@ -24,10 +24,17 @@ async function main() {
   assert.strictEqual(detectIntent('calculate earthworks cut and fill'), 'earthworks');
   assert.strictEqual(detectIntent('Paving / road layer takeoff asphalt DBM'), 'paving');
   assert.strictEqual(detectIntent('Groundworks takeoff cut/fill plus paving'), 'groundworks');
-  assert.strictEqual(detectIntent('', 'read'), 'read');
-  assert.strictEqual(detectIntent('', 'study'), 'study');
+  assert.strictEqual(detectIntent('Analyze uploaded file(s) and pull all proper details.'), 'takeoff');
   assert.strictEqual(detectIntent('', 'calculate'), 'takeoff');
-  assert.strictEqual(detectIntent('Study this civil drawing walkthrough'), 'study');
+  const autoBoq = readDrawingFully({
+    text: 'SCHEDULE OF FOOTING\nF1 1500x1500 450 4\nF2 1800x1800 500 2',
+    filename: 'F.pdf',
+    question: 'Analyze uploaded file',
+    autoBoq: true,
+  });
+  assert.strictEqual(autoBoq.intent, 'takeoff');
+  assert(/Quantity Takeoff|BOQ|RCC|cum/i.test(autoBoq.markdown), 'auto boq md');
+  assert((autoBoq.boqResult?.boq?.length || 0) >= 1 || (autoBoq.extracted?.schedules?.footings?.length || 0) >= 1, 'auto boq rows');
   assert(AGENTS.some(a => a.id === 'earthworks'), 'earthworks agent');
   assert(AGENTS.some(a => a.id === 'paving'), 'paving agent');
   assert(AGENTS.some(a => a.id === 'groundworks'), 'groundworks agent');

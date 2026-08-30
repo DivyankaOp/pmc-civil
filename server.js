@@ -239,15 +239,79 @@ function parseTakeoffScope(body = {}) {
   return scope;
 }
 
-/** Civils-style product action: read | study | calculate */
+/** Civils-style product action: read | study | calculate — uploads default calculate/BOQ */
 function parseDrawingAction(body = {}) {
   const raw = String(body.action || body.drawingAction || body.mode || '').toLowerCase().trim();
   if (raw === 'read' || raw === 'drawing') return 'read';
   if (raw === 'study') return 'study';
-  if (raw === 'calculate' || raw === 'calc' || raw === 'takeoff' || raw === 'boq') {
+  if (raw === 'calculate' || raw === 'calc' || raw === 'takeoff' || raw === 'boq' || raw === 'auto') {
     return raw === 'boq' ? 'boq' : 'calculate';
   }
-  return null;
+  // File upload without explicit action → auto BOQ
+  if (body.autoBoq === true || body.autoBoq === '1' || body.auto_boq === '1') return 'calculate';
+  return 'calculate';
+}
+
+/**
+ * DWG/DXF/DWF → converter PNG + text → schedule-first local BOQ.
+ * Shared by /analyze-drawing and /project/analyze-sheet.
+ */
+function analyzeCadFileToBundle({ tmpPath, filename, question, scope, action, companionOcrText = '' }) {
+  const { execSync } = require('child_process');
+  const scriptPath = scriptsPath('dwg_converter.py');
+  const tmpPng = path.join(os.tmpdir(), `pmc_dwg_${Date.now()}.png`);
+  let converterResult = {};
+  try {
+    const py = pyExec();
+    const out = execSync(
+      `${py} "${scriptPath}" "${tmpPath}" "${tmpPng}" 300 true`,
+      { timeout: 180000, maxBuffer: 40 * 1024 * 1024 }
+    );
+    converterResult = JSON.parse(out.toString());
+  } catch (e) {
+    converterResult = { success: false, error: e.message };
+  }
+  if (!converterResult.success && !converterResult.png_path) {
+    return {
+      error: true,
+      needsDxfExport: /\.dwg$/i.test(filename || ''),
+      needsPdfOrDxf: true,
+      message: converterResult.error
+        || 'CAD file could not be rendered. Export PDF/DXF from ZWCAD/AutoCAD and re-upload (any size OK).',
+    };
+  }
+  const pngPath = converterResult.png_path || tmpPng;
+  const texts = (converterResult.texts || []).map(t => (typeof t === 'string' ? t : t.text || '')).filter(Boolean);
+  let combined = texts.join('\n');
+  let ocrBoxes = [];
+  let hints = [];
+  if (fs.existsSync(pngPath)) {
+    const zoom = runCadZoomOcrOnFile(pngPath);
+    if (zoom?.success && zoom.full_text) {
+      combined = [combined, zoom.full_text].filter(Boolean).join('\n');
+      ocrBoxes = zoom.boxes || [];
+      hints = zoom.drawing_hints || [];
+    }
+  }
+  const spatial = buildSpatialScheduleText({ ocrBoxes, plainLines: combined.split('\n') });
+  const scheduleBundle = runScheduleFirstLocal(
+    [spatial.text || combined, companionOcrText].filter(Boolean).join('\n\n'),
+    {
+      filename,
+      question: question || 'Prepare quantity takeoff / BOQ from this drawing — read schedules, calculate, ask missing values.',
+      hints,
+      spatialTables: spatial.tables || [],
+      scope,
+      action: action || 'calculate',
+      autoBoq: true,
+    },
+  );
+  return {
+    error: false,
+    scheduleBundle,
+    combined: (spatial.text || combined),
+    pngPath,
+  };
 }
 const multer = require('multer');
 const fs = require('fs');
@@ -724,6 +788,7 @@ async function buildDrawingContextFromFile(filePath, opts = {}) {
     scope: opts.scope || null,
     polylines: opts.polylines || [],
     action: opts.action || null,
+    autoBoq: opts.autoBoq !== false && opts.action !== 'read' && opts.action !== 'study',
   });
   console.log(`[drawing-context] type=${local.typeInfo?.drawing_type} schedule=${local.extracted.quality} rows=${local.extracted.total_schedule_rows} localQA=${!!local.answeredLocally} companion=${(opts.companionOcrText || '').length}`);
 
@@ -1845,8 +1910,10 @@ app.post('/analyze-dwg', async (req, res) => {
     const dwgText = [textSummary, dimSummary, layers].filter(Boolean).join('\n');
     const scheduleBundle = runScheduleFirstLocal(dwgText, {
       filename: filename || 'drawing.dwg',
-      question: 'study drawing: identify type, levels, schedules, tables',
+      question: 'Prepare quantity takeoff / BOQ from this drawing — read schedules, calculate, ask missing values.',
       hints: [],
+      action: 'calculate',
+      autoBoq: true,
     });
     console.log(`[DWG] type=${scheduleBundle.typeInfo?.drawing_type} schedule=${scheduleBundle.extracted.quality} rows=${scheduleBundle.extracted.total_schedule_rows} localQA=${!!scheduleBundle.answeredLocally}`);
 
@@ -2395,56 +2462,20 @@ app.post('/analyze-drawing', (req, res) => {
       const sizeMb = (fs.statSync(tmpPath).size / (1024 * 1024)).toFixed(1);
       console.log(`[/analyze-drawing] ${filename} (${sizeMb} MB) action=${action || '-'} q="${question.slice(0, 80)}" agent=${scope?.agent || '-'} extras=${extras.length}`);
 
-      // DWG/DXF/DWF → reuse converter path then local OCR on PNG if produced
+      // DWG/DXF/DWF → converter + OCR → auto BOQ
       if (['.dwg', '.dxf', '.dwf'].includes(ext)) {
-        const { execSync } = require('child_process');
-        const scriptPath = scriptsPath('dwg_converter.py');
-        const tmpPng = path.join(os.tmpdir(), `pmc_dwg_${Date.now()}.png`);
-        let converterResult = {};
-        try {
-          const py = pyExec();
-          const out = execSync(
-            `${py} "${scriptPath}" "${tmpPath}" "${tmpPng}" 300 true`,
-            { timeout: 180000, maxBuffer: 40 * 1024 * 1024 }
-          );
-          converterResult = JSON.parse(out.toString());
-        } catch (e) {
-          converterResult = { success: false, error: e.message };
-        }
-        if (!converterResult.success && !converterResult.png_path) {
+        const cad = analyzeCadFileToBundle({
+          tmpPath, filename, question, scope, action: action || 'calculate', companionOcrText,
+        });
+        if (cad.error) {
           return res.status(422).json({
             success: false,
-            needsDxfExport: ext === '.dwg',
+            needsDxfExport: cad.needsDxfExport,
             needsPdfOrDxf: true,
-            error: converterResult.error ||
-              'CAD file could not be rendered. Export PDF/DXF from ZWCAD/AutoCAD and re-upload (any size OK).',
+            error: cad.message,
           });
         }
-        const pngPath = converterResult.png_path || tmpPng;
-        const texts = (converterResult.texts || []).map(t => (typeof t === 'string' ? t : t.text || '')).filter(Boolean);
-        let combined = texts.join('\n');
-        let ocrBoxes = [];
-        let hints = [];
-        if (fs.existsSync(pngPath)) {
-          const zoom = runCadZoomOcrOnFile(pngPath);
-          if (zoom?.success && zoom.full_text) {
-            combined = [combined, zoom.full_text].filter(Boolean).join('\n');
-            ocrBoxes = zoom.boxes || [];
-            hints = zoom.drawing_hints || [];
-          }
-        }
-        const spatial = buildSpatialScheduleText({ ocrBoxes, plainLines: combined.split('\n') });
-        const scheduleBundle = runScheduleFirstLocal(
-          [spatial.text || combined, companionOcrText].filter(Boolean).join('\n\n'),
-          {
-            filename,
-            question,
-            hints,
-            spatialTables: spatial.tables || [],
-            scope,
-            action,
-          },
-        );
+        const scheduleBundle = cad.scheduleBundle;
         const md = scheduleBundle.markdown || 'No schedule data found. Upload PDF export of the same sheet.';
         return res.json({
           success: true,
@@ -2459,17 +2490,18 @@ app.post('/analyze-drawing', (req, res) => {
           groundworks: scheduleBundle.groundworks || null,
           qaChecklist: scheduleBundle.qaChecklist || null,
           scope: scope || null,
-          combined_text: (spatial.text || combined).slice(0, 80000),
+          combined_text: String(cad.combined || '').slice(0, 80000),
           schedule_first: {
             quality: scheduleBundle.extracted?.quality,
             rows: scheduleBundle.extracted?.total_schedule_rows,
             drawing_type: scheduleBundle.typeInfo?.drawing_type,
-            mode: scheduleBundle.needsUserInput ? 'ask-user' : 'local-only',
+            mode: scheduleBundle.needsUserInput ? 'ask-user' : 'auto-boq',
             tokens: 0,
             file_mb: Number(sizeMb),
             needs_user_input: !!scheduleBundle.needsUserInput,
             questions: scheduleBundle.clarifications?.questions || [],
             agent: scope?.agent || null,
+            auto_boq: true,
           },
         });
       }
@@ -2769,28 +2801,55 @@ app.post('/project/analyze-sheet', (req, res) => {
       let projectId = req.body?.projectId || '';
       if (!tmpPath) return res.status(400).json({ error: 'No file' });
 
+      // Upload default = auto BOQ (unless explicit read/study)
+      if ((!action || action === 'calculate' || action === 'boq') && !question) {
+        question = 'Prepare quantity takeoff / BOQ from this drawing — read schedules, calculate, ask missing values one-by-one.';
+      }
+
       const companionOcrText = ocrCompanionImages(extras);
       if (companionOcrText) {
         console.log(`[/project/analyze-sheet] companion OCR chars=${companionOcrText.length} files=${extras.length}`);
       }
 
-      const ctx = await buildDrawingContextFromFile(tmpPath, {
-        question: question || 'Prepare quantity takeoff from this drawing',
-        filename,
-        mime: primary?.mimetype,
-        scope,
-        action,
-        companionOcrText,
-      });
-      let scheduleBundle = ctx.scheduleFirst;
-      scheduleBundle = await enrichWithVisionAgents({
-        tmpPath,
-        scope,
-        scheduleBundle,
-        question,
-        filename,
-        combinedText: ctx.combinedText || '',
-      });
+      const ext = path.extname(filename).toLowerCase();
+      let scheduleBundle;
+      let combinedText = '';
+
+      if (['.dwg', '.dxf', '.dwf'].includes(ext)) {
+        const cad = analyzeCadFileToBundle({
+          tmpPath, filename, question, scope, action: action || 'calculate', companionOcrText,
+        });
+        if (cad.error) {
+          return res.status(422).json({
+            success: false,
+            needsDxfExport: cad.needsDxfExport,
+            needsPdfOrDxf: true,
+            error: cad.message,
+          });
+        }
+        scheduleBundle = cad.scheduleBundle;
+        combinedText = cad.combined || '';
+      } else {
+        const ctx = await buildDrawingContextFromFile(tmpPath, {
+          question: question || 'Prepare quantity takeoff / BOQ from this drawing',
+          filename,
+          mime: primary?.mimetype,
+          scope,
+          action: action || 'calculate',
+          companionOcrText,
+          autoBoq: true,
+        });
+        scheduleBundle = ctx.scheduleFirst;
+        combinedText = ctx.combinedText || '';
+        scheduleBundle = await enrichWithVisionAgents({
+          tmpPath,
+          scope,
+          scheduleBundle,
+          question,
+          filename,
+          combinedText,
+        });
+      }
       if (!projectId || !getProject(projectId)) {
         projectId = createProject(req.body?.projectName || 'Takeoff project').id;
       }
@@ -2806,7 +2865,7 @@ app.post('/project/analyze-sheet', (req, res) => {
         question,
         scope,
         file_mb: Number(sizeMb),
-        combined_text: ctx.combinedText || '',
+        combined_text: combinedText,
       });
 
       // Keep a small b64 for annotate if file <= 15MB
@@ -2834,13 +2893,13 @@ app.post('/project/analyze-sheet', (req, res) => {
         vision_takeoff: scheduleBundle?.vision_takeoff || null,
         borehole_digitise: scheduleBundle?.borehole_digitise || null,
         scope: scope || null,
-        combined_text: (ctx.combinedText || '').slice(0, 80000),
+        combined_text: String(combinedText || '').slice(0, 80000),
         b64,
         schedule_first: {
           drawing_type: scheduleBundle?.typeInfo?.drawing_type,
           mode: scheduleBundle?.vision_takeoff?.mode
             || scheduleBundle?.borehole_digitise?.mode
-            || (scheduleBundle?.needsUserInput ? 'ask-user' : 'takeoff'),
+            || (scheduleBundle?.needsUserInput ? 'ask-user' : 'auto-boq'),
           needs_user_input: !!scheduleBundle?.needsUserInput,
           questions: scheduleBundle?.clarifications?.questions || [],
           agent: scope?.agent || null,
@@ -2850,6 +2909,8 @@ app.post('/project/analyze-sheet', (req, res) => {
           file_mb: Number(sizeMb),
           vision_items: scheduleBundle?.vision_takeoff?.items || 0,
           geotech_bh: scheduleBundle?.geotech?.boreholes?.length || 0,
+          auto_boq: true,
+          boq_items: scheduleBundle?.boqResult?.boq?.length || 0,
         },
       });
     } catch (e) {

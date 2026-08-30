@@ -282,11 +282,11 @@ textarea.tin::placeholder{color:var(--tx3)}
       <div class="welcome" id="welcome">
         <div class="wico">🏗️</div>
         <div class="wtit">PMC Civil AI</div>
-        <div class="wsub">Civils.ai-style: <strong>Read</strong> the sheet → <strong>Study</strong> it → <strong>Calculate</strong> quantities. Missing cells pe invent nahi — poochhega.</div>
+        <div class="wsub"><strong>Drawing upload = auto BOQ</strong> — messy PDF / PNG / DWG / DXF. Missing cells pe poochhega, invent nahi.</div>
         <div class="steps">
-          <div class="step"><div class="step-n">01</div><div class="step-t">Pick action</div><div class="step-d">Read · Study · Calculate</div></div>
-          <div class="step"><div class="step-n">02</div><div class="step-t">Upload PDF</div><div class="step-d">Drawing / schedule / BH log</div></div>
-          <div class="step"><div class="step-n">03</div><div class="step-t">Confirm & export</div><div class="step-d">Human QA → Excel / AGS</div></div>
+          <div class="step"><div class="step-n">01</div><div class="step-t">Upload drawing</div><div class="step-d">PDF · PNG · DWG · DXF</div></div>
+          <div class="step"><div class="step-n">02</div><div class="step-t">Auto draft BOQ</div><div class="step-d">Schedules → volumes</div></div>
+          <div class="step"><div class="step-n">03</div><div class="step-t">Confirm gaps</div><div class="step-d">Human QA → Excel</div></div>
         </div>
         <div class="action-row" id="actionRow">
           <button type="button" class="action-card" id="actRead" onclick="setDrawingAction('read')"><span class="al">Read</span><span class="ad">Type · title · schedules · levels — no BOQ</span></button>
@@ -325,11 +325,11 @@ textarea.tin::placeholder{color:var(--tx3)}
         <textarea class="tin" id="tin" placeholder="Extra question optional — scope form above sets the trade…" rows="1" onkeydown="hkey(event)" oninput="aRz(this)"></textarea>
         <button class="sbtn" id="sbtn" onclick="send()">➤</button>
       </div>
-      <div class="hint">PDF + <kbd>Ctrl+V</kbd> schedule photo together → both OCR. Default = local (0 Claude).</div>
+      <div class="hint"><strong>Upload drawing → auto BOQ</strong> · PDF/PNG/DWG/DXF · schedule photo <kbd>Ctrl+V</kbd> OK · invent nahi</div>
     </div>
   </div>
 </div>
-<input type="file" id="fi" accept="image/*,.pdf,.png,.jpg,.jpeg,.webp,.gif,.bmp,.tif,.tiff,.dxf,.DXF,.dwg,.DWG,.dwf,.DWF,.xlsx,.xls,.csv,.doc,.docx,.txt" multiple onchange="onFiles(event)">
+<input type="file" id="fi" accept="image/*,.pdf,.png,.jpg,.jpeg,.webp,.gif,.bmp,.tif,.tiff,.dxf,.DXF,.dwg,.DWG,.dwf,.DWF,.xlsx,.xls,.csv,.doc,.docx,.txt,*/*" multiple onchange="onFiles(event)">
 
 <div class="meas-modal" id="measModal">
   <div class="meas-card">
@@ -910,13 +910,12 @@ async function postAnalyzeDrawing(fileEntry, question, companions=[]){
   for(const c of (companions||[]).slice(0,8)){
     try{ appendBlob(fd,'extra', c); }catch(_){}
   }
-  const scope=drawingAction==='calculate'?getTakeoffScope():null;
-  const defaultQ=drawingAction==='read'?QT.drawing
-    :drawingAction==='study'?QT.study
-      :'Prepare quantity takeoff from this drawing — read schedules, calculate quantities, ask missing values one-by-one.';
+  const scope=getTakeoffScope();
+  const defaultQ='Prepare quantity takeoff / BOQ from this drawing — read schedules, calculate quantities, ask missing values one-by-one.';
   fd.append('question', question||defaultQ);
   fd.append('filename', fileEntry.name||'drawing.pdf');
-  fd.append('action', drawingAction==='calculate'?'calculate':drawingAction);
+  fd.append('action', 'calculate');
+  fd.append('autoBoq', '1');
   if(scope){
     fd.append('scope', JSON.stringify(scope));
     fd.append('agent', scope.agent||'full');
@@ -933,7 +932,8 @@ async function postAnalyzeDrawing(fileEntry, question, companions=[]){
     for(const c of (companions||[]).slice(0,8)) try{ appendBlob(fd2,'extra', c); }catch(_){}
     fd2.append('question', question||defaultQ);
     fd2.append('filename', fileEntry.name||'drawing.pdf');
-    fd2.append('action', drawingAction==='calculate'?'calculate':drawingAction);
+    fd2.append('action', 'calculate');
+    fd2.append('autoBoq', '1');
     if(scope){
       fd2.append('scope', JSON.stringify(scope));
       fd2.append('agent', scope.agent||'full');
@@ -1702,6 +1702,15 @@ async function send(){
   if(!txt&&!files.length)return;
   busy=true;document.getElementById('sbtn').disabled=true;
 
+  // PRODUCT RULE: any drawing upload → auto BOQ (Calculate), unless user only typed Read/Study with no file
+  const hasDrawingUpload=files.some(f=>
+    f.isDrawing||f.isDWG||f.isDXF||f.type==='application/pdf'||f.type?.startsWith('image/')||
+    /\.(pdf|png|jpe?g|webp|gif|bmp|tiff?|dwg|dxf|dwf)$/i.test(f.name||'')
+  );
+  if(hasDrawingUpload){
+    setDrawingAction('calculate');
+  }
+
   // Init new chat if needed
   if(!currentChatId){currentChatId='chat_'+Date.now();}
 
@@ -1755,8 +1764,9 @@ async function send(){
   hist.push({role:'user',content:disp,fnames});
   tin.value='';tin.style.height='auto';
 
-  // DXF files → classify-first → Q&A → full analysis
-  if(hasDXF){
+  // DXF: Auto BOQ path (schedule-first) — skip symbol-classify gate
+  // Legacy classify kept only if user typed "classify symbols" explicitly
+  if(hasDXF && /classify\s*symbol|layer\s*qa/i.test(sentText||'')){
     files=[];renderChips();
     addLoad();
     try{
@@ -1794,10 +1804,8 @@ async function send(){
   // Pure DXF already returned above via /classify-dxf
   // PDF + pasted schedule photos: OCR companions with the primary sheet
   const drawingFiles=sentFiles.filter(f=>
-    (!f.isDXF) && (
-      f.isDrawing || f.isDWG || f.type==='application/pdf' || f.type?.startsWith('image/') ||
-      /\.(pdf|png|jpe?g|webp|gif|bmp|tiff?|dwg|dwf)$/i.test(f.name||'')
-    )
+    f.isDrawing || f.isDWG || f.isDXF || f.type==='application/pdf' || f.type?.startsWith('image/') ||
+    /\.(pdf|png|jpe?g|webp|gif|bmp|tiff?|dwg|dxf|dwf)$/i.test(f.name||'')
   );
   if(drawingFiles.length){
     const primary=drawingFiles.find(f=>/\.pdf$/i.test(f.name||''))
