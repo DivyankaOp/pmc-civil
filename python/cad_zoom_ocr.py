@@ -20,6 +20,16 @@ try:
 except Exception:
     pass
 
+
+def _fitz():
+    """PyMuPDF import: prefer `pymupdf` (the legacy `fitz` alias prints a deprecation
+    warning to STDOUT on >=1.24, which corrupts the JSON we hand back to Node)."""
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        import fitz
+    return fitz
+
 MAX_PAGES = 5
 # Cap longest side before cropping (keeps RapidOCR fast + stable)
 IMAGE_MAX_SIDE = int(os.environ.get("PMC_OCR_MAX_SIDE", "9000"))
@@ -31,7 +41,7 @@ SCHEDULE_RE = re.compile(
 
 
 def _save_clip(page, clip, dpi, path):
-    import fitz
+    fitz = _fitz()
     from PIL import Image
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     pix = page.get_pixmap(matrix=mat, alpha=False, clip=clip)
@@ -45,7 +55,7 @@ def _save_clip(page, clip, dpi, path):
 
 def _find_schedule_clips(page, w, h):
     """Use vector text hits to zoom schedule regions; fallback fixed bands."""
-    import fitz
+    fitz = _fitz()
     clips = []
     try:
         blocks = page.get_text("blocks") or []
@@ -71,7 +81,7 @@ def _find_schedule_clips(page, w, h):
 
 
 def render_pdf_regions(pdf_path, out_dir):
-    import fitz
+    fitz = _fitz()
     doc = fitz.open(pdf_path)
     paths = []
     n_pages = min(len(doc), MAX_PAGES)
@@ -92,7 +102,6 @@ def render_pdf_regions(pdf_path, out_dir):
                 paths.append((f"{prefix}_sched{ai}", path, pi))
         else:
             # Scanned CAD: fewer high-value crops (speed) — schedules usually top/right
-            import fitz as _fitz
             bands = {
                 "zoom_top_right": (w * 0.42, 0, w, h * 0.55, 200),
                 "zoom_mid_right": (w * 0.48, h * 0.20, w, h * 0.78, 200),
@@ -100,7 +109,7 @@ def render_pdf_regions(pdf_path, out_dir):
             }
             for name, (x1, y1, x2, y2, dpi) in bands.items():
                 path = os.path.join(out_dir, f"{prefix}_{name}.png")
-                _save_clip(page, _fitz.Rect(x1, y1, x2, y2), dpi, path)
+                _save_clip(page, fitz.Rect(x1, y1, x2, y2), dpi, path)
                 paths.append((f"{prefix}_{name}", path, pi))
     doc.close()
     return paths

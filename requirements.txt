@@ -6,3 +6,6 @@ numpy>=1.26.0
 openpyxl>=3.1.0
 opencv-python-headless>=4.8.0
 PyMuPDF>=1.23.0
+# Local OCR engine used by python/cad_zoom_ocr.py (zero-token drawing reading)
+rapidocr_onnxruntime>=1.2.0
+onnxruntime>=1.16.0

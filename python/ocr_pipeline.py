@@ -39,10 +39,13 @@ import tempfile
 import subprocess
 
 try:
-    import fitz  # PyMuPDF
+    import pymupdf as fitz  # PyMuPDF >= 1.24 ("fitz" alias prints a deprecation warning on stdout)
 except ImportError:
-    print(json.dumps({"error": "PyMuPDF not installed. Run: pip install pymupdf --break-system-packages"}))
-    sys.exit(1)
+    try:
+        import fitz  # PyMuPDF (older)
+    except ImportError:
+        print(json.dumps({"error": "PyMuPDF not installed. Run: pip install pymupdf --break-system-packages"}))
+        sys.exit(1)
 
 try:
     import cv2

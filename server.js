@@ -391,13 +391,24 @@ function pyExec() {
   return process.env.PMC_PYTHON || (process.platform === 'win32' ? 'py -3' : 'python3');
 }
 
+/** Python libs sometimes print warnings to stdout before our JSON — keep only the JSON payload. */
+function jsonFromStdout(raw) {
+  const s = String(raw || '');
+  const i = Math.min(...['{', '['].map(ch => s.indexOf(ch)).filter(x => x >= 0));
+  return Number.isFinite(i) ? s.slice(i) : s;
+}
+
 async function extractPdfTextFromPath(pdfPath) {
   const { execFileSync } = require('child_process');
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pmc_pdf_'));
   try {
     const scriptPath = path.join(tmpDir, 'extract.py');
     fs.writeFileSync(scriptPath, `
-import fitz, json, sys
+import json, sys
+try:
+    import pymupdf as fitz  # PyMuPDF >= 1.24 (the "fitz" alias prints a deprecation warning on stdout)
+except ImportError:
+    import fitz
 doc = fitz.open(sys.argv[1])
 pages = []
 for page_num in range(len(doc)):
@@ -423,10 +434,15 @@ print(json.dumps({"pages": pages, "is_vector": any(len(p["texts"])>10 for p in p
       maxBuffer: 40 * 1024 * 1024,
       windowsHide: true,
     });
-    return JSON.parse(out.toString());
+    return JSON.parse(jsonFromStdout(out.toString()));
   } catch (e) {
-    console.error('PDF text extract error:', e.message);
-    return null;
+    // Surface the real cause (usually missing PyMuPDF / python) instead of a silent null
+    const stderr = (e.stderr && e.stderr.toString().trim()) || '';
+    const reason = /No module named/i.test(stderr)
+      ? `Python module missing — run: ${pyExec()} -m pip install -r requirements.txt (${stderr.split(/\r?\n/).pop()})`
+      : (stderr.split(/\r?\n/).filter(Boolean).pop() || e.message);
+    console.error('PDF text extract error:', reason);
+    return { pages: [], total_texts: 0, is_vector: false, error: `PyMuPDF text extract failed: ${reason}` };
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
   }
@@ -457,7 +473,11 @@ async function extractLargePdfViaImageOCR(pdfBase64, gcvKey) {
 
 
     const script = `
-import fitz, base64, json, sys
+import base64, json, sys
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
 doc = fitz.open(sys.argv[1])
 tiles = []
 for i in range(len(doc)):
@@ -470,7 +490,7 @@ print(json.dumps(tiles))
     const sp = tmpDir + '/r.py';
     fs.writeFileSync(sp, script);
     const out = execSync(`${pyExec()} "${sp}" "${pdfPath}"`, { timeout: 60000, maxBuffer: 100 * 1024 * 1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
-    const tiles = JSON.parse(out.toString());
+    const tiles = JSON.parse(jsonFromStdout(out.toString()));
     console.log(`[GCV-Large] Rendered ${tiles.length} page tiles from large PDF`);
 
     // OCR each tile using images:annotate (no size restriction)
@@ -569,7 +589,11 @@ async function extractScannedPdfWithGCV(pdfBase64) {
         fs.writeFileSync(pdfPath2, Buffer.from(pdfBase64, 'base64'));
       }
       const fallbackScript = `
-import fitz,subprocess,json,tempfile,os,sys
+import subprocess,json,tempfile,os,sys
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
 doc=fitz.open(sys.argv[1])
 pages=[]
 for i in range(len(doc)):
@@ -588,7 +612,7 @@ print(json.dumps({'pages':pages}))
       fs.writeFileSync(fbScript, fallbackScript);
       const py2 = pyExec();
       const fbOut = execSync(`${py2} "${fbScript}" "${pdfPath2}"`, { timeout: 60000, maxBuffer: 10*1024*1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
-      const fbData = JSON.parse(fbOut.toString());
+      const fbData = JSON.parse(jsonFromStdout(fbOut.toString()));
       if (fbData.pages?.length) {
         console.log('[OCR Fallback] Used simple Tesseract PSM6 fallback');
         return { pages: fbData.pages, is_gcv: false, engine: 'tesseract-fallback' };
@@ -624,7 +648,11 @@ async function pdfToImageTiles(pdfBase64) {
     // optimal edge) so text stays crisp instead of being crushed by
     // whole-page downscaling.
     const script = `
-import fitz, json, base64, io, sys
+import json, base64, io, sys
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
 from PIL import Image
 
 MAX_EDGE = 1568
@@ -674,7 +702,7 @@ print(json.dumps(tiles))
     const scriptPath = tmpDir + '/convert.py';
     fs.writeFileSync(scriptPath, script);
     const out = execSync(`${pyExec()} "${scriptPath}" "${pdfPath}"`, { timeout: 120000, maxBuffer: 300 * 1024 * 1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
-    const result = JSON.parse(out.toString());
+    const result = JSON.parse(jsonFromStdout(out.toString()));
     return result.map(t => typeof t === 'object' ? t.data : t);
   } catch(e) {
     console.error('PDF tile error:', e.message);
@@ -748,9 +776,13 @@ async function buildDrawingContextFromFile(filePath, opts = {}) {
   const isImage = ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff', '.gif'].includes(ext)
     || (opts.mime || '').startsWith('image/');
 
+  // Collect engine-level failures (missing python deps, OCR crash) so the
+  // response can say WHY the extract is empty instead of a generic "weak".
+  const engineErrors = [];
   let extracted = null;
   if (isPdf) {
     extracted = await extractPdfTextFromPath(workPath);
+    if (extracted?.error) engineErrors.push(extracted.error);
   }
   const { plainLines, extractedTextBlock } = linesFromExtractedPdf(extracted);
 
@@ -784,9 +816,15 @@ async function buildDrawingContextFromFile(filePath, opts = {}) {
         plainLines.push(...String(zoom.full_text).split('\n'));
         console.log(`[drawing-context] CAD-zoom OCR: ${zoom.char_count || cadZoomText.length} chars | boxes=${ocrBoxes.length} | pages=${zoom.pages_processed || '?'} | hints=${cadHints.join(',')}`);
       } else {
-        console.warn('[drawing-context] CAD-zoom OCR failed:', zoom?.error || 'empty');
+        const why = String(zoom?.error || 'empty result').trim();
+        const hint = /No module named/i.test(why)
+          ? ` — run: ${pyExec()} -m pip install -r requirements.txt`
+          : '';
+        engineErrors.push(`CAD-zoom OCR failed: ${why.split(/\r?\n/).filter(Boolean).pop()}${hint}`);
+        console.warn('[drawing-context] CAD-zoom OCR failed:', why);
       }
     } catch (e) {
+      engineErrors.push(`CAD-zoom OCR error: ${e.message}`);
       console.warn('[drawing-context] CAD-zoom OCR error:', e.message);
     }
 
@@ -846,6 +884,18 @@ async function buildDrawingContextFromFile(filePath, opts = {}) {
   });
   console.log(`[drawing-context] type=${local.typeInfo?.drawing_type} schedule=${local.extracted.quality} rows=${local.extracted.total_schedule_rows} localQA=${!!local.answeredLocally} companion=${(opts.companionOcrText || '').length}`);
 
+  // Nothing was read AND an engine failed → tell the user the real reason up front
+  if (engineErrors.length && String(combinedText || '').trim().length < 40 && local.markdown) {
+    const banner = [
+      '> ⚠️ **Drawing text could not be extracted — reading engine error (not a drawing problem):**',
+      ...engineErrors.map(e => `> - ${e}`),
+      '> ',
+      '> Fix the server environment above and re-upload. Report below is from an EMPTY extract.',
+      '',
+    ].join('\n');
+    local.markdown = banner + local.markdown;
+  }
+
   const needVisionRaw = forceVision || (local.needsClaude && local.needsVision);
   // Strict policy: never attach image tiles for "schedule weak" Claude polish — ask user instead
   const visionOk = allowClaude('schedule_weak_fallback').ok;
@@ -883,6 +933,7 @@ async function buildDrawingContextFromFile(filePath, opts = {}) {
     needsVision: needVision,
     fileBytes,
     spatialTables: spatial.tables || [],
+    engineErrors,
   };
 }
 
@@ -2740,6 +2791,7 @@ app.post('/analyze-drawing', (req, res) => {
             questions: scheduleBundle.clarifications?.questions || [],
             spatial_tables: (ctx.spatialTables || []).length,
             text_chars: (ctx.combinedText || '').length,
+            engine_errors: ctx.engineErrors || [],
             measure_items: (scheduleBundle.measure || scheduleBundle.qa?.measure)?.items?.length || 0,
             agent: scope?.agent || null,
             geotech_bh: (scheduleBundle.geotech || scheduleBundle.qa?.geotech)?.boreholes?.length || 0,
